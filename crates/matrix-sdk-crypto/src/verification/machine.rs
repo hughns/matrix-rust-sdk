@@ -41,7 +41,7 @@ use super::{
 use crate::{
     olm::PrivateCrossSigningIdentity,
     requests::OutgoingRequest,
-    store::{CryptoStoreError, DynCryptoStore},
+    store::{CryptoStoreError, DynCryptoStore, NoisyArc},
     OutgoingVerificationRequest, ReadOnlyAccount, ReadOnlyDevice, ReadOnlyUserIdentity,
     RoomMessageRequest, ToDeviceRequest,
 };
@@ -57,7 +57,7 @@ impl VerificationMachine {
     pub(crate) fn new(
         account: ReadOnlyAccount,
         identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
-        store: Arc<DynCryptoStore>,
+        store: NoisyArc<DynCryptoStore>,
     ) -> Self {
         Self {
             store: VerificationStore { account, private_identity: identity, inner: store },

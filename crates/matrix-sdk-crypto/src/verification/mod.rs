@@ -52,7 +52,7 @@ use crate::{
     error::SignatureError,
     gossiping::{GossipMachine, GossipRequest},
     olm::{PrivateCrossSigningIdentity, ReadOnlyAccount, Session},
-    store::{Changes, DynCryptoStore},
+    store::{Changes, DynCryptoStore, NoisyArc},
     types::Signatures,
     CryptoStoreError, LocalTrust, OutgoingVerificationRequest, ReadOnlyDevice,
     ReadOnlyOwnUserIdentity, ReadOnlyUserIdentities,
@@ -62,7 +62,7 @@ use crate::{
 pub(crate) struct VerificationStore {
     pub account: ReadOnlyAccount,
     pub private_identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
-    inner: Arc<DynCryptoStore>,
+    inner: NoisyArc<DynCryptoStore>,
 }
 
 /// An emoji that is used for interactive verification using a short auth

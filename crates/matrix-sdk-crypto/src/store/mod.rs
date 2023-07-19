@@ -42,7 +42,10 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
     ops::Deref,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicU64},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -58,7 +61,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{broadcast, Mutex};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use vodozemac::{megolm::SessionOrdering, Curve25519PublicKey};
 use zeroize::Zeroize;
 
@@ -109,10 +112,100 @@ pub struct Store {
 }
 
 #[derive(Debug)]
+#[repr(C)]
+struct NoisyArcInner<T: ?Sized> {
+    inner: Box<T>,
+    base_id: String,
+    next_id: AtomicU64,
+}
+
+impl<T: ?Sized> NoisyArcInner<T> {
+    pub fn get_next_id(&self) -> u64 {
+        return self.next_id.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug)]
+pub struct NoisyArc<T: ?Sized> {
+    ptr: Arc<NoisyArcInner<T>>,
+    id: u64,
+}
+
+impl<T: ?Sized + Debug> Clone for NoisyArc<T> {
+    fn clone(&self) -> Self {
+        let res = Self { ptr: self.ptr.clone(), id: self.ptr.get_next_id() };
+        error!(
+            "NoisyArc::clone {:?} -> {}. Refcount now {}",
+            self.ptr.inner,
+            res.id,
+            Arc::strong_count(&self.ptr)
+        );
+        res
+    }
+}
+
+impl<T: ?Sized> Drop for NoisyArc<T> {
+    fn drop(&mut self) {
+        info!("NoisyArc::drop. Refcount before drop {}", Arc::strong_count(&self.ptr));
+    }
+}
+
+impl<T: ?Sized> Deref for NoisyArc<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.ptr.inner.deref()
+    }
+}
+
+impl<T: Debug + ?Sized> NoisyArc<T> {
+    pub fn new(data: T) -> NoisyArc<T>
+    where
+        T: Sized,
+    {
+        Self::from_box(Box::new(data))
+    }
+
+    pub fn from_box(inner: Box<T>) -> NoisyArc<T> {
+        use uuid::Uuid;
+
+        Self {
+            ptr: Arc::new(NoisyArcInner {
+                inner,
+                next_id: AtomicU64::new(1),
+                base_id: Uuid::new_v4().to_string(),
+            }),
+            id: 0,
+        }
+    }
+
+    // SAFETY: T and U must be compatible types such that transmuting between
+    // them directly would be acceptable.
+    pub unsafe fn transmute<U: Debug + ?Sized>(self) -> NoisyArc<U> {
+        let id = self.id;
+        let ptr = Arc::into_raw(self.ptr.clone());
+        drop(self);
+
+        // SAFETY: T and U are compatible for transmuting, NoisyArcInner is
+        // #[repr(C)], thus NoisyArcInner<T> and NoisyArcInner<U> have the same
+        // layout and safety invariants.
+        let ptr = unsafe { Arc::from_raw(ptr as _) };
+        let res = NoisyArc { ptr, id };
+
+        error!(
+            "NoisyArc::transmute {:?}. Refcount now {}",
+            res.ptr.inner,
+            Arc::strong_count(&res.ptr)
+        );
+        res
+    }
+}
+
+#[derive(Debug)]
 struct StoreInner {
     user_id: OwnedUserId,
     identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
-    store: Arc<DynCryptoStore>,
+    store: NoisyArc<DynCryptoStore>,
     verification_machine: VerificationMachine,
     tracked_users_cache: DashSet<OwnedUserId>,
 
@@ -375,7 +468,7 @@ impl Store {
     pub(crate) fn new(
         user_id: OwnedUserId,
         identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
-        store: Arc<DynCryptoStore>,
+        store: NoisyArc<DynCryptoStore>,
         verification_machine: VerificationMachine,
     ) -> Self {
         let (room_keys_received_sender, _) = broadcast::channel(10);
@@ -995,7 +1088,8 @@ impl Store {
     /// Creates a `CryptoStoreLock` for this store, that will contain the given
     /// key and value when hold.
     pub fn create_store_lock(&self, lock_key: String, lock_value: String) -> CryptoStoreLock {
-        CryptoStoreLock::new(self.inner.store.clone(), lock_key, lock_value)
+        panic!("Store.create_store_lock");
+        // CryptoStoreLock::new(self.inner.store.clone(), lock_key, lock_value)
     }
 }
 

@@ -68,7 +68,8 @@ use crate::{
     session_manager::{GroupSessionManager, SessionManager},
     store::{
         locks::LockStoreError, Changes, DeviceChanges, DynCryptoStore, IdentityChanges,
-        IntoCryptoStore, MemoryStore, Result as StoreResult, RoomKeyInfo, SecretImportError, Store,
+        IntoCryptoStore, MemoryStore, NoisyArc, Result as StoreResult, RoomKeyInfo,
+        SecretImportError, Store,
     },
     types::{
         events::{
@@ -175,7 +176,7 @@ impl OlmMachine {
     fn new_helper(
         user_id: &UserId,
         device_id: &DeviceId,
-        store: Arc<DynCryptoStore>,
+        store: NoisyArc<DynCryptoStore>,
         account: ReadOnlyAccount,
         user_identity: PrivateCrossSigningIdentity,
     ) -> Self {

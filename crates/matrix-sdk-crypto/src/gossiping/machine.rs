@@ -1070,7 +1070,7 @@ mod tests {
         identities::{LocalTrust, ReadOnlyDevice},
         olm::{Account, PrivateCrossSigningIdentity, ReadOnlyAccount},
         session_manager::GroupSessionCache,
-        store::{IntoCryptoStore, MemoryStore, Store},
+        store::{IntoCryptoStore, MemoryStore, NoisyArc, Store},
         types::events::room::encrypted::{EncryptedEvent, RoomEncryptedEventContent},
         verification::VerificationMachine,
     };
