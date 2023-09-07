@@ -1034,6 +1034,7 @@ mod tests {
     #[cfg(feature = "automatic-room-key-forwarding")]
     use assert_matches::assert_matches;
     use dashmap::DashMap;
+    use matrix_sdk_common::NoisyArc;
     use matrix_sdk_test::async_test;
     use ruma::{
         device_id, event_id,
@@ -1066,7 +1067,7 @@ mod tests {
         identities::{LocalTrust, ReadOnlyDevice},
         olm::{Account, PrivateCrossSigningIdentity, ReadOnlyAccount},
         session_manager::GroupSessionCache,
-        store::{CryptoStoreWrapper, MemoryStore, NoisyArc, Store},
+        store::{CryptoStoreWrapper, MemoryStore, Store},
         types::events::room::encrypted::{EncryptedEvent, RoomEncryptedEventContent},
         verification::VerificationMachine,
     };

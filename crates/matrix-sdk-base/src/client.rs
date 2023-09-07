@@ -21,8 +21,7 @@ use std::{
 use std::{ops::Deref, sync::Arc};
 
 use eyeball::{SharedObservable, Subscriber};
-use matrix_sdk_common::instant::Instant;
-use matrix_sdk_crypto::store::NoisyArc;
+use matrix_sdk_common::{instant::Instant, NoisyArc};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
     store::DynCryptoStore, EncryptionSettings, EncryptionSyncChanges, OlmError, OlmMachine,

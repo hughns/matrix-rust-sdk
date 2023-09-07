@@ -19,9 +19,12 @@ use std::{
 };
 
 use dashmap::DashMap;
-use matrix_sdk_common::deserialized_responses::{
-    AlgorithmInfo, DeviceLinkProblem, EncryptionInfo, TimelineEvent, VerificationLevel,
-    VerificationState,
+use matrix_sdk_common::{
+    deserialized_responses::{
+        AlgorithmInfo, DeviceLinkProblem, EncryptionInfo, TimelineEvent, VerificationLevel,
+        VerificationState,
+    },
+    NoisyArc,
 };
 use ruma::{
     api::client::{
@@ -70,8 +73,7 @@ use crate::{
     session_manager::{GroupSessionManager, SessionManager},
     store::{
         locks::LockStoreError, Changes, CryptoStoreWrapper, DeviceChanges, IdentityChanges,
-        IntoCryptoStore, MemoryStore, NoisyArc, Result as StoreResult, RoomKeyInfo,
-        SecretImportError, Store,
+        IntoCryptoStore, MemoryStore, Result as StoreResult, RoomKeyInfo, SecretImportError, Store,
     },
     types::{
         events::{

@@ -24,6 +24,7 @@ use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use event_enums::OutgoingContent;
 pub use machine::VerificationMachine;
+use matrix_sdk_common::NoisyArc;
 #[cfg(feature = "qrcode")]
 pub use qrcode::{QrVerification, QrVerificationState, ScanError};
 pub use requests::{VerificationRequest, VerificationRequestState};
@@ -52,7 +53,7 @@ use crate::{
     error::SignatureError,
     gossiping::{GossipMachine, GossipRequest},
     olm::{PrivateCrossSigningIdentity, ReadOnlyAccount, Session},
-    store::{Changes, CryptoStoreWrapper, NoisyArc},
+    store::{Changes, CryptoStoreWrapper},
     types::Signatures,
     CryptoStoreError, LocalTrust, OutgoingVerificationRequest, ReadOnlyDevice,
     ReadOnlyOwnUserIdentity, ReadOnlyUserIdentities,

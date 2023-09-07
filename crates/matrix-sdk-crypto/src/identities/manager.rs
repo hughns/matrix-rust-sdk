@@ -753,6 +753,7 @@ pub(crate) mod testing {
     #![allow(dead_code)]
     use std::sync::Arc;
 
+    use matrix_sdk_common::NoisyArc;
     use ruma::{
         api::{client::keys::get_keys::v3::Response as KeyQueryResponse, IncomingResponse},
         device_id, user_id, DeviceId, UserId,
@@ -787,7 +788,7 @@ pub(crate) mod testing {
         let identity = Arc::new(Mutex::new(identity));
         let user_id = user_id().to_owned();
         let account = ReadOnlyAccount::with_device_id(&user_id, device_id());
-        let store = Arc::new(CryptoStoreWrapper::new(&user_id, MemoryStore::new()));
+        let store = NoisyArc::new(CryptoStoreWrapper::new(&user_id, MemoryStore::new()));
         let verification = VerificationMachine::new(account, identity.clone(), store.clone());
         let store = Store::new(user_id.clone(), identity, store, verification);
         IdentityManager::new(user_id, device_id().into(), store)

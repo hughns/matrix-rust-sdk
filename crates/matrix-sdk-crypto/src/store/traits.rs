@@ -15,7 +15,7 @@
 use std::{collections::HashMap, fmt, sync::Arc};
 
 use async_trait::async_trait;
-use matrix_sdk_common::AsyncTraitDeps;
+use matrix_sdk_common::{AsyncTraitDeps, NoisyArc};
 use ruma::{
     events::secret::request::SecretName, DeviceId, OwnedDeviceId, RoomId, TransactionId, UserId,
 };
@@ -27,7 +27,6 @@ use crate::{
         InboundGroupSession, OlmMessageHash, OutboundGroupSession, PrivateCrossSigningIdentity,
         Session,
     },
-    store::NoisyArc,
     types::events::room_key_withheld::RoomKeyWithheldEvent,
     GossipRequest, GossippedSecret, ReadOnlyAccount, ReadOnlyDevice, ReadOnlyUserIdentities,
     SecretInfo, TrackedUser,

@@ -42,6 +42,7 @@
 // support resuming it.
 
 use hkdf::Hkdf;
+use matrix_sdk_common::NoisyArc;
 use ruma::{
     api::client::dehydrated_device::{put_dehydrated_device, DehydratedDeviceData},
     assign,
@@ -56,7 +57,7 @@ use vodozemac::LibolmPickleError;
 
 use crate::{
     olm::Account,
-    store::{CryptoStoreWrapper, MemoryStore, NoisyArc, RoomKeyInfo, Store},
+    store::{CryptoStoreWrapper, MemoryStore, RoomKeyInfo, Store},
     verification::VerificationMachine,
     EncryptionSyncChanges, OlmError, OlmMachine, ReadOnlyAccount, SignatureError,
 };

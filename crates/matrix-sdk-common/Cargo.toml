@@ -25,6 +25,7 @@ ruma = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+uuid = { version = "^1.0.0", features = ["v4"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 futures-util = { workspace = true, features = ["channel"] }

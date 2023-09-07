@@ -2,6 +2,7 @@ use std::ops::Deref;
 
 use futures_core::Stream;
 use futures_util::StreamExt;
+use matrix_sdk_common::NoisyArc;
 use ruma::{OwnedUserId, UserId};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
@@ -10,9 +11,7 @@ use tracing::warn;
 use super::{DeviceChanges, IdentityChanges};
 use crate::{
     store,
-    store::{
-        locks::CryptoStoreLock, Changes, DynCryptoStore, IntoCryptoStore, NoisyArc, RoomKeyInfo,
-    },
+    store::{locks::CryptoStoreLock, Changes, DynCryptoStore, IntoCryptoStore, RoomKeyInfo},
     GossippedSecret, ReadOnlyOwnUserIdentity,
 };
 

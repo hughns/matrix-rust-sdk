@@ -38,7 +38,7 @@ pub mod integration_tests;
 mod traits;
 
 use dashmap::DashMap;
-use matrix_sdk_crypto::store::NoisyArc;
+use matrix_sdk_common::NoisyArc;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::store::{DynCryptoStore, IntoCryptoStore};
 pub use matrix_sdk_store_encryption::Error as StoreEncryptionError;

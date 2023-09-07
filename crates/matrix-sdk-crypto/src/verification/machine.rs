@@ -19,6 +19,7 @@ use std::{
 };
 
 use dashmap::DashMap;
+use matrix_sdk_common::NoisyArc;
 use ruma::{
     events::{
         key::verification::VerificationMethod, AnyToDeviceEvent, AnyToDeviceEventContent,
@@ -41,7 +42,7 @@ use super::{
 use crate::{
     olm::PrivateCrossSigningIdentity,
     requests::OutgoingRequest,
-    store::{CryptoStoreError, CryptoStoreWrapper, NoisyArc},
+    store::{CryptoStoreError, CryptoStoreWrapper},
     OutgoingVerificationRequest, ReadOnlyAccount, ReadOnlyDevice, ReadOnlyUserIdentity,
     RoomMessageRequest, ToDeviceRequest,
 };

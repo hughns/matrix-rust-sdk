@@ -23,9 +23,12 @@ pub use ruma;
 pub mod debug;
 pub mod deserialized_responses;
 pub mod executor;
+mod noisy_arc;
 pub mod ring_buffer;
 pub mod timeout;
 pub mod tracing_timer;
+
+pub use noisy_arc::NoisyArc;
 
 /// Alias for `Send` on non-wasm, empty trait (implemented by everything) on
 /// wasm.
