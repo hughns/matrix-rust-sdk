@@ -12,6 +12,8 @@ use tracing::{error, info};
 #[derive(Debug)]
 pub struct NoisyArc<T: ?Sized> {
     ptr: Arc<NoisyArcInner<T>>,
+
+    /// unique id for this ref to the inner
     id: u64,
 }
 
@@ -30,7 +32,7 @@ impl<T: ?Sized + Debug> Clone for NoisyArc<T> {
 
 impl<T: ?Sized> Drop for NoisyArc<T> {
     fn drop(&mut self) {
-        info!("NoisyArc::drop. Refcount before drop {}", Arc::strong_count(&self.ptr));
+        info!("NoisyArc::drop({}). Refcount before drop {}", self.id, Arc::strong_count(&self.ptr));
     }
 }
 
