@@ -20,7 +20,7 @@ use async_once_cell::OnceCell as AsyncOnceCell;
 use matrix_sdk::{SlidingSync, SlidingSyncRoom};
 use ruma::{
     api::client::sync::sync_events::{v4::RoomSubscription, UnreadNotificationsCount},
-    RoomId,
+    OwnedMxcUri, RoomId,
 };
 
 use super::Error;
@@ -46,7 +46,7 @@ struct RoomInner {
     sliding_sync_room: SlidingSyncRoom,
 
     /// The underlying client room.
-    room: matrix_sdk::room::Room,
+    room: matrix_sdk::Room,
 
     /// The timeline of the room.
     timeline: AsyncOnceCell<Arc<Timeline>>,
@@ -89,8 +89,16 @@ impl Room {
         })
     }
 
-    /// Get the underlying [`matrix_sdk::room::Room`].
-    pub fn inner_room(&self) -> &matrix_sdk::room::Room {
+    /// Get the best possible avatar for the room.
+    ///
+    /// If the sliding sync room has received an avatar from the server, then
+    /// use it, otherwise, let's try to find one from `Room`.
+    pub fn avatar_url(&self) -> Option<OwnedMxcUri> {
+        self.inner.sliding_sync_room.avatar_url().or_else(|| self.inner.room.avatar_url())
+    }
+
+    /// Get the underlying [`matrix_sdk::Room`].
+    pub fn inner_room(&self) -> &matrix_sdk::Room {
         &self.inner.room
     }
 
@@ -129,13 +137,27 @@ impl Room {
             .clone()
     }
 
-    /// Get the latest event in the timeline, if we already have it cached. Does
-    /// not fetch any events or calculate anything - if it's not already
-    /// available, we return None.
+    /// Get the latest event in the timeline.
     ///
-    /// It's different from `Self::timeline().latest_event()` as it won't track
-    /// the read marker and receipts.
+    /// The latest event comes first from the `Timeline` if it exists and if it
+    /// contains a local event. Otherwise, it comes from the cache. This method
+    /// does not fetch any events or calculate anything — if it's not
+    /// already available, we return `None`.
     pub async fn latest_event(&self) -> Option<EventTimelineItem> {
+        // Look for a local event in the `Timeline`.
+        //
+        // First off, let's see if a `Timeline` exists…
+        if let Some(timeline) = self.inner.timeline.get() {
+            // If it contains a `latest_event`…
+            if let Some(timeline_last_event) = timeline.latest_event().await {
+                // If it's a local echo…
+                if timeline_last_event.is_local_echo() {
+                    return Some(timeline_last_event);
+                }
+            }
+        }
+
+        // Otherwise, fallback to the classical path.
         self.inner.sliding_sync_room.latest_timeline_item().await
     }
 

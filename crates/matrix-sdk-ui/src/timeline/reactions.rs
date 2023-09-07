@@ -12,7 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ruma::{OwnedEventId, OwnedTransactionId};
+use std::collections::HashMap;
+
+use indexmap::IndexSet;
+use ruma::{
+    events::relation::Annotation, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId,
+    OwnedUserId,
+};
+
+use super::event_item::EventItemIdentifier;
+
+/// Data associated with a reaction sender. It can be used to display
+/// a details UI component for a reaction with both sender
+/// names and the date at which they sent a reaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReactionSenderData {
+    /// Sender identifier.
+    pub sender_id: OwnedUserId,
+    /// Date at which the sender reacted.
+    pub timestamp: MilliSecondsSinceUnixEpoch,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct Reactions {
+    /// Reaction event / txn ID => sender and reaction data.
+    pub(super) map: HashMap<EventItemIdentifier, (ReactionSenderData, Annotation)>,
+    /// ID of event that is not in the timeline yet => List of reaction event
+    /// IDs.
+    pub(super) pending: HashMap<OwnedEventId, IndexSet<OwnedEventId>>,
+}
+
+impl Reactions {
+    pub(super) fn clear(&mut self) {
+        self.map.clear();
+        self.pending.clear();
+    }
+}
 
 /// The result of toggling a reaction
 ///

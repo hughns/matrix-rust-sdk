@@ -13,8 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "experimental-sliding-sync")]
-use std::sync::RwLock as StdRwLock;
 use std::{fmt, sync::Arc};
 
 use matrix_sdk_base::{store::StoreConfig, BaseClient};
@@ -23,7 +21,6 @@ use ruma::{
     OwnedServerName, ServerName,
 };
 use thiserror::Error;
-use tokio::sync::{broadcast, Mutex, OnceCell, RwLock};
 use tracing::{debug, field::debug, instrument, Span};
 use url::Url;
 
@@ -74,11 +71,12 @@ use crate::{config::RequestConfig, error::RumaApiError, http_client::HttpClient,
 #[derive(Clone, Debug)]
 pub struct ClientBuilder {
     homeserver_cfg: Option<HomeserverConfig>,
+    #[cfg(feature = "experimental-sliding-sync")]
+    sliding_sync_proxy: Option<String>,
     http_cfg: Option<HttpConfig>,
     store_config: BuilderStoreConfig,
     request_config: RequestConfig,
     respect_login_well_known: bool,
-    appservice_mode: bool,
     server_versions: Option<Box<[MatrixVersion]>>,
     handle_refresh_tokens: bool,
     base_client: Option<BaseClient>,
@@ -88,11 +86,12 @@ impl ClientBuilder {
     pub(crate) fn new() -> Self {
         Self {
             homeserver_cfg: None,
+            #[cfg(feature = "experimental-sliding-sync")]
+            sliding_sync_proxy: None,
             http_cfg: None,
             store_config: BuilderStoreConfig::Custom(StoreConfig::default()),
             request_config: Default::default(),
             respect_login_well_known: true,
-            appservice_mode: false,
             server_versions: None,
             handle_refresh_tokens: false,
             base_client: None,
@@ -109,13 +108,46 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the sliding-sync proxy URL to use.
+    ///
+    /// This is used only if the homeserver URL was defined with
+    /// [`Self::homeserver_url`]. If the homeserver address was defined with
+    /// [`Self::server_name`], then auto-discovery via the `.well-known`
+    /// endpoint will be performed.
+    #[cfg(feature = "experimental-sliding-sync")]
+    pub fn sliding_sync_proxy(mut self, url: impl AsRef<str>) -> Self {
+        self.sliding_sync_proxy = Some(url.as_ref().to_owned());
+        self
+    }
+
     /// Set the server name to discover the homeserver from.
+    ///
+    /// We assume we can connect in HTTPS to that server. If that's not the
+    /// case, prefer using [`Self::insecure_server_name_no_tls`].
     ///
     /// This method is mutually exclusive with
     /// [`homeserver_url()`][Self::homeserver_url], if you set both whatever was
     /// set last will be used.
     pub fn server_name(mut self, server_name: &ServerName) -> Self {
-        self.homeserver_cfg = Some(HomeserverConfig::ServerName(server_name.to_owned()));
+        self.homeserver_cfg = Some(HomeserverConfig::ServerName {
+            server: server_name.to_owned(),
+            // Assume HTTPS if not specified.
+            protocol: UrlScheme::Https,
+        });
+        self
+    }
+
+    /// Set the server name to discover the homeserver from, assuming an HTTP
+    /// (not secured) scheme.
+    ///
+    /// This method is mutually exclusive with
+    /// [`homeserver_url()`][Self::homeserver_url], if you set both whatever was
+    /// set last will be used.
+    pub fn insecure_server_name_no_tls(mut self, server_name: &ServerName) -> Self {
+        self.homeserver_cfg = Some(HomeserverConfig::ServerName {
+            server: server_name.to_owned(),
+            protocol: UrlScheme::Http,
+        });
         self
     }
 
@@ -236,33 +268,6 @@ impl ClientBuilder {
         self
     }
 
-    /// Puts the client into application service mode
-    ///
-    /// This is low-level functionality. For an high-level API check the
-    /// `matrix_sdk_appservice` crate.
-    #[doc(hidden)]
-    #[cfg(feature = "appservice")]
-    pub fn appservice_mode(mut self) -> Self {
-        self.appservice_mode = true;
-        self
-    }
-
-    /// All outgoing http requests will have a GET query key-value appended with
-    /// `user_id` being the key and the `user_id` from the `Session` being
-    /// the value. This is called [identity assertion] in the
-    /// Matrix Application Service Spec.
-    ///
-    /// Requests that don't require authentication might not do identity
-    /// assertion.
-    ///
-    /// [identity assertion]: https://spec.matrix.org/unstable/application-service-api/#identity-assertion
-    #[doc(hidden)]
-    #[cfg(feature = "appservice")]
-    pub fn assert_identity(mut self) -> Self {
-        self.request_config.assert_identity = true;
-        self
-    }
-
     /// Specify the Matrix versions supported by the homeserver manually, rather
     /// than `build()` doing it using a `get_supported_versions` request.
     ///
@@ -360,20 +365,32 @@ impl ClientBuilder {
         let http_client = HttpClient::new(inner_http_client.clone(), self.request_config);
 
         let mut authentication_server_info = None;
+
         #[cfg(feature = "experimental-sliding-sync")]
         let mut sliding_sync_proxy: Option<Url> = None;
+
         let homeserver = match homeserver_cfg {
-            HomeserverConfig::Url(url) => url,
-            HomeserverConfig::ServerName(server_name) => {
+            HomeserverConfig::Url(url) => {
+                #[cfg(feature = "experimental-sliding-sync")]
+                {
+                    sliding_sync_proxy =
+                        self.sliding_sync_proxy.as_ref().map(|url| Url::parse(url)).transpose()?;
+                }
+                url
+            }
+            HomeserverConfig::ServerName { server: server_name, protocol } => {
                 debug!("Trying to discover the homeserver");
 
-                let homeserver = homeserver_from_name(&server_name);
+                let homeserver = match protocol {
+                    UrlScheme::Http => format!("http://{server_name}"),
+                    UrlScheme::Https => format!("https://{server_name}"),
+                };
+
                 let well_known = http_client
                     .send(
                         discover_homeserver::Request::new(),
                         Some(RequestConfig::short_retry()),
                         homeserver,
-                        None,
                         None,
                         &[MatrixVersion::V1_0],
                         Default::default(),
@@ -390,6 +407,7 @@ impl ClientBuilder {
                 if let Some(proxy) = well_known.sliding_sync_proxy.map(|p| p.url) {
                     sliding_sync_proxy = Url::parse(&proxy).ok();
                 }
+
                 debug!(
                     homeserver_url = well_known.homeserver.base_url,
                     "Discovered the homeserver"
@@ -399,39 +417,19 @@ impl ClientBuilder {
             }
         };
 
-        let homeserver = RwLock::new(Url::parse(&homeserver)?);
+        let homeserver = Url::parse(&homeserver)?;
 
-        let (unknown_token_error_sender, _) = broadcast::channel(1);
-
-        let inner = Arc::new(ClientInner {
+        let inner = Arc::new(ClientInner::new(
             homeserver,
             authentication_server_info,
             #[cfg(feature = "experimental-sliding-sync")]
-            sliding_sync_proxy: StdRwLock::new(sliding_sync_proxy),
+            sliding_sync_proxy,
             http_client,
             base_client,
-            server_versions: OnceCell::new_with(self.server_versions),
-            #[cfg(feature = "e2e-encryption")]
-            group_session_locks: Default::default(),
-            #[cfg(feature = "e2e-encryption")]
-            key_claim_lock: Default::default(),
-            members_request_locks: Default::default(),
-            encryption_state_request_locks: Default::default(),
-            typing_notice_times: Default::default(),
-            event_handlers: Default::default(),
-            notification_handlers: Default::default(),
-            room_update_channels: Default::default(),
-            sync_gap_broadcast_txs: Default::default(),
-            appservice_mode: self.appservice_mode,
-            respect_login_well_known: self.respect_login_well_known,
-            sync_beat: event_listener::Event::new(),
-            handle_refresh_tokens: self.handle_refresh_tokens,
-            refresh_token_lock: Mutex::new(Ok(())),
-            unknown_token_error_sender,
-            auth_data: Default::default(),
-            #[cfg(feature = "e2e-encryption")]
-            cross_process_crypto_store_lock: OnceCell::new(),
-        });
+            self.server_versions,
+            self.respect_login_well_known,
+            self.handle_refresh_tokens,
+        ));
 
         debug!("Done building the Client");
 
@@ -439,20 +437,18 @@ impl ClientBuilder {
     }
 }
 
-fn homeserver_from_name(server_name: &ServerName) -> String {
-    #[cfg(not(test))]
-    return format!("https://{server_name}");
-
-    // Wiremock only knows how to test http endpoints:
-    // https://github.com/LukeMathWalker/wiremock-rs/issues/58
-    #[cfg(test)]
-    return format!("http://{server_name}");
+#[derive(Clone, Debug)]
+enum UrlScheme {
+    Http,
+    Https,
 }
 
 #[derive(Clone, Debug)]
 enum HomeserverConfig {
+    /// A precise URL, including the protocol.
     Url(String),
-    ServerName(OwnedServerName),
+    /// A host/port pair representing a server URL.
+    ServerName { server: OwnedServerName, protocol: UrlScheme },
 }
 
 #[derive(Clone, Debug)]

@@ -1,5 +1,10 @@
 # unreleased
 
+- Add initial support for MSC3814 - dehydrated devices.
+
+- Mark our `OwnUserIdentity` as verified if we successfully import the matching
+  private keys.
+
 - The `OlmMachine::export_cross_signing_keys()` method now returns a `Result`.
   This removes an `unwrap()` from the codebase.
 
@@ -46,3 +51,15 @@
 
 - Add new API `OlmMachine::query_keys_for_users` for generating out-of-band key
   queries.
+
+- Rename "recovery key" to "backup decryption key" to avoid confusion with the
+  secret-storage key which is also known as a recovery key.
+
+  This affects the `matrix_sdk_crypto::store::RecoveryKey` struct itself (now
+  renamed to `BackupDecryptionKey`, as well as
+  `BackupMachine::save_recovery_key` (now `save_decryption_key`).
+
+- Change the returned success value type of `BackupMachine::backup` from
+  `OutgoingRequest` to `(OwnedTransactionId, KeysBackupRequest)`.
+
+- Expose new `OlmMachine::get_room_event_encryption_info` method.

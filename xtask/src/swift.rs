@@ -1,8 +1,6 @@
-use std::{
-    fs::{copy, create_dir_all, remove_dir_all, remove_file, rename},
-    path::{Path, PathBuf},
-};
+use std::fs::{copy, create_dir_all, remove_dir_all, remove_file, rename};
 
+use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Subcommand};
 use uniffi_bindgen::bindings::TargetLanguage;
 use xshell::{cmd, pushd};
@@ -38,7 +36,7 @@ enum SwiftCommand {
         /// Move the generated xcframework and swift sources into the given
         /// components-folder
         #[clap(long)]
-        components_path: Option<PathBuf>,
+        components_path: Option<Utf8PathBuf>,
     },
 }
 
@@ -69,7 +67,7 @@ fn build_library() -> Result<()> {
 
     create_dir_all(ffi_directory.as_path())?;
 
-    cmd!("cargo build -p matrix-sdk-ffi").run()?;
+    cmd!("rustup run stable cargo build -p matrix-sdk-ffi").run()?;
 
     rename(
         target_directory.join(release_type).join(static_lib_filename),
@@ -95,28 +93,24 @@ fn build_library() -> Result<()> {
     Ok(())
 }
 
-fn generate_uniffi(library_file: &Path, ffi_directory: &Path) -> Result<()> {
+fn generate_uniffi(library_file: &Utf8Path, ffi_directory: &Utf8Path) -> Result<()> {
     let root_directory = workspace::root_path()?;
-    let udl_file = camino::Utf8PathBuf::from_path_buf(
-        root_directory.join("bindings/matrix-sdk-ffi/src/api.udl"),
-    )
-    .unwrap();
-    let outdir_overwrite = camino::Utf8Path::from_path(ffi_directory).unwrap();
-    let library_path = camino::Utf8Path::from_path(library_file).unwrap();
+    let udl_file = root_directory.join("bindings/matrix-sdk-ffi/src/api.udl");
 
     uniffi_bindgen::generate_bindings(
         udl_file.as_path(),
         None,
         vec![TargetLanguage::Swift],
-        Some(outdir_overwrite),
-        Some(library_path),
+        Some(ffi_directory),
+        Some(library_file),
         false,
     )?;
     Ok(())
 }
 
-fn build_for_target(target: &str, profile: &str) -> Result<PathBuf> {
-    cmd!("cargo build -p matrix-sdk-ffi --target {target} --profile {profile}").run()?;
+fn build_for_target(target: &str, profile: &str) -> Result<Utf8PathBuf> {
+    cmd!("rustup run stable cargo build -p matrix-sdk-ffi --target {target} --profile {profile}")
+        .run()?;
 
     // The builtin dev profile has its files stored under target/debug, all
     // other targets have matching directory names
@@ -127,7 +121,7 @@ fn build_for_target(target: &str, profile: &str) -> Result<PathBuf> {
 fn build_xcframework(
     profile: &str,
     only_target: Option<String>,
-    components_path: Option<PathBuf>,
+    components_path: Option<Utf8PathBuf>,
 ) -> Result<()> {
     let root_dir = workspace::root_path()?;
     let apple_dir = root_dir.join("bindings/apple");
@@ -198,13 +192,13 @@ fn build_xcframework(
     println!("-- Generating MatrixSDKFFI.xcframework framework");
     let xcframework_path = generated_dir.join("MatrixSDKFFI.xcframework");
     if xcframework_path.exists() {
-        remove_dir_all(xcframework_path.as_path())?;
+        remove_dir_all(&xcframework_path)?;
     }
     let mut cmd = cmd!("xcodebuild -create-xcframework");
     for p in libs {
-        cmd = cmd.arg("-library").arg(p).arg("-headers").arg(headers_dir.as_path())
+        cmd = cmd.arg("-library").arg(p).arg("-headers").arg(&headers_dir)
     }
-    cmd.arg("-output").arg(xcframework_path.as_path()).run()?;
+    cmd.arg("-output").arg(&xcframework_path).run()?;
 
     // Copy the Swift package manifest to the SDK root for local development.
     copy(apple_dir.join("Debug-Package.swift"), root_dir.join("Package.swift"))?;
@@ -222,22 +216,22 @@ fn build_xcframework(
     remove_dir_all(headers_dir.as_path())?;
 
     if let Some(path) = components_path {
-        println!("-- Copying MatrixSDKFFI.xcframework to {path:?}");
+        println!("-- Copying MatrixSDKFFI.xcframework to {path}");
         let framework_target = path.join("MatrixSDKFFI.xcframework");
         let swift_target = path.join("Sources/MatrixRustSDK");
         if framework_target.exists() {
-            remove_dir_all(framework_target.as_path())?;
+            remove_dir_all(&framework_target)?;
         }
         if swift_target.exists() {
-            remove_dir_all(swift_target.as_path())?;
+            remove_dir_all(&swift_target)?;
         }
-        create_dir_all(framework_target.as_path())?;
-        create_dir_all(swift_target.as_path())?;
+        create_dir_all(&framework_target)?;
+        create_dir_all(&swift_target)?;
 
         let copy_options = fs_extra::dir::CopyOptions { content_only: true, ..Default::default() };
 
-        fs_extra::dir::copy(xcframework_path.as_path(), framework_target.as_path(), &copy_options)?;
-        fs_extra::dir::copy(swift_dir.as_path(), swift_target.as_path(), &copy_options)?;
+        fs_extra::dir::copy(&xcframework_path, &framework_target, &copy_options)?;
+        fs_extra::dir::copy(&swift_dir, &swift_target, &copy_options)?;
     }
 
     println!("-- All done and hunky dory. Enjoy!");

@@ -1,13 +1,11 @@
 use std::{fs, path::PathBuf, sync::Arc};
 
-use anyhow::anyhow;
 use matrix_sdk::{
-    config::StoreConfig,
     ruma::{
         api::{error::UnknownVersionError, MatrixVersion},
         ServerName, UserId,
     },
-    Client as MatrixClient, ClientBuilder as MatrixClientBuilder, MemoryStore, SqliteCryptoStore,
+    Client as MatrixClient, ClientBuilder as MatrixClientBuilder,
 };
 use sanitize_filename_reader_friendly::sanitize;
 use url::Url;
@@ -16,11 +14,17 @@ use zeroize::Zeroizing;
 use super::{client::Client, RUNTIME};
 use crate::{error::ClientError, helpers::unwrap_or_clone_arc};
 
+#[derive(Clone)]
+pub(crate) enum UrlScheme {
+    Http,
+    Https,
+}
+
 #[derive(Clone, uniffi::Object)]
 pub struct ClientBuilder {
     base_path: Option<String>,
     username: Option<String>,
-    server_name: Option<String>,
+    server_name: Option<(String, UrlScheme)>,
     homeserver_url: Option<String>,
     server_versions: Option<Vec<String>>,
     passphrase: Zeroizing<Option<String>>,
@@ -28,8 +32,8 @@ pub struct ClientBuilder {
     sliding_sync_proxy: Option<String>,
     proxy: Option<String>,
     disable_ssl_verification: bool,
+    disable_automatic_token_refresh: bool,
     inner: MatrixClientBuilder,
-    with_memory_state_store: bool,
 }
 
 #[uniffi::export]
@@ -59,7 +63,8 @@ impl ClientBuilder {
 
     pub fn server_name(self: Arc<Self>, server_name: String) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
-        builder.server_name = Some(server_name);
+        // Assume HTTPS if no protocol is provided.
+        builder.server_name = Some((server_name, UrlScheme::Https));
         Arc::new(builder)
     }
 
@@ -99,9 +104,9 @@ impl ClientBuilder {
         Arc::new(builder)
     }
 
-    pub fn with_memory_state_store(self: Arc<Self>) -> Arc<Self> {
+    pub fn disable_automatic_token_refresh(self: Arc<Self>) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
-        builder.with_memory_state_store = true;
+        builder.disable_automatic_token_refresh = true;
         Arc::new(builder)
     }
 
@@ -111,6 +116,16 @@ impl ClientBuilder {
 }
 
 impl ClientBuilder {
+    pub(crate) fn server_name_with_protocol(
+        self: Arc<Self>,
+        server_name: String,
+        protocol: UrlScheme,
+    ) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.server_name = Some((server_name, protocol));
+        Arc::new(builder)
+    }
+
     pub(crate) fn build_inner(self: Arc<Self>) -> anyhow::Result<Arc<Client>> {
         let builder = unwrap_or_clone_arc(self);
         let mut inner_builder = builder.inner;
@@ -120,34 +135,25 @@ impl ClientBuilder {
             let data_path = PathBuf::from(base_path).join(sanitize(username));
             fs::create_dir_all(&data_path)?;
 
-            if builder.with_memory_state_store {
-                let sqlite_crypto_store = RUNTIME.block_on(async move {
-                    SqliteCryptoStore::open(&data_path, builder.passphrase.as_deref()).await
-                })?;
-                inner_builder = inner_builder.store_config(
-                    StoreConfig::new()
-                        .crypto_store(sqlite_crypto_store)
-                        .state_store(MemoryStore::new()),
-                );
-            } else {
-                inner_builder =
-                    inner_builder.sqlite_store(&data_path, builder.passphrase.as_deref());
-            }
+            inner_builder = inner_builder.sqlite_store(&data_path, builder.passphrase.as_deref());
         }
 
         // Determine server either from URL, server name or user ID.
         if let Some(homeserver_url) = builder.homeserver_url {
             inner_builder = inner_builder.homeserver_url(homeserver_url);
-        } else if let Some(server_name) = builder.server_name {
+        } else if let Some((server_name, protocol)) = builder.server_name {
             let server_name = ServerName::parse(server_name)?;
-            inner_builder = inner_builder.server_name(&server_name);
+            inner_builder = match protocol {
+                UrlScheme::Http => inner_builder.insecure_server_name_no_tls(&server_name),
+                UrlScheme::Https => inner_builder.server_name(&server_name),
+            };
         } else if let Some(username) = builder.username {
             let user = UserId::parse(username)?;
             inner_builder = inner_builder.server_name(user.server_name());
         } else {
-            return Err(anyhow!(
+            anyhow::bail!(
                 "Failed to build: One of homeserver_url, server_name or username must be called."
-            ));
+            );
         }
 
         if let Some(proxy) = builder.proxy {
@@ -156,6 +162,10 @@ impl ClientBuilder {
 
         if builder.disable_ssl_verification {
             inner_builder = inner_builder.disable_ssl_verification();
+        }
+
+        if !builder.disable_automatic_token_refresh {
+            inner_builder = inner_builder.handle_refresh_tokens();
         }
 
         if let Some(user_agent) = builder.user_agent {
@@ -190,9 +200,7 @@ impl ClientBuilder {
             sdk_client.set_sliding_sync_proxy(Some(Url::parse(&sliding_sync_proxy)?));
         }
 
-        let client = Client::new(sdk_client);
-
-        Ok(Arc::new(client))
+        Ok(Client::new(sdk_client))
     }
 }
 
@@ -209,8 +217,8 @@ impl Default for ClientBuilder {
             sliding_sync_proxy: None,
             proxy: None,
             disable_ssl_verification: false,
+            disable_automatic_token_refresh: false,
             inner: MatrixClient::builder(),
-            with_memory_state_store: false,
         }
     }
 }

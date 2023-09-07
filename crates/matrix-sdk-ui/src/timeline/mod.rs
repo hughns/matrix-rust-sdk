@@ -16,7 +16,7 @@
 //!
 //! See [`Timeline`] for details.
 
-use std::{ops::Deref, pin::Pin, sync::Arc, task::Poll, time::Duration};
+use std::{pin::Pin, sync::Arc, task::Poll, time::Duration};
 
 use async_std::sync::{Condvar, Mutex};
 use eyeball::{SharedObservable, Subscriber};
@@ -27,9 +27,10 @@ use matrix_sdk::{
     attachment::AttachmentConfig,
     event_handler::EventHandlerHandle,
     executor::JoinHandle,
-    room::{self, Joined, MessagesOptions, Receipts, Room},
+    room::{MessagesOptions, Receipts, Room},
     Client, Result,
 };
+use matrix_sdk_base::RoomState;
 use mime::Mime;
 use pin_project_lite::pin_project;
 use ruma::{
@@ -39,9 +40,10 @@ use ruma::{
         reaction::ReactionEventContent,
         receipt::{Receipt, ReceiptThread},
         relation::Annotation,
-        room::{message::sanitize::HtmlSanitizerMode, redaction::RoomRedactionEventContent},
+        room::redaction::RoomRedactionEventContent,
         AnyMessageLikeEventContent,
     },
+    html::HtmlSanitizerMode,
     EventId, OwnedEventId, OwnedTransactionId, TransactionId, UserId,
 };
 use thiserror::Error;
@@ -55,20 +57,19 @@ mod futures;
 mod inner;
 mod item;
 mod pagination;
+mod polls;
 mod queue;
 mod reactions;
 mod read_receipts;
-#[cfg(feature = "experimental-sliding-sync")]
 mod sliding_sync_ext;
 #[cfg(test)]
 mod tests;
 #[cfg(feature = "e2e-encryption")]
 mod to_device;
 mod traits;
+mod util;
 mod virtual_item;
 
-#[cfg(feature = "experimental-sliding-sync")]
-pub use self::sliding_sync_ext::SlidingSyncRoomExt;
 pub use self::{
     builder::TimelineBuilder,
     event_item::{
@@ -80,14 +81,17 @@ pub use self::{
     futures::SendAttachment,
     item::{TimelineItem, TimelineItemKind},
     pagination::{PaginationOptions, PaginationOutcome},
+    polls::PollResult,
+    reactions::ReactionSenderData,
+    sliding_sync_ext::SlidingSyncRoomExt,
     traits::RoomExt,
     virtual_item::VirtualTimelineItem,
 };
 use self::{
-    event_item::EventTimelineItemKind,
     inner::{ReactionAction, TimelineInner, TimelineInnerState},
     queue::LocalMessage,
     reactions::ReactionToggleResult,
+    util::rfind_event_by_id,
 };
 
 /// The default sanitizer mode used when sanitizing HTML.
@@ -100,14 +104,14 @@ const DEFAULT_SANITIZER_MODE: HtmlSanitizerMode = HtmlSanitizerMode::Compat;
 /// messages.
 #[derive(Debug)]
 pub struct Timeline {
-    inner: TimelineInner<room::Common>,
+    inner: TimelineInner,
 
     start_token: Arc<Mutex<Option<String>>>,
     start_token_condvar: Arc<Condvar>,
     /// Observable for whether a pagination is currently running
     back_pagination_status: SharedObservable<BackPaginationStatus>,
 
-    _end_token: Mutex<Option<String>>,
+    _end_token: Arc<Mutex<Option<String>>>,
     msg_sender: Sender<LocalMessage>,
     drop_handle: Arc<TimelineDropHandle>,
 }
@@ -126,23 +130,15 @@ impl From<&Annotation> for AnnotationKey {
 }
 
 impl Timeline {
-    pub(crate) fn builder(room: &room::Common) -> TimelineBuilder {
+    pub(crate) fn builder(room: &Room) -> TimelineBuilder {
         TimelineBuilder::new(room)
     }
 
-    fn room(&self) -> &room::Common {
+    fn room(&self) -> &Room {
         self.inner.room()
     }
 
-    fn joined_room(&self) -> Result<Joined, Error> {
-        match Room::from(self.room().clone()) {
-            Room::Joined(room) => Ok(room),
-            _ => Err(Error::RoomNotJoined),
-        }
-    }
-
     /// Clear all timeline items, and reset pagination parameters.
-    #[cfg(feature = "experimental-sliding-sync")]
     pub async fn clear(&self) {
         let mut start_lock = self.start_token.lock().await;
         let mut end_lock = self._end_token.lock().await;
@@ -203,15 +199,11 @@ impl Timeline {
                 outcome.events_received = messages.chunk.len().try_into().ok()?;
                 outcome.total_events_received =
                     outcome.total_events_received.checked_add(outcome.events_received)?;
-                outcome.items_added = 0;
-                outcome.items_updated = 0;
 
-                for room_ev in messages.chunk {
-                    let res = self.inner.handle_back_paginated_event(room_ev).await;
-                    outcome.items_added = outcome.items_added.checked_add(res.item_added as u16)?;
-                    outcome.items_updated = outcome.items_updated.checked_add(res.items_updated)?;
-                }
+                let res = self.inner.handle_back_paginated_events(messages.chunk).await?;
 
+                outcome.items_added = res.items_added;
+                outcome.items_updated = res.items_updated;
                 outcome.total_items_added =
                     outcome.total_items_added.checked_add(outcome.items_added)?;
                 outcome.total_items_updated =
@@ -298,12 +290,6 @@ impl Timeline {
         Some(item.to_owned())
     }
 
-    /// Get the current list of timeline items. Do not use this in production!
-    #[cfg(feature = "testing")]
-    pub async fn items(&self) -> Vector<Arc<TimelineItem>> {
-        self.inner.items().await
-    }
-
     /// Get the latest of the timeline's event items.
     pub async fn latest_event(&self) -> Option<EventTimelineItem> {
         self.inner.items().await.last()?.as_event().cloned()
@@ -321,12 +307,15 @@ impl Timeline {
         (items, stream)
     }
 
-    #[cfg(feature = "testing")]
-    pub async fn subscribe_filter_map<U: Clone>(
+    /// Get the current timeline items, and a batched stream of changes.
+    ///
+    /// In contrast to [`subscribe`](Self::subscribe), this stream can yield
+    /// multiple diffs at once. The batching is done such that no arbitrary
+    /// delays are added.
+    pub async fn subscribe_batched(
         &self,
-        f: impl Fn(Arc<TimelineItem>) -> Option<U>,
-    ) -> (Vector<U>, impl Stream<Item = VectorDiff<U>>) {
-        let (items, stream) = self.inner.subscribe_filter_map(f).await;
+    ) -> (Vector<Arc<TimelineItem>>, impl Stream<Item = Vec<VectorDiff<Arc<TimelineItem>>>>) {
+        let (items, stream) = self.inner.subscribe_batched().await;
         let stream = TimelineStream::new(stream, self.drop_handle.clone());
         (items, stream)
     }
@@ -407,13 +396,13 @@ impl Timeline {
 
     /// Redact a reaction event from the homeserver
     async fn redact_reaction(&self, event_id: &EventId) -> ReactionToggleResult {
+        let room = self.room();
+        if room.state() != RoomState::Joined {
+            return ReactionToggleResult::RedactFailure { event_id: event_id.to_owned() };
+        }
+
         let txn_id = TransactionId::new();
         let no_reason = RoomRedactionEventContent::default();
-        let room = self.joined_room();
-
-        let Ok(room) = room else {
-            return ReactionToggleResult::RedactFailure { event_id: event_id.to_owned() };
-        };
 
         let response = room.redact(event_id, no_reason.reason.as_deref(), Some(txn_id)).await;
 
@@ -429,8 +418,10 @@ impl Timeline {
         annotation: &Annotation,
         txn_id: OwnedTransactionId,
     ) -> ReactionToggleResult {
-        let room = self.joined_room();
-        let Ok(room) = room else { return ReactionToggleResult::AddFailure { txn_id } };
+        let room = self.room();
+        if room.state() != RoomState::Joined {
+            return ReactionToggleResult::AddFailure { txn_id };
+        }
 
         let event_content =
             AnyMessageLikeEventContent::Reaction(ReactionEventContent::from(annotation.clone()));
@@ -505,6 +496,9 @@ impl Timeline {
             | TimelineItemContent::FailedToParseState { .. } => {
                 error_return!("Invalid state: attempting to retry a failed-to-parse item");
             }
+            TimelineItemContent::Poll(poll_state) => {
+                AnyMessageLikeEventContent::UnstablePollStart(poll_state.into())
+            }
         };
 
         let txn_id = txn_id.to_owned();
@@ -576,10 +570,9 @@ impl Timeline {
 
     /// Get the latest read receipt for the given user.
     ///
-    /// Contrary to [`Common::user_receipt()`](room::Common::user_receipt) that
-    /// only keeps track of read receipts received from the homeserver, this
-    /// keeps also track of implicit read receipts in this timeline, i.e.
-    /// when a room member sends an event.
+    /// Contrary to [`Room::user_receipt()`] that only keeps track of read
+    /// receipts received from the homeserver, this keeps also track of implicit
+    /// read receipts in this timeline, i.e. when a room member sends an event.
     #[instrument(skip(self))]
     pub async fn latest_user_read_receipt(
         &self,
@@ -590,11 +583,9 @@ impl Timeline {
 
     /// Send the given receipt.
     ///
-    /// This uses [`Joined::send_single_receipt`] internally, but checks
+    /// This uses [`Room::send_single_receipt`] internally, but checks
     /// first if the receipt points to an event in this timeline that is more
     /// recent than the current ones, to avoid unnecessary requests.
-    ///
-    /// [`Joined::send_single_receipt`]: room::Joined::send_single_receipt
     #[instrument(skip(self))]
     pub async fn send_single_receipt(
         &self,
@@ -606,21 +597,15 @@ impl Timeline {
             return Ok(());
         }
 
-        let Room::Joined(room) = Room::from(self.room().clone()) else {
-            // FIXME: Probably not exactly right
-            return Err(matrix_sdk::Error::InconsistentState);
-        };
-
-        room.send_single_receipt(receipt_type, thread, event_id).await
+        self.room().send_single_receipt(receipt_type, thread, event_id).await
     }
 
     /// Send the given receipts.
     ///
-    /// This uses [`Joined::send_multiple_receipts`] internally, but checks
-    /// first if the receipts point to events in this timeline that are more
-    /// recent than the current ones, to avoid unnecessary requests.
-    ///
-    /// [`Joined::send_multiple_receipts`]: room::Joined::send_multiple_receipts
+    /// This uses [`Room::send_multiple_receipts`] internally, but
+    /// checks first if the receipts point to events in this timeline that
+    /// are more recent than the current ones, to avoid unnecessary
+    /// requests.
     #[instrument(skip(self))]
     pub async fn send_multiple_receipts(&self, mut receipts: Receipts) -> Result<()> {
         if let Some(fully_read) = &receipts.fully_read {
@@ -661,12 +646,25 @@ impl Timeline {
             }
         }
 
-        let Room::Joined(room) = Room::from(self.room().clone()) else {
-            // FIXME: Probably not exactly right
-            return Err(matrix_sdk::Error::InconsistentState);
-        };
+        self.room().send_multiple_receipts(receipts).await
+    }
+}
 
-        room.send_multiple_receipts(receipts).await
+/// Test helpers, likely not very useful in production.
+#[doc(hidden)]
+impl Timeline {
+    /// Get the current list of timeline items.
+    pub async fn items(&self) -> Vector<Arc<TimelineItem>> {
+        self.inner.items().await
+    }
+
+    pub async fn subscribe_filter_map<U: Clone>(
+        &self,
+        f: impl Fn(Arc<TimelineItem>) -> Option<U>,
+    ) -> (Vector<U>, impl Stream<Item = VectorDiff<U>>) {
+        let (items, stream) = self.inner.subscribe_filter_map(f).await;
+        let stream = TimelineStream::new(stream, self.drop_handle.clone());
+        (items, stream)
     }
 }
 
@@ -675,6 +673,7 @@ struct TimelineDropHandle {
     client: Client,
     event_handler_handles: Vec<EventHandlerHandle>,
     room_update_join_handle: JoinHandle<()>,
+    ignore_user_list_update_join_handle: JoinHandle<()>,
 }
 
 impl Drop for TimelineDropHandle {
@@ -683,6 +682,7 @@ impl Drop for TimelineDropHandle {
             self.client.remove_event_handler(handle);
         }
         self.room_update_join_handle.abort();
+        self.ignore_user_list_update_join_handle.abort();
     }
 }
 
@@ -709,57 +709,6 @@ impl<S: Stream> Stream for TimelineStream<S> {
     ) -> Poll<Option<Self::Item>> {
         self.project().inner.poll_next(cx)
     }
-}
-
-struct EventTimelineItemWithId<'a> {
-    inner: &'a EventTimelineItem,
-    internal_id: u64,
-}
-
-impl<'a> EventTimelineItemWithId<'a> {
-    fn with_inner_kind(&self, kind: impl Into<EventTimelineItemKind>) -> Arc<TimelineItem> {
-        Arc::new(TimelineItem {
-            kind: self.inner.with_kind(kind).into(),
-            internal_id: self.internal_id,
-        })
-    }
-}
-
-impl Deref for EventTimelineItemWithId<'_> {
-    type Target = EventTimelineItem;
-
-    fn deref(&self) -> &Self::Target {
-        self.inner
-    }
-}
-
-// FIXME: Put an upper bound on timeline size or add a separate map to look up
-// the index of a timeline item by its key, to avoid large linear scans.
-fn rfind_event_item(
-    items: &Vector<Arc<TimelineItem>>,
-    mut f: impl FnMut(&EventTimelineItem) -> bool,
-) -> Option<(usize, EventTimelineItemWithId<'_>)> {
-    items
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, item)| {
-            Some((
-                idx,
-                EventTimelineItemWithId { inner: item.as_event()?, internal_id: item.internal_id },
-            ))
-        })
-        .rfind(|(_, it)| f(it.inner))
-}
-
-fn rfind_event_by_id<'a>(
-    items: &'a Vector<Arc<TimelineItem>>,
-    event_id: &EventId,
-) -> Option<(usize, EventTimelineItemWithId<'a>)> {
-    rfind_event_item(items, |it| it.event_id() == Some(event_id))
-}
-
-fn find_read_marker(items: &Vector<Arc<TimelineItem>>) -> Option<usize> {
-    items.iter().rposition(|item| item.is_read_marker())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -808,34 +757,4 @@ pub enum Error {
     /// Could not get user
     #[error("User ID is not available")]
     UserIdNotAvailable,
-}
-
-/// Result of comparing events position in the timeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RelativePosition {
-    /// Event B is after (more recent than) event A.
-    After,
-    /// They are the same event.
-    Same,
-    /// Event B is before (older than) event A.
-    Before,
-}
-
-fn compare_events_positions(
-    event_a: &EventId,
-    event_b: &EventId,
-    timeline_items: &Vector<Arc<TimelineItem>>,
-) -> Option<RelativePosition> {
-    if event_a == event_b {
-        return Some(RelativePosition::Same);
-    }
-
-    let (pos_event_a, _) = rfind_event_by_id(timeline_items, event_a)?;
-    let (pos_event_b, _) = rfind_event_by_id(timeline_items, event_b)?;
-
-    if pos_event_a > pos_event_b {
-        Some(RelativePosition::Before)
-    } else {
-        Some(RelativePosition::After)
-    }
 }

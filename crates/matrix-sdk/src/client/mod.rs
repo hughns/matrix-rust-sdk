@@ -17,9 +17,10 @@
 #[cfg(feature = "experimental-sliding-sync")]
 use std::sync::RwLock as StdRwLock;
 use std::{
-    collections::{btree_map, BTreeMap},
+    collections::{btree_map, hash_map::DefaultHasher, BTreeMap},
     fmt::{self, Debug},
     future::Future,
+    hash::{Hash, Hasher},
     pin::Pin,
     sync::{Arc, Mutex as StdMutex},
 };
@@ -27,6 +28,14 @@ use std::{
 use dashmap::DashMap;
 use eyeball::{Observable, SharedObservable, Subscriber};
 use futures_core::Stream;
+#[cfg(feature = "experimental-oidc")]
+use mas_oidc_client::{
+    error::{
+        Error as OidcClientError, ErrorBody as OidcErrorBody, HttpError as OidcHttpError,
+        TokenRefreshError, TokenRequestError,
+    },
+    types::errors::ClientErrorCode,
+};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::store::locks::CryptoStoreLock;
 use matrix_sdk_base::{
@@ -34,8 +43,8 @@ use matrix_sdk_base::{
     SyncOutsideWasm,
 };
 use matrix_sdk_common::instant::Instant;
-#[cfg(feature = "appservice")]
-use ruma::TransactionId;
+#[cfg(feature = "experimental-sliding-sync")]
+use ruma::api::client::error::ErrorKind;
 use ruma::{
     api::{
         client::{
@@ -48,7 +57,6 @@ use ruma::{
                 get_capabilities::{self, Capabilities},
                 get_supported_versions,
             },
-            error::ErrorKind,
             filter::{create_filter::v3::Request as FilterUploadRequest, FilterDefinition},
             membership::{join_room_by_id, join_room_by_id_or_alias},
             profile::get_profile,
@@ -69,11 +77,13 @@ use ruma::{
 };
 use serde::de::DeserializeOwned;
 use tokio::sync::{broadcast, Mutex, OnceCell, RwLock, RwLockReadGuard};
-use tracing::{debug, error, instrument, trace, Instrument, Span};
+use tracing::{debug, error, info, instrument, trace, Instrument, Span};
 use url::Url;
 
 #[cfg(feature = "e2e-encryption")]
 use crate::encryption::Encryption;
+#[cfg(feature = "experimental-oidc")]
+use crate::oidc::{Oidc, OidcError};
 use crate::{
     authentication::AuthData,
     config::RequestConfig,
@@ -84,9 +94,9 @@ use crate::{
     http_client::HttpClient,
     matrix_auth::MatrixAuth,
     notification_settings::NotificationSettings,
-    room,
     sync::{RoomUpdate, SyncResponse},
-    Account, AuthApi, AuthSession, Error, Media, RefreshTokenError, Result, TransmissionProgress,
+    Account, AuthApi, AuthSession, Error, Media, RefreshTokenError, Result, Room,
+    TransmissionProgress,
 };
 
 mod builder;
@@ -104,10 +114,9 @@ type NotificationHandlerFut = Pin<Box<dyn Future<Output = ()>>>;
 
 #[cfg(not(target_arch = "wasm32"))]
 type NotificationHandlerFn =
-    Box<dyn Fn(Notification, room::Room, Client) -> NotificationHandlerFut + Send + Sync>;
+    Box<dyn Fn(Notification, Room, Client) -> NotificationHandlerFut + Send + Sync>;
 #[cfg(target_arch = "wasm32")]
-type NotificationHandlerFn =
-    Box<dyn Fn(Notification, room::Room, Client) -> NotificationHandlerFut>;
+type NotificationHandlerFn = Box<dyn Fn(Notification, Room, Client) -> NotificationHandlerFut>;
 
 /// Enum controlling if a loop running callbacks should continue or abort.
 ///
@@ -123,11 +132,16 @@ pub enum LoopCtrl {
     Break,
 }
 
-/// Wrapper struct for ErrorKind::UnknownToken
+/// Represents changes that can occur to a `Client`s `Session`.
 #[derive(Debug, Clone)]
-pub struct UnknownToken {
-    /// Whether or not the session was soft logged out
-    pub soft_logout: bool,
+pub enum SessionChange {
+    /// The session's token is no longer valid.
+    UnknownToken {
+        /// Whether or not the session was soft logged out
+        soft_logout: bool,
+    },
+    /// The session's tokens have been refreshed.
+    TokensRefreshed,
 }
 
 /// An async/await enabled Matrix client.
@@ -142,12 +156,12 @@ pub(crate) struct ClientInner {
     /// The URL of the homeserver to connect to.
     homeserver: RwLock<Url>,
     /// The authentication server info discovered from the homeserver.
-    authentication_server_info: Option<AuthenticationServerInfo>,
+    pub(crate) authentication_server_info: Option<AuthenticationServerInfo>,
     /// The sliding sync proxy that is trusted by the homeserver.
     #[cfg(feature = "experimental-sliding-sync")]
     sliding_sync_proxy: StdRwLock<Option<Url>>,
     /// The underlying HTTP client.
-    http_client: HttpClient,
+    pub(crate) http_client: HttpClient,
     /// User session data.
     base_client: BaseClient,
     /// The Matrix versions the server supports (well-known ones only)
@@ -161,7 +175,7 @@ pub(crate) struct ClientInner {
     pub(crate) key_claim_lock: Mutex<()>,
     pub(crate) members_request_locks: Mutex<BTreeMap<OwnedRoomId, Arc<Mutex<()>>>>,
     /// Locks for requests on the encryption state of rooms.
-    pub(crate) encryption_state_request_locks: DashMap<OwnedRoomId, Arc<Mutex<()>>>,
+    pub(crate) encryption_state_request_locks: Mutex<BTreeMap<OwnedRoomId, Arc<Mutex<()>>>>,
     pub(crate) typing_notice_times: DashMap<OwnedRoomId, Instant>,
     /// Event handlers. See `add_event_handler`.
     pub(crate) event_handlers: EventHandlerStore,
@@ -169,10 +183,6 @@ pub(crate) struct ClientInner {
     notification_handlers: RwLock<Vec<NotificationHandlerFn>>,
     pub(crate) room_update_channels: StdMutex<BTreeMap<OwnedRoomId, broadcast::Sender<RoomUpdate>>>,
     pub(crate) sync_gap_broadcast_txs: StdMutex<BTreeMap<OwnedRoomId, Observable<()>>>,
-    /// Whether the client should operate in application service style mode.
-    /// This is low-level functionality. For an high-level API check the
-    /// `matrix_sdk_appservice` crate.
-    pub(crate) appservice_mode: bool,
     /// Whether the client should update its homeserver URL with the discovery
     /// information present in the login response.
     respect_login_well_known: bool,
@@ -187,14 +197,82 @@ pub(crate) struct ClientInner {
     /// wait for the sync to get the data to fetch a room object from the state
     /// store.
     pub(crate) sync_beat: event_listener::Event,
-    /// Client API UnknownToken error publisher. Allows the subscriber logout
-    /// the user when any request fails because of an invalid access token
-    pub(crate) unknown_token_error_sender: broadcast::Sender<UnknownToken>,
+    /// Session change publisher. Allows the subscriber to handle changes to the
+    /// session such as logging out when the access token is invalid or
+    /// persisting updates to the access/refresh tokens.
+    pub(crate) session_change_sender: broadcast::Sender<SessionChange>,
     /// Authentication data to keep in memory.
     pub(crate) auth_data: OnceCell<AuthData>,
 
     #[cfg(feature = "e2e-encryption")]
     pub(crate) cross_process_crypto_store_lock: OnceCell<CryptoStoreLock>,
+    /// Latest "generation" of data known by the crypto store.
+    ///
+    /// This is a counter that only increments, set in the database (and can
+    /// wrap). It's incremented whenever some process acquires a lock for the
+    /// first time. *This assumes the crypto store lock is being held, to
+    /// avoid data races on writing to this value in the store*.
+    ///
+    /// The current process will maintain this value in local memory and in the
+    /// DB over time. Observing a different value than the one read in
+    /// memory, when reading from the store indicates that somebody else has
+    /// written into the database under our feet.
+    ///
+    /// TODO: this should live in the `OlmMachine`, since it's information
+    /// related to the lock. As of today (2023-07-28), we blow up the entire
+    /// olm machine when there's a generation mismatch. So storing the
+    /// generation in the olm machine would make the client think there's
+    /// *always* a mismatch, and that's why we need to store the generation
+    /// outside the `OlmMachine`.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) crypto_store_generation: Arc<Mutex<Option<u64>>>,
+}
+
+impl ClientInner {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        homeserver: Url,
+        authentication_server_info: Option<AuthenticationServerInfo>,
+        #[cfg(feature = "experimental-sliding-sync")] sliding_sync_proxy: Option<Url>,
+        http_client: HttpClient,
+        base_client: BaseClient,
+        server_versions: Option<Box<[MatrixVersion]>>,
+        respect_login_well_known: bool,
+        handle_refresh_tokens: bool,
+    ) -> Self {
+        let session_change_sender = broadcast::Sender::new(1);
+
+        Self {
+            homeserver: RwLock::new(homeserver),
+            authentication_server_info,
+            #[cfg(feature = "experimental-sliding-sync")]
+            sliding_sync_proxy: StdRwLock::new(sliding_sync_proxy),
+            http_client,
+            base_client,
+            server_versions: OnceCell::new_with(server_versions),
+            #[cfg(feature = "e2e-encryption")]
+            group_session_locks: Default::default(),
+            #[cfg(feature = "e2e-encryption")]
+            key_claim_lock: Default::default(),
+            members_request_locks: Default::default(),
+            encryption_state_request_locks: Default::default(),
+            typing_notice_times: Default::default(),
+            event_handlers: Default::default(),
+            notification_handlers: Default::default(),
+            room_update_channels: Default::default(),
+            sync_gap_broadcast_txs: Default::default(),
+            respect_login_well_known,
+            sync_beat: event_listener::Event::new(),
+            handle_refresh_tokens,
+            refresh_token_lock: Mutex::new(Ok(())),
+            session_change_sender,
+            auth_data: Default::default(),
+            #[cfg(feature = "e2e-encryption")]
+            cross_process_crypto_store_lock: OnceCell::new(),
+            #[cfg(feature = "e2e-encryption")]
+            crypto_store_generation: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -267,50 +345,6 @@ impl Client {
     pub async fn get_capabilities(&self) -> HttpResult<Capabilities> {
         let res = self.send(get_capabilities::v3::Request::new(), None).await?;
         Ok(res.capabilities)
-    }
-
-    /// Process a [transaction] received from the homeserver which has been
-    /// converted into a sync response.
-    ///
-    /// # Arguments
-    ///
-    /// * `transaction_id` - The id of the transaction, used to guard against
-    ///   the same transaction being sent twice. This guarding currently isn't
-    ///   implemented.
-    /// * `sync_response` - The sync response converted from a transaction
-    ///   received from the homeserver.
-    ///
-    /// [transaction]: https://matrix.org/docs/spec/application_service/r0.1.2#put-matrix-app-v1-transactions-txnid
-    #[cfg(feature = "appservice")]
-    pub async fn receive_transaction(
-        &self,
-        transaction_id: &TransactionId,
-        sync_response: sync_events::v3::Response,
-    ) -> Result<()> {
-        const TXN_ID_KEY: &[u8] = b"appservice.txn_id";
-
-        let store = self.store();
-        let store_tokens = store.get_custom_value(TXN_ID_KEY).await?;
-        let mut txn_id_bytes = transaction_id.as_bytes().to_vec();
-        if let Some(mut store_tokens) = store_tokens {
-            // The data is separated by a NULL byte.
-            let mut store_tokens_split = store_tokens.split(|x| *x == b'\0');
-            if store_tokens_split.any(|x| x == transaction_id.as_bytes()) {
-                // We already encountered this transaction id before, so we exit early instead
-                // of processing further.
-                //
-                // Spec: https://spec.matrix.org/v1.3/application-service-api/#pushing-events
-                return Ok(());
-            }
-            store_tokens.push(b'\0');
-            store_tokens.append(&mut txn_id_bytes);
-            self.store().set_custom_value(TXN_ID_KEY, store_tokens).await?;
-        } else {
-            self.store().set_custom_value(TXN_ID_KEY, txn_id_bytes).await?;
-        }
-        self.process_sync(sync_response).await?;
-
-        Ok(())
     }
 
     /// Get a copy of the default request config.
@@ -409,7 +443,7 @@ impl Client {
     ///
     /// Will be `None` if the client has not been logged in.
     pub fn access_token(&self) -> Option<String> {
-        Some(self.inner.auth_data.get()?.access_token())
+        self.inner.auth_data.get()?.access_token()
     }
 
     /// Access the authentication API used to log in this client.
@@ -418,6 +452,8 @@ impl Client {
     pub fn auth_api(&self) -> Option<AuthApi> {
         match self.inner.auth_data.get()? {
             AuthData::Matrix(_) => Some(AuthApi::Matrix(self.matrix_auth())),
+            #[cfg(feature = "experimental-oidc")]
+            AuthData::Oidc(_) => Some(AuthApi::Oidc(self.oidc())),
         }
     }
 
@@ -430,6 +466,8 @@ impl Client {
     pub fn session(&self) -> Option<AuthSession> {
         match self.auth_api()? {
             AuthApi::Matrix(api) => api.session().map(Into::into),
+            #[cfg(feature = "experimental-oidc")]
+            AuthApi::Oidc(api) => api.full_session().map(Into::into),
         }
     }
 
@@ -459,6 +497,12 @@ impl Client {
         Media::new(self.clone())
     }
 
+    /// Access the OpenID Connect API of the client.
+    #[cfg(feature = "experimental-oidc")]
+    pub fn oidc(&self) -> Oidc {
+        Oidc::new(self.clone())
+    }
+
     /// Register a handler for a specific event type.
     ///
     /// The handler is a function or closure with one or more arguments. The
@@ -477,8 +521,8 @@ impl Client {
     /// the event handler being skipped and an error being logged. The following
     /// context argument types are only available for a subset of event types:
     ///
-    /// * [`Room`][room::Room] is only available for room-specific events, i.e.
-    ///   not for events like global account data events or presence events.
+    /// * [`Room`] is only available for room-specific events, i.e. not for
+    ///   events like global account data events or presence events.
     ///
     /// You can provide custom context via
     /// [`add_event_handler_context`](Client::add_event_handler_context) and
@@ -495,7 +539,6 @@ impl Client {
     /// use matrix_sdk::{
     ///     deserialized_responses::EncryptionInfo,
     ///     event_handler::Ctx,
-    ///     room::Room,
     ///     ruma::{
     ///         events::{
     ///             macros::EventContent,
@@ -505,7 +548,7 @@ impl Client {
     ///         push::Action,
     ///         Int, MilliSecondsSinceUnixEpoch,
     ///     },
-    ///     Client,
+    ///     Client, Room,
     /// };
     /// use serde::{Deserialize, Serialize};
     ///
@@ -574,17 +617,13 @@ impl Client {
     ///     todo!("Display the token");
     /// });
     ///
-    /// // Adding your custom data to the handler can be done as well
-    /// let data = "MyCustomIdentifier".to_owned();
+    /// // Event handler closures can also capture local variables.
+    /// // Make sure they are cheap to clone though, because they will be cloned
+    /// // every time the closure is called.
+    /// let data: std::sync::Arc<str> = "MyCustomIdentifier".into();
     ///
-    /// client.add_event_handler({
-    ///     let data = data.clone();
-    ///     move |ev: SyncRoomMessageEvent | {
-    ///         let data = data.clone();
-    ///         async move {
-    ///             println!("Calling the handler with identifier {data}");
-    ///         }
-    ///     }
+    /// client.add_event_handler(move |ev: SyncRoomMessageEvent | async move {
+    ///     println!("Calling the handler with identifier {data}");
     /// });
     /// # });
     /// ```
@@ -699,8 +738,8 @@ impl Client {
     ///
     /// ```
     /// use matrix_sdk::{
-    ///     event_handler::Ctx, room::Room,
-    ///     ruma::events::room::message::SyncRoomMessageEvent,
+    ///     event_handler::Ctx, ruma::events::room::message::SyncRoomMessageEvent,
+    ///     Room,
     /// };
     /// # #[derive(Clone)]
     /// # struct SomeType;
@@ -737,14 +776,11 @@ impl Client {
     /// Register a handler for a notification.
     ///
     /// Similar to [`Client::add_event_handler`], but only allows functions
-    /// or closures with exactly the three arguments [`Notification`],
-    /// [`room::Room`], [`Client`] for now.
+    /// or closures with exactly the three arguments [`Notification`], [`Room`],
+    /// [`Client`] for now.
     pub async fn register_notification_handler<H, Fut>(&self, handler: H) -> &Self
     where
-        H: Fn(Notification, room::Room, Client) -> Fut
-            + SendOutsideWasm
-            + SyncOutsideWasm
-            + 'static,
+        H: Fn(Notification, Room, Client) -> Fut + SendOutsideWasm + SyncOutsideWasm + 'static,
         Fut: Future<Output = ()> + SendOutsideWasm + 'static,
     {
         self.inner.notification_handlers.write().await.push(Box::new(
@@ -778,47 +814,47 @@ impl Client {
     /// Get all the rooms the client knows about.
     ///
     /// This will return the list of joined, invited, and left rooms.
-    pub fn rooms(&self) -> Vec<room::Room> {
+    pub fn rooms(&self) -> Vec<Room> {
         self.base_client()
             .get_rooms()
             .into_iter()
-            .map(|room| room::Common::new(self.clone(), room).into())
+            .map(|room| Room::new(self.clone(), room))
             .collect()
     }
 
     /// Get all the rooms the client knows about, filtered by room state.
-    pub fn rooms_filtered(&self, filter: RoomStateFilter) -> Vec<room::Room> {
+    pub fn rooms_filtered(&self, filter: RoomStateFilter) -> Vec<Room> {
         self.base_client()
             .get_rooms_filtered(filter)
             .into_iter()
-            .map(|room| room::Common::new(self.clone(), room).into())
+            .map(|room| Room::new(self.clone(), room))
             .collect()
     }
 
     /// Returns the joined rooms this client knows about.
-    pub fn joined_rooms(&self) -> Vec<room::Joined> {
+    pub fn joined_rooms(&self) -> Vec<Room> {
         self.base_client()
             .get_rooms_filtered(RoomStateFilter::JOINED)
             .into_iter()
-            .filter_map(|room| room::Joined::new(self, room))
+            .map(|room| Room::new(self.clone(), room))
             .collect()
     }
 
     /// Returns the invited rooms this client knows about.
-    pub fn invited_rooms(&self) -> Vec<room::Invited> {
+    pub fn invited_rooms(&self) -> Vec<Room> {
         self.base_client()
             .get_rooms_filtered(RoomStateFilter::INVITED)
             .into_iter()
-            .filter_map(|room| room::Invited::new(self, room))
+            .map(|room| Room::new(self.clone(), room))
             .collect()
     }
 
     /// Returns the left rooms this client knows about.
-    pub fn left_rooms(&self) -> Vec<room::Left> {
+    pub fn left_rooms(&self) -> Vec<Room> {
         self.base_client()
             .get_rooms_filtered(RoomStateFilter::LEFT)
             .into_iter()
-            .filter_map(|room| room::Left::new(self, room))
+            .map(|room| Room::new(self.clone(), room))
             .collect()
     }
 
@@ -827,37 +863,8 @@ impl Client {
     /// # Arguments
     ///
     /// `room_id` - The unique id of the room that should be fetched.
-    pub fn get_room(&self, room_id: &RoomId) -> Option<room::Room> {
-        self.base_client()
-            .get_room(room_id)
-            .map(|room| room::Common::new(self.clone(), room).into())
-    }
-
-    /// Get a joined room with the given room id.
-    ///
-    /// # Arguments
-    ///
-    /// `room_id` - The unique id of the room that should be fetched.
-    pub fn get_joined_room(&self, room_id: &RoomId) -> Option<room::Joined> {
-        self.base_client().get_room(room_id).and_then(|room| room::Joined::new(self, room))
-    }
-
-    /// Get an invited room with the given room id.
-    ///
-    /// # Arguments
-    ///
-    /// `room_id` - The unique id of the room that should be fetched.
-    pub fn get_invited_room(&self, room_id: &RoomId) -> Option<room::Invited> {
-        self.base_client().get_room(room_id).and_then(|room| room::Invited::new(self, room))
-    }
-
-    /// Get a left room with the given room id.
-    ///
-    /// # Arguments
-    ///
-    /// `room_id` - The unique id of the room that should be fetched.
-    pub fn get_left_room(&self, room_id: &RoomId) -> Option<room::Left> {
-        self.base_client().get_room(room_id).and_then(|room| room::Left::new(self, room))
+    pub fn get_room(&self, room_id: &RoomId) -> Option<Room> {
+        self.base_client().get_room(room_id).map(|room| Room::new(self.clone(), room))
     }
 
     /// Resolve a room alias to a room id and a list of servers which know
@@ -907,6 +914,8 @@ impl Client {
         let session = session.into();
         match session {
             AuthSession::Matrix(s) => self.matrix_auth().restore_session(s).await,
+            #[cfg(feature = "experimental-oidc")]
+            AuthSession::Oidc(s) => self.oidc().restore_session(s).await,
         }
     }
 
@@ -915,14 +924,20 @@ impl Client {
     ///
     /// See the documentation of the authentication API's `refresh_access_token`
     /// method for more information.
-    pub async fn refresh_access_token(&self) -> HttpResult<()> {
+    pub async fn refresh_access_token(&self) -> Result<(), RefreshTokenError> {
         let Some(auth_api) = self.auth_api() else {
-            return Err(RefreshTokenError::RefreshTokenRequired.into());
+            return Err(RefreshTokenError::RefreshTokenRequired);
         };
 
         match auth_api {
             AuthApi::Matrix(a) => {
+                trace!("Token refresh: Using the homeserver.");
                 a.refresh_access_token().await?;
+            }
+            #[cfg(feature = "experimental-oidc")]
+            AuthApi::Oidc(api) => {
+                trace!("Token refresh: Using OIDC.");
+                api.refresh_access_token().await?;
             }
         }
 
@@ -1003,11 +1018,11 @@ impl Client {
     /// # Arguments
     ///
     /// * `room_id` - The `RoomId` of the room to be joined.
-    pub async fn join_room_by_id(&self, room_id: &RoomId) -> Result<room::Joined> {
+    pub async fn join_room_by_id(&self, room_id: &RoomId) -> Result<Room> {
         let request = join_room_by_id::v3::Request::new(room_id.to_owned());
         let response = self.send(request, None).await?;
         let base_room = self.base_client().room_joined(&response.room_id).await?;
-        room::Joined::new(self, base_room).ok_or(Error::InconsistentState)
+        Ok(Room::new(self.clone(), base_room))
     }
 
     /// Join a room by `RoomId`.
@@ -1023,13 +1038,13 @@ impl Client {
         &self,
         alias: &RoomOrAliasId,
         server_names: &[OwnedServerName],
-    ) -> Result<room::Joined> {
+    ) -> Result<Room> {
         let request = assign!(join_room_by_id_or_alias::v3::Request::new(alias.to_owned()), {
             server_name: server_names.to_owned(),
         });
         let response = self.send(request, None).await?;
         let base_room = self.base_client().room_joined(&response.room_id).await?;
-        room::Joined::new(self, base_room).ok_or(Error::InconsistentState)
+        Ok(Room::new(self.clone(), base_room))
     }
 
     /// Search the homeserver's directory of public rooms.
@@ -1079,8 +1094,8 @@ impl Client {
 
     /// Create a room with the given parameters.
     ///
-    /// Sends a request to `/_matrix/client/r0/createRoom`, returns the created
-    /// room as a [`room::Joined`] object.
+    /// Sends a request to `/_matrix/client/r0/createRoom` and returns the
+    /// created room.
     ///
     /// If you want to create a direct message with one specific user, you can
     /// use [`create_dm`][Self::create_dm], which is more convenient than
@@ -1108,14 +1123,14 @@ impl Client {
     /// assert!(client.create_room(request).await.is_ok());
     /// # };
     /// ```
-    pub async fn create_room(&self, request: create_room::v3::Request) -> Result<room::Joined> {
+    pub async fn create_room(&self, request: create_room::v3::Request) -> Result<Room> {
         let invite = request.invite.clone();
         let is_direct_room = request.is_direct;
         let response = self.send(request, None).await?;
 
         let base_room = self.base_client().get_or_create_room(&response.room_id, RoomState::Joined);
 
-        let joined_room = room::Joined::new(self, base_room).unwrap();
+        let joined_room = Room::new(self.clone(), base_room);
 
         if is_direct_room && !invite.is_empty() {
             if let Err(error) =
@@ -1134,7 +1149,7 @@ impl Client {
     /// Convenience shorthand for [`create_room`][Self::create_room] with the
     /// given user being invited, the room marked `is_direct` and both the
     /// creator and invitee getting the default maximum power level.
-    pub async fn create_dm(&self, user_id: &UserId) -> Result<room::Joined> {
+    pub async fn create_dm(&self, user_id: &UserId) -> Result<Room> {
         self.create_room(assign!(create_room::v3::Request::new(), {
             invite: vec![user_id.to_owned()],
             is_direct: true,
@@ -1252,31 +1267,69 @@ impl Client {
         ))
         .await;
 
-        // If this is an `M_UNKNOWN_TOKEN` error and refresh token handling is active,
-        // try to refresh the token and retry the request.
-        if self.inner.handle_refresh_tokens {
-            if let Err(Some(ErrorKind::UnknownToken { .. })) =
-                res.as_ref().map_err(HttpError::client_api_error_kind)
-            {
-                if let Err(refresh_error) = self.refresh_access_token().await {
-                    match &refresh_error {
-                        HttpError::RefreshToken(RefreshTokenError::RefreshTokenRequired) => {
-                            // Refreshing access tokens is not supported by
-                            // this `Session`, ignore.
-                        }
-                        _ => {
-                            return Err(refresh_error);
-                        }
+        // An `M_UNKNOWN_TOKEN` error can potentially be fixed with a token refresh.
+        if let Err(Some(ErrorKind::UnknownToken { soft_logout })) =
+            res.as_ref().map_err(HttpError::client_api_error_kind)
+        {
+            trace!("Token refresh: Unknown token error received.");
+            // If automatic token refresh isn't supported, there is nothing more to do.
+            if !self.inner.handle_refresh_tokens {
+                trace!("Token refresh: Automatic refresh disabled.");
+                self.broadcast_unknown_token(soft_logout);
+                return res;
+            }
+
+            // Try to refresh the token and retry the request.
+            if let Err(refresh_error) = self.refresh_access_token().await {
+                match &refresh_error {
+                    RefreshTokenError::RefreshTokenRequired => {
+                        trace!("Token refresh: The session doesn't have a refresh token.");
+                        // Refreshing access tokens is not supported by this `Session`, ignore.
+                        self.broadcast_unknown_token(soft_logout);
                     }
-                } else {
-                    return Box::pin(self.send_inner(
-                        request,
-                        config,
-                        sliding_sync_proxy,
-                        Default::default(),
-                    ))
-                    .await;
+                    #[cfg(feature = "experimental-oidc")]
+                    RefreshTokenError::Oidc(oidc_error) => {
+                        match **oidc_error {
+                            OidcError::Oidc(OidcClientError::TokenRefresh(
+                                TokenRefreshError::Token(TokenRequestError::Http(OidcHttpError {
+                                    body:
+                                        Some(OidcErrorBody {
+                                            error: ClientErrorCode::InvalidGrant, ..
+                                        }),
+                                    ..
+                                })),
+                            )) => {
+                                error!(
+                                    "Token refresh: OIDC refresh_token rejected with invalid grant"
+                                );
+                                // The refresh was denied, signal to sign out the user.
+                                self.broadcast_unknown_token(soft_logout);
+                            }
+                            _ => {
+                                trace!("Token refresh: OIDC refresh encountered a problem.");
+                                // The refresh failed for other reasons, no need
+                                // to sign out.
+                            }
+                        };
+                        return Err(refresh_error.into());
+                    }
+                    _ => {
+                        trace!("Token refresh: Token refresh failed.");
+                        // This isn't necessarily correct, but matches the behaviour when
+                        // implementing OIDC.
+                        self.broadcast_unknown_token(soft_logout);
+                        return Err(refresh_error.into());
+                    }
                 }
+            } else {
+                trace!("Token refresh: Refresh succeeded, retrying request.");
+                return Box::pin(self.send_inner(
+                    request,
+                    config,
+                    sliding_sync_proxy,
+                    Default::default(),
+                ))
+                .await;
             }
         }
 
@@ -1299,32 +1352,36 @@ impl Client {
             None => self.homeserver().await.to_string(),
         };
 
-        let response = self
-            .inner
+        let access_token = self.access_token();
+        let access_token = access_token.as_deref();
+        {
+            let hash = access_token.as_ref().map(|t| {
+                let mut hasher = DefaultHasher::new();
+                t.hash(&mut hasher);
+                hasher.finish()
+            });
+            tracing::trace!("Attempting request with access_token {hash:?}");
+        }
+
+        self.inner
             .http_client
             .send(
                 request,
                 config,
                 homeserver,
-                self.access_token().as_deref(),
-                self.user_id(),
+                access_token,
                 self.server_versions().await?,
                 send_progress,
             )
-            .await;
+            .await
+    }
 
-        if let Err(http_error) = &response {
-            if let Some(ErrorKind::UnknownToken { soft_logout }) =
-                http_error.client_api_error_kind()
-            {
-                _ = self
-                    .inner
-                    .unknown_token_error_sender
-                    .send(UnknownToken { soft_logout: *soft_logout });
-            }
-        }
-
-        response
+    fn broadcast_unknown_token(&self, soft_logout: &bool) {
+        info!("An unknown token error has been encountered.");
+        _ = self
+            .inner
+            .session_change_sender
+            .send(SessionChange::UnknownToken { soft_logout: *soft_logout });
     }
 
     async fn request_server_versions(&self) -> HttpResult<Box<[MatrixVersion]>> {
@@ -1335,7 +1392,6 @@ impl Client {
                 get_supported_versions::Request::new(),
                 None,
                 self.homeserver().await.to_string(),
-                None,
                 None,
                 &[MatrixVersion::V1_0],
                 Default::default(),
@@ -1897,9 +1953,9 @@ impl Client {
         self.send(request, None).await
     }
 
-    /// Subscribes a new receiver to client UnknownToken errors
-    pub fn subscribe_to_unknown_token_errors(&self) -> broadcast::Receiver<UnknownToken> {
-        let broadcast = &self.inner.unknown_token_error_sender;
+    /// Subscribes a new receiver to client SessionChange broadcasts.
+    pub fn subscribe_to_session_changes(&self) -> broadcast::Receiver<SessionChange> {
+        let broadcast = &self.inner.session_change_sender;
         broadcast.subscribe()
     }
 
@@ -1934,6 +1990,30 @@ impl Client {
         let ruleset = self.account().push_rules().await.unwrap_or_else(|_| Ruleset::new());
         NotificationSettings::new(self.clone(), ruleset)
     }
+
+    /// Create a new specialized `Client` that can process notifications.
+    pub async fn notification_client(&self) -> Result<Client> {
+        let client = Client {
+            inner: Arc::new(ClientInner::new(
+                self.inner.homeserver.read().await.clone(),
+                self.inner.authentication_server_info.clone(),
+                #[cfg(feature = "experimental-sliding-sync")]
+                self.inner.sliding_sync_proxy.read().unwrap().clone(),
+                self.inner.http_client.clone(),
+                self.inner.base_client.clone_with_in_memory_state_store(),
+                self.inner.server_versions.get().cloned(),
+                self.inner.respect_login_well_known,
+                self.inner.handle_refresh_tokens,
+            )),
+        };
+
+        // Copy the parent's session into the child.
+        if let Some(session) = self.session() {
+            client.restore_session(session).await?;
+        }
+
+        Ok(client)
+    }
 }
 
 // The http mocking library is not supported for wasm32
@@ -1941,6 +2021,7 @@ impl Client {
 pub(crate) mod tests {
     use std::time::Duration;
 
+    use matrix_sdk_base::RoomState;
     use matrix_sdk_test::{
         async_test, test_json, JoinedRoomBuilder, StateTestEvent, SyncResponseBuilder,
     };
@@ -2008,7 +2089,11 @@ pub(crate) mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
             .mount(&server)
             .await;
-        let client = Client::builder().server_name(alice.server_name()).build().await.unwrap();
+        let client = Client::builder()
+            .insecure_server_name_no_tls(alice.server_name())
+            .build()
+            .await
+            .unwrap();
 
         assert_eq!(client.homeserver().await, Url::parse(server_url.as_ref()).unwrap());
     }
@@ -2027,7 +2112,11 @@ pub(crate) mod tests {
             .await;
 
         assert!(
-            Client::builder().server_name(alice.server_name()).build().await.is_err(),
+            Client::builder()
+                .insecure_server_name_no_tls(alice.server_name())
+                .build()
+                .await
+                .is_err(),
             "Creating a client from a user ID should fail when the .well-known request fails."
         );
     }
@@ -2050,8 +2139,8 @@ pub(crate) mod tests {
 
         assert_eq!(client.homeserver().await, Url::parse(&server.uri()).unwrap());
 
-        let room = client.get_joined_room(room_id);
-        assert!(room.is_some());
+        let room = client.get_room(room_id).unwrap();
+        assert_eq!(room.state(), RoomState::Joined);
     }
 
     #[async_test]

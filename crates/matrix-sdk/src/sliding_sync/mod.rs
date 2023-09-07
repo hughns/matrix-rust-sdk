@@ -33,12 +33,8 @@ use std::{
 };
 
 use async_stream::stream;
-pub use builder::*;
-pub use client::*;
-pub use error::*;
 use futures_core::stream::Stream;
-pub use list::*;
-pub use room::*;
+use matrix_sdk_common::{ring_buffer::RingBuffer, timer};
 use ruma::{
     api::client::{
         error::ErrorKind,
@@ -49,15 +45,17 @@ use ruma::{
 use serde::{Deserialize, Serialize};
 use tokio::{
     select, spawn,
-    sync::{broadcast::Sender, Mutex as AsyncMutex, RwLock as AsyncRwLock},
+    sync::{broadcast::Sender, Mutex as AsyncMutex, OwnedMutexGuard, RwLock as AsyncRwLock},
 };
-use tracing::{debug, error, instrument, warn, Instrument, Span};
+use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 use url::Url;
-use utils::JoinHandleExt as _;
 
+pub use self::{builder::*, error::*, list::*, room::*};
 use self::{
     cache::restore_sliding_sync_state,
+    client::SlidingSyncResponseProcessor,
     sticky_parameters::{LazyTransactionId, SlidingSyncStickyManager, StickyData},
+    utils::JoinHandleExt as _,
 };
 use crate::{config::RequestConfig, Client, Result};
 
@@ -68,9 +66,6 @@ use crate::{config::RequestConfig, Client, Result};
 pub struct SlidingSync {
     /// The Sliding Sync data.
     inner: Arc<SlidingSyncInner>,
-
-    /// A lock to ensure that responses are handled one at a time.
-    response_handling_lock: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Debug)]
@@ -93,11 +88,33 @@ pub(super) struct SlidingSyncInner {
     /// the [`Self::proxy_timeout`].
     network_timeout: Duration,
 
-    /// The storage key to keep this cache at and load it from
+    /// The storage key to keep this cache at and load it from.
     storage_key: String,
 
-    /// Position markers
-    position: StdRwLock<SlidingSyncPositionMarkers>,
+    /// Should this sliding sync instance try to restore its sync position
+    /// from the database?
+    ///
+    /// Note: in non-cfg(e2e-encryption) builds, it's always set to false. We
+    /// keep it even so, to avoid sparkling cfg statements everywhere
+    /// throughout this file.
+    share_pos: bool,
+
+    /// Position markers.
+    ///
+    /// The `pos` marker represents a progression when exchanging requests and
+    /// responses with the server: the server acknowledges the request by
+    /// responding with a new `pos`. If the client sends two non-necessarily
+    /// consecutive requests with the same `pos`, the server has to reply with
+    /// the same identical response.
+    ///
+    /// `position` is behind a mutex so that a new request starts after the
+    /// previous request trip has fully ended (successfully or not). This
+    /// mechanism exists to wait for the response to be handled and to see the
+    /// `position` being updated, before sending a new request.
+    position: Arc<AsyncMutex<SlidingSyncPositionMarkers>>,
+
+    /// Past position markers.
+    past_positions: StdRwLock<RingBuffer<SlidingSyncPositionMarkers>>,
 
     /// The lists of this Sliding Sync instance.
     lists: AsyncRwLock<BTreeMap<String, SlidingSyncList>>,
@@ -118,11 +135,11 @@ pub(super) struct SlidingSyncInner {
 
 impl SlidingSync {
     pub(super) fn new(inner: SlidingSyncInner) -> Self {
-        Self { inner: Arc::new(inner), response_handling_lock: Arc::new(AsyncMutex::new(())) }
+        Self { inner: Arc::new(inner) }
     }
 
-    async fn cache_to_storage(&self, to_device_token: Option<String>) -> Result<()> {
-        cache::store_sliding_sync_state(self, to_device_token).await
+    async fn cache_to_storage(&self, position: &SlidingSyncPositionMarkers) -> Result<()> {
+        cache::store_sliding_sync_state(self, position).await
     }
 
     /// Create a new [`SlidingSyncBuilder`].
@@ -230,6 +247,8 @@ impl SlidingSync {
         &self,
         mut list_builder: SlidingSyncListBuilder,
     ) -> Result<Option<SlidingSyncList>> {
+        let _timer = timer!(format!("restoring (loading+processing) list {}", list_builder.name));
+
         let reloaded_rooms =
             list_builder.set_cached_and_reload(&self.inner.client, &self.inner.storage_key).await?;
 
@@ -266,7 +285,32 @@ impl SlidingSync {
     async fn handle_response(
         &self,
         mut sliding_sync_response: v4::Response,
+        position: &mut SlidingSyncPositionMarkers,
     ) -> Result<UpdateSummary, crate::Error> {
+        let pos = Some(sliding_sync_response.pos.clone());
+
+        {
+            debug!(
+                pos = ?sliding_sync_response.pos,
+                delta_token = ?sliding_sync_response.delta_token,
+                "Update position markers`"
+            );
+
+            // Look up for this new `pos` in the past position markers.
+            let past_positions = self.inner.past_positions.read().unwrap();
+
+            // The `pos` received by the server has already been received in the past!
+            if past_positions.iter().any(|position| position.pos == pos) {
+                error!(
+                    ?sliding_sync_response,
+                    "Sliding Sync response has ALREADY been handled by the client in the past"
+                );
+
+                return Err(Error::ResponseAlreadyReceived { pos }.into());
+            }
+        }
+
+        // Compute `limited`.
         {
             let known_rooms = self.inner.rooms.read().await;
             compute_limited(&known_rooms, &mut sliding_sync_response.rooms);
@@ -278,22 +322,27 @@ impl SlidingSync {
         // move to Sliding Sync, i.e. to `v4::Response`), but processing the
         // `sliding_sync_response` is vital, so it must be done somewhere; for now it
         // happens here.
-        let mut sync_response =
-            self.inner.client.process_sliding_sync(&sliding_sync_response).await?;
+
+        let mut response_processor = SlidingSyncResponseProcessor::new(self.inner.client.clone());
+
+        #[cfg(feature = "e2e-encryption")]
+        if self.is_e2ee_enabled() {
+            response_processor.handle_encryption(&sliding_sync_response.extensions).await?
+        }
+
+        // Only handle the room's subsection of the response, if this sliding sync was
+        // configured to do so. That's because even when not requesting it,
+        // sometimes the current (2023-07-20) proxy will forward room events
+        // unrelated to the current connection's parameters.
+        //
+        // NOTE: SS proxy workaround.
+        if self.must_process_rooms_response().await {
+            response_processor.handle_room_response(&sliding_sync_response).await?;
+        }
+
+        let mut sync_response = response_processor.process_and_take_response().await?;
 
         debug!(?sync_response, "Sliding Sync response has been handled by the client");
-
-        {
-            debug!(
-                pos = ?sliding_sync_response.pos,
-                delta_token = ?sliding_sync_response.delta_token,
-                "Update position markers`"
-            );
-
-            let mut position_lock = self.inner.position.write().unwrap();
-            position_lock.pos = Some(sliding_sync_response.pos);
-            position_lock.delta_token = sliding_sync_response.delta_token;
-        }
 
         // Commit sticky parameters, if needed.
         if let Some(ref txn_id) = sliding_sync_response.txn_id {
@@ -375,15 +424,18 @@ impl SlidingSync {
                 updated_lists
             };
 
-            UpdateSummary {
-                lists: updated_lists,
-                rooms: updated_rooms,
-                to_device_token: sliding_sync_response
-                    .extensions
-                    .to_device
-                    .map(|ext| ext.next_batch),
-            }
+            UpdateSummary { lists: updated_lists, rooms: updated_rooms }
         };
+
+        // Everything went well, we can update the position markers.
+        //
+        // Save the new position markers.
+        position.pos = pos;
+        position.delta_token = sliding_sync_response.delta_token.clone();
+
+        // Keep this position markers in memory, in case it pops from the server.
+        let mut past_positions = self.inner.past_positions.write().unwrap();
+        past_positions.push(position.clone());
 
         Ok(update_summary)
     }
@@ -391,7 +443,12 @@ impl SlidingSync {
     async fn generate_sync_request(
         &self,
         txn_id: &mut LazyTransactionId,
-    ) -> Result<(v4::Request, RequestConfig, BTreeSet<OwnedRoomId>)> {
+    ) -> Result<(
+        v4::Request,
+        RequestConfig,
+        BTreeSet<OwnedRoomId>,
+        OwnedMutexGuard<SlidingSyncPositionMarkers>,
+    )> {
         // Collect requests for lists.
         let mut requests_lists = BTreeMap::new();
 
@@ -404,10 +461,40 @@ impl SlidingSync {
         }
 
         // Collect the `pos` and `delta_token`.
-        let (pos, delta_token) = {
-            let position_lock = self.inner.position.read().unwrap();
+        //
+        // Wait on the `position` mutex to be available. It means no request nor
+        // response is running. The `position` mutex is released whether the response
+        // has been fully handled successfully, in this case the `pos` is updated, or
+        // the response handling has failed, in this case the `pos` hasn't been updated
+        // and the same `pos` will be used for this new request.
+        let mut position_guard = self.inner.position.clone().lock_owned().await;
+        let delta_token = position_guard.delta_token.clone();
 
-            (position_lock.pos.clone(), position_lock.delta_token.clone())
+        let to_device_enabled =
+            self.inner.sticky.read().unwrap().data().extensions.to_device.enabled == Some(true);
+
+        let restored_fields = if self.inner.share_pos || to_device_enabled {
+            let lists = self.inner.lists.read().await;
+            restore_sliding_sync_state(&self.inner.client, &self.inner.storage_key, &lists).await?
+        } else {
+            None
+        };
+
+        // Update pos: either the one restored from the database, if any and the sliding
+        // sync was configured so, or read it from the memory cache.
+        let pos = if self.inner.share_pos {
+            if let Some(fields) = &restored_fields {
+                // Override the memory one with the database one, for consistency.
+                if fields.pos != position_guard.pos {
+                    info!("Pos from previous request ('{:?}') was different from pos in database ('{:?}').", position_guard.pos, fields.pos);
+                    position_guard.pos = fields.pos.clone();
+                }
+                fields.pos.clone()
+            } else {
+                position_guard.pos.clone()
+            }
+        } else {
+            position_guard.pos.clone()
         };
 
         Span::current().record("pos", &pos);
@@ -417,36 +504,20 @@ impl SlidingSync {
 
         let mut request = assign!(v4::Request::new(), {
             conn_id: Some(self.inner.id.clone()),
-            pos,
             delta_token,
+            pos,
             timeout: Some(self.inner.poll_timeout),
             lists: requests_lists,
             unsubscribe_rooms: room_unsubscriptions.iter().cloned().collect(),
         });
 
-        let to_device_enabled = {
-            let mut sticky_params = self.inner.sticky.write().unwrap();
+        // Apply sticky parameters, if needs be.
+        self.inner.sticky.write().unwrap().maybe_apply(&mut request, txn_id);
 
-            sticky_params.maybe_apply(&mut request, txn_id);
-
-            sticky_params.data().extensions.to_device.enabled == Some(true)
-        };
-
-        // Set the to_device token if the extension is enabled.
+        // Set the to-device token if the extension is enabled.
         if to_device_enabled {
-            let lists = self.inner.lists.read().await;
-
-            let mut to_device_token = None;
-            restore_sliding_sync_state(
-                &self.inner.client,
-                &self.inner.storage_key,
-                &lists,
-                &mut None,
-                &mut to_device_token,
-            )
-            .await?;
-
-            request.extensions.to_device.since = to_device_token;
+            request.extensions.to_device.since =
+                restored_fields.and_then(|fields| fields.to_device_token);
         }
 
         // Apply the transaction id if one was generated.
@@ -461,15 +532,35 @@ impl SlidingSync {
             // and extra time for the network delays.
             RequestConfig::default().timeout(self.inner.poll_timeout + self.inner.network_timeout),
             room_unsubscriptions,
+            position_guard,
         ))
+    }
+
+    /// Is the e2ee extension enabled for this sliding sync instance?
+    #[cfg(feature = "e2e-encryption")]
+    fn is_e2ee_enabled(&self) -> bool {
+        self.inner.sticky.read().unwrap().data().extensions.e2ee.enabled == Some(true)
+    }
+
+    #[cfg(not(feature = "e2e-encryption"))]
+    fn is_e2ee_enabled(&self) -> bool {
+        false
+    }
+
+    /// Should we process the room's subpart of a response?
+    async fn must_process_rooms_response(&self) -> bool {
+        // We consider that we must, if there's any room subscription or there's any
+        // list.
+        !self.inner.sticky.read().unwrap().data().room_subscriptions.is_empty()
+            || !self.inner.lists.read().await.is_empty()
     }
 
     #[instrument(skip_all, fields(pos))]
     async fn sync_once(&self) -> Result<UpdateSummary> {
-        let (request, request_config, requested_room_unsubscriptions) =
+        let (request, request_config, requested_room_unsubscriptions, mut position_guard) =
             self.generate_sync_request(&mut LazyTransactionId::new()).await?;
 
-        debug!("Sending the sliding sync request");
+        debug!("Sending request");
 
         // Prepare the request.
         let request = self.inner.client.send_with_homeserver(
@@ -486,9 +577,7 @@ impl SlidingSync {
 
         #[cfg(feature = "e2e-encryption")]
         let response = {
-            if self.inner.sticky.read().unwrap().data().extensions.e2ee.enabled == Some(true) {
-                debug!("Sliding Sync is sending the request along with outgoing E2EE requests");
-
+            if self.is_e2ee_enabled() {
                 // Here, we need to run 2 things:
                 //
                 // 1. Send the sliding sync request and get a response,
@@ -529,21 +618,15 @@ impl SlidingSync {
 
                 response
             } else {
-                debug!("Sliding Sync is sending the request (e2ee not enabled in this instance)");
-
                 request.await?
             }
         };
 
         // Send the request and get a response _without_ end-to-end encryption support.
         #[cfg(not(feature = "e2e-encryption"))]
-        let response = {
-            debug!("Sliding Sync is sending the request");
+        let response = request.await?;
 
-            request.await?
-        };
-
-        debug!("Sliding Sync response received");
+        debug!("Received response");
 
         // At this point, the request has been sent, and a response has been received.
         //
@@ -559,18 +642,17 @@ impl SlidingSync {
         // Spawn a new future to ensure that the code inside this future cannot be
         // cancelled if this method is cancelled.
         let future = async move {
-            debug!("Sliding Sync response handling starts");
+            debug!("Start handling response");
 
             // In case the task running this future is detached, we must
-            // ensure responses are handled one at a time, hence we lock the
-            // `response_handling_lock`.
-            let response_handling_lock = this.response_handling_lock.lock().await;
+            // ensure responses are handled one at a time. At this point we still own
+            // `position_guard`, so we're fine.
 
             // Room unsubscriptions have been received by the server. We can update the
             // unsubscriptions buffer. However, it would be an error to empty it entirely as
             // more unsubscriptions could have been inserted during the request/response
             // dance. So let's cherry-pick which unsubscriptions to remove.
-            {
+            if !requested_room_unsubscriptions.is_empty() {
                 let room_unsubscriptions = &mut *this.inner.room_unsubscriptions.write().unwrap();
 
                 room_unsubscriptions
@@ -578,14 +660,15 @@ impl SlidingSync {
             }
 
             // Handle the response.
-            let updates = this.handle_response(response).await?;
+            let updates = this.handle_response(response, &mut position_guard).await?;
 
-            this.cache_to_storage(updates.to_device_token.clone()).await?;
+            this.cache_to_storage(&position_guard).await?;
 
-            // Release the lock.
-            drop(response_handling_lock);
+            // Release the position guard lock.
+            // It means that other responses can be generated and then handled later.
+            drop(position_guard);
 
-            debug!("Sliding Sync response has been fully handled");
+            debug!("Done handling response");
 
             Ok(updates)
         };
@@ -593,7 +676,7 @@ impl SlidingSync {
         spawn(future.instrument(Span::current())).await.unwrap()
     }
 
-    /// Create a _new_ Sliding Sync sync-loop.
+    /// Create a _new_ Sliding Sync sync loop.
     ///
     /// This method returns a `Stream`, which will send requests and will handle
     /// responses automatically. Lists and rooms are updated automatically.
@@ -602,9 +685,9 @@ impl SlidingSync {
     /// return `Err(…)`. An `Err` will _always_ lead to the `Stream`
     /// termination.
     #[allow(unknown_lints, clippy::let_with_type_underscore)] // triggered by instrument macro
-    #[instrument(name = "sync_stream", skip_all)]
+    #[instrument(name = "sync_stream", skip_all, fields(conn_id = self.inner.id, with_e2ee = self.is_e2ee_enabled()))]
     pub fn sync(&self) -> impl Stream<Item = Result<UpdateSummary, crate::Error>> + '_ {
-        debug!(?self.inner.position, "About to run the sync-loop");
+        debug!("Starting sync stream");
 
         let sync_span = Span::current();
         let mut internal_channel_receiver = self.inner.internal_channel.subscribe();
@@ -612,7 +695,7 @@ impl SlidingSync {
         stream! {
             loop {
                 sync_span.in_scope(|| {
-                    debug!(?self.inner.position, "Sync-loop is running");
+                    debug!("Sync stream is running");
                 });
 
                 select! {
@@ -622,7 +705,7 @@ impl SlidingSync {
                         use SlidingSyncInternalMessage::*;
 
                         sync_span.in_scope(|| {
-                            debug!(?internal_message, "Sync-loop has received an internal message");
+                            debug!(?internal_message, "Sync stream has received an internal message");
                         });
 
                         match internal_message {
@@ -642,21 +725,17 @@ impl SlidingSync {
                                 yield Ok(updates);
                             }
 
+                            // Here, errors we can safely ignore.
+                            Err(crate::Error::SlidingSync(Error::ResponseAlreadyReceived { .. })) => {
+                                continue;
+                            }
+
+                            // Here, errors we **cannot** ignore, and that must stop the sync loop.
                             Err(error) => {
                                 if error.client_api_error_kind() == Some(&ErrorKind::UnknownPos) {
                                     // The Sliding Sync session has expired. Let's reset `pos` and sticky parameters.
                                     sync_span.in_scope(|| async {
-                                        warn!("Session expired; resetting `pos` and sticky parameters");
-
-                                        {
-                                            let mut position_lock = self.inner.position.write().unwrap();
-                                            position_lock.pos = None;
-                                        }
-
-                                        // Force invalidation of all the sticky parameters.
-                                        let _ = self.inner.sticky.write().unwrap().data_mut();
-
-                                        self.inner.lists.read().await.values().for_each(|list| list.invalidate_sticky_data());
+                                        self.expire_session().await;
                                     }).await;
                                 }
 
@@ -670,20 +749,55 @@ impl SlidingSync {
                 }
             }
 
-            debug!("Sync-loop has exited.");
+            debug!("Sync stream has exited.");
         }
     }
 
-    /// Force to stop the sync-loop ([`Self::sync`]) if it's running.
+    /// Force to stop the sync loop ([`Self::sync`]) if it's running.
     ///
     /// Usually, dropping the `Stream` returned by [`Self::sync`] should be
     /// enough to “stop” it, but depending of how this `Stream` is used, it
     /// might not be obvious to drop it immediately (thinking of using this API
     /// over FFI; the foreign-language might not be able to drop a value
-    /// immediately). Thus, calling this method will ensure that the sync-loop
+    /// immediately). Thus, calling this method will ensure that the sync loop
     /// stops gracefully and as soon as it returns.
     pub fn stop_sync(&self) -> Result<()> {
         Ok(self.inner.internal_channel_send(SlidingSyncInternalMessage::SyncLoopStop)?)
+    }
+
+    /// Expire the current Sliding Sync session.
+    ///
+    /// Expiring a Sliding Sync session means: resetting `pos`. It also cleans
+    /// up the `past_positions`, and resets sticky parameters.
+    ///
+    /// This should only be used when it's clear that this session was about to
+    /// expire anyways, and should be used only in very specific cases (e.g.
+    /// multiple sliding syncs being run in parallel, and one of them has
+    /// expired).
+    ///
+    /// This method **MUST** be called when the sync loop is stopped.
+    #[doc(hidden)]
+    pub async fn expire_session(&self) {
+        info!("Session expired; resetting `pos` and sticky parameters");
+
+        {
+            let mut position = self.inner.position.lock().await;
+            position.pos = None;
+
+            if let Err(err) = self.cache_to_storage(&position).await {
+                error!(
+                    "couldn't invalidate sliding sync frozen state when expiring session: {err}"
+                );
+            }
+
+            let mut past_positions = self.inner.past_positions.write().unwrap();
+            past_positions.clear();
+        }
+
+        // Force invalidation of all the sticky parameters.
+        let _ = self.inner.sticky.write().unwrap().data_mut();
+
+        self.inner.lists.read().await.values().for_each(|list| list.invalidate_sticky_data());
     }
 }
 
@@ -695,7 +809,7 @@ impl SlidingSyncInner {
     }
 
     /// Send a message over the internal channel if there is a receiver, i.e. if
-    /// the sync-loop is running.
+    /// the sync loop is running.
     #[instrument]
     fn internal_channel_send_if_possible(&self, message: SlidingSyncInternalMessage) {
         // If there is no receiver, the send will fail, but that's OK here.
@@ -717,24 +831,19 @@ enum SlidingSyncInternalMessage {
 impl SlidingSync {
     /// Get a copy of the `pos` value.
     pub fn pos(&self) -> Option<String> {
-        let position_lock = self.inner.position.read().unwrap();
+        let position_lock = self.inner.position.blocking_lock();
         position_lock.pos.clone()
     }
 
     /// Set a new value for `pos`.
     pub fn set_pos(&self, new_pos: String) {
-        let mut position_lock = self.inner.position.write().unwrap();
+        let mut position_lock = self.inner.position.blocking_lock();
         position_lock.pos = Some(new_pos);
     }
 
     /// Get the URL to Sliding Sync.
     pub fn sliding_sync_proxy(&self) -> Option<Url> {
         self.inner.sliding_sync_proxy.clone()
-    }
-
-    /// Force caching the current sliding sync to storage.
-    pub async fn force_cache_to_storage(&self, to_device_token: Option<String>) -> Result<()> {
-        self.cache_to_storage(to_device_token).await
     }
 
     /// Read the static extension configuration for this Sliding Sync.
@@ -748,7 +857,7 @@ impl SlidingSync {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct SlidingSyncPositionMarkers {
     /// An ephemeral position in the current stream, as received from the
     /// previous `/sync` response, or `None` for the first request.
@@ -764,8 +873,10 @@ pub(super) struct SlidingSyncPositionMarkers {
     delta_token: Option<String>,
 }
 
+/// Frozen bits of a Sliding Sync that are stored in the *state* store.
 #[derive(Serialize, Deserialize)]
 struct FrozenSlidingSync {
+    /// Deprecated: prefer storing in the crypto store.
     #[serde(skip_serializing_if = "Option::is_none")]
     to_device_since: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -773,11 +884,16 @@ struct FrozenSlidingSync {
 }
 
 impl FrozenSlidingSync {
-    fn new(sliding_sync: &SlidingSync, to_device_since: Option<String>) -> Self {
-        let position = sliding_sync.inner.position.read().unwrap();
-
-        Self { delta_token: position.delta_token.clone(), to_device_since }
+    async fn new(position: &SlidingSyncPositionMarkers) -> Self {
+        // The to-device token must be saved in the `FrozenCryptoSlidingSync` now.
+        Self { delta_token: position.delta_token.clone(), to_device_since: None }
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct FrozenSlidingSyncPos {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pos: Option<String>,
 }
 
 /// A summary of the updates received after a sync (like in
@@ -788,8 +904,6 @@ pub struct UpdateSummary {
     pub lists: Vec<String>,
     /// The rooms that have seen updates
     pub rooms: Vec<OwnedRoomId>,
-    /// The `prev_batch` token from the ToDevice extension, if any.
-    pub to_device_token: Option<String>,
 }
 
 /// The set of sticky parameters owned by the `SlidingSyncInner` instance, and
@@ -828,6 +942,8 @@ impl StickyData for SlidingSyncStickyParameters {
 /// correctly, so we cheat and "correct" it using heuristics here.
 /// TODO remove this workaround as soon as support of the `limited` flag is
 /// properly implemented in the open-source proxy: https://github.com/matrix-org/sliding-sync/issues/197
+// NOTE: SS proxy workaround.
+#[instrument(skip_all)]
 fn compute_limited(
     known_rooms: &BTreeMap<OwnedRoomId, SlidingSyncRoom>,
     response_rooms: &mut BTreeMap<OwnedRoomId, v4::SlidingSyncRoom>,
@@ -839,47 +955,106 @@ fn compute_limited(
             continue;
         }
 
+        if room.limited {
+            // If the room was already marked as limited, the server knew more than we do.
+            continue;
+        }
+
+        trace!(?room_id, "starting");
+
         // If the known room had some timeline events, consider it's a `limited` if
         // there's absolutely no overlap between the known events and
         // the new events in the timeline.
         if let Some(known_room) = known_rooms.get(room_id) {
+            let known_events = known_room.timeline_queue();
+
+            if room.timeline.is_empty() && !known_events.is_empty() {
+                // If the cached timeline had events, but the one in the response didn't have
+                // any, don't mark the room as limited.
+                trace!(
+                    "no timeline updates in response, local timeline had events => not limited."
+                );
+                continue;
+            }
+
             // Gather all the known event IDs. Ignore events that don't have an event ID.
-            let known_events: HashSet<OwnedEventId> = HashSet::from_iter(
-                known_room.timeline_queue().into_iter().filter_map(|event| event.event_id()),
-            );
+            let num_known_events = known_events.len();
+            let known_events: HashSet<OwnedEventId> =
+                HashSet::from_iter(known_events.into_iter().filter_map(|event| event.event_id()));
+
+            if num_known_events != known_events.len() {
+                trace!(
+                    "{} local timeline events had no IDs",
+                    num_known_events - known_events.len()
+                );
+            }
 
             // There's overlap if, and only if, there's at least one event in the
             // response's timeline that matches an event id we've seen before.
+            let mut num_missing_event_ids = 0;
             let overlap = room.timeline.iter().any(|seen_event| {
-                seen_event
-                    .get_field::<OwnedEventId>("event_id")
-                    .ok()
-                    .flatten()
-                    .map_or(false, |seen_event_id| known_events.contains(&seen_event_id))
+                if let Some(seen_event_id) =
+                    seen_event.get_field::<OwnedEventId>("event_id").ok().flatten()
+                {
+                    known_events.contains(&seen_event_id)
+                } else {
+                    warn!("unable to get event_id from {seen_event:?} when computing limited flag");
+                    num_missing_event_ids += 1;
+                    false
+                }
             });
 
             room.limited = !overlap;
+
+            trace!(
+                num_events_response = room.timeline.len(),
+                num_events_local = known_events.len(),
+                num_missing_event_ids,
+                room_limited = room.limited,
+                "done"
+            );
+        } else {
+            trace!("room isn't known locally => not limited");
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Not;
+    use std::{
+        collections::BTreeMap,
+        future::ready,
+        ops::Not,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use assert_matches::assert_matches;
-    use futures_util::{pin_mut, StreamExt};
+    use futures_util::{future::join_all, pin_mut, StreamExt};
     use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
     use matrix_sdk_test::async_test;
     use ruma::{
-        api::client::sync::sync_events::v4::ToDeviceConfig, room_id, serde::Raw, TransactionId,
+        api::client::{
+            error::ErrorKind,
+            sync::sync_events::v4::{self, ExtensionsConfig, ToDeviceConfig},
+        },
+        assign, owned_room_id, room_id,
+        serde::Raw,
+        uint, DeviceKeyAlgorithm, OwnedRoomId, TransactionId,
     };
+    use serde::Deserialize;
     use serde_json::json;
+    use url::Url;
     use wiremock::{http::Method, Match, Mock, MockServer, Request, ResponseTemplate};
 
-    use super::*;
+    use super::{
+        compute_limited,
+        sticky_parameters::{LazyTransactionId, SlidingSyncStickyManager},
+        FrozenSlidingSync, SlidingSync, SlidingSyncList, SlidingSyncListBuilder, SlidingSyncMode,
+        SlidingSyncRoom, SlidingSyncStickyParameters,
+    };
     use crate::{
-        sliding_sync::sticky_parameters::SlidingSyncStickyManager, test_utils::logged_in_client,
+        sliding_sync::cache::restore_sliding_sync_state, test_utils::logged_in_client, Result,
     };
 
     #[derive(Copy, Clone)]
@@ -1025,17 +1200,11 @@ mod tests {
             .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10))])
         .await?;
 
-        // When no to-device token is present, it's still not there after caching
-        // either.
-        let frozen = FrozenSlidingSync::new(&sliding_sync, None);
+        // FrozenSlidingSync doesn't contain the to_device_token anymore, as it's saved
+        // in the crypto store since PR #2323.
+        let position_guard = sliding_sync.inner.position.lock().await;
+        let frozen = FrozenSlidingSync::new(&position_guard).await;
         assert!(frozen.to_device_since.is_none());
-
-        // When a to-device token is present, `prepare_extensions_config` fills the
-        // request with it.
-        let since = String::from("my-to-device-since-token");
-
-        let frozen = FrozenSlidingSync::new(&sliding_sync, Some(since.clone()));
-        assert_eq!(frozen.to_device_since, Some(since));
 
         Ok(())
     }
@@ -1199,7 +1368,7 @@ mod tests {
         // Even without a since token, the first request will contain the extensions
         // configuration, at least.
         let txn_id = TransactionId::new();
-        let (request, _, _) = sync
+        let (request, _, _, _) = sync
             .generate_sync_request(&mut LazyTransactionId::from_owned(txn_id.to_owned()))
             .await?;
 
@@ -1219,7 +1388,7 @@ mod tests {
 
         // Regenerating a request will yield the same one.
         let txn_id2 = TransactionId::new();
-        let (request, _, _) = sync
+        let (request, _, _, _) = sync
             .generate_sync_request(&mut LazyTransactionId::from_owned(txn_id2.to_owned()))
             .await?;
 
@@ -1239,7 +1408,7 @@ mod tests {
 
         // The next request should contain no sticky parameters.
         let txn_id = TransactionId::new();
-        let (request, _, _) = sync
+        let (request, _, _, _) = sync
             .generate_sync_request(&mut LazyTransactionId::from_owned(txn_id.to_owned()))
             .await?;
         assert!(request.extensions.e2ee.enabled.is_none());
@@ -1249,17 +1418,32 @@ mod tests {
         // If there's a to-device `since` token, we make sure we put the token
         // into the extension config. The rest doesn't need to be re-enabled due to
         // stickiness.
-        let since_token = "since";
-        sync.force_cache_to_storage(Some(since_token.to_owned())).await?;
+        let _since_token = "since";
+
+        #[cfg(feature = "e2e-encryption")]
+        {
+            use matrix_sdk_base::crypto::store::Changes;
+            if let Some(olm_machine) = &*client.olm_machine().await {
+                olm_machine
+                    .store()
+                    .save_changes(Changes {
+                        next_batch_token: Some(_since_token.to_owned()),
+                        ..Default::default()
+                    })
+                    .await?;
+            }
+        }
 
         let txn_id = TransactionId::new();
-        let (request, _, _) = sync
+        let (request, _, _, _) = sync
             .generate_sync_request(&mut LazyTransactionId::from_owned(txn_id.to_owned()))
             .await?;
 
         assert!(request.extensions.e2ee.enabled.is_none());
         assert!(request.extensions.to_device.enabled.is_none());
-        assert_eq!(request.extensions.to_device.since.as_deref(), Some(since_token));
+
+        #[cfg(feature = "e2e-encryption")]
+        assert_eq!(request.extensions.to_device.since.as_deref(), Some(_since_token));
 
         Ok(())
     }
@@ -1276,7 +1460,7 @@ mod tests {
             .await?;
 
         // First request asks to enable the extension.
-        let (request, _, _) =
+        let (request, _, _, _) =
             sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
         assert!(request.extensions.to_device.enabled.is_some());
 
@@ -1284,68 +1468,364 @@ mod tests {
         pin_mut!(sync);
 
         // `pos` is `None` to start with.
-        assert!(sliding_sync.inner.position.read().unwrap().pos.is_none());
+        assert!(sliding_sync.inner.position.lock().await.pos.is_none());
 
         #[derive(Deserialize)]
         struct PartialRequest {
             txn_id: Option<String>,
         }
 
+        {
+            let _mock_guard = Mock::given(SlidingSyncMatcher)
+                .respond_with(|request: &Request| {
+                    // Repeat the txn_id in the response, if set.
+                    let request: PartialRequest = request.body_json().unwrap();
+
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "txn_id": request.txn_id,
+                        "pos": "0",
+                    }))
+                })
+                .mount_as_scoped(&server)
+                .await;
+
+            let next = sync.next().await;
+            assert_matches!(next, Some(Ok(_update_summary)));
+
+            // `pos` has been updated.
+            assert_eq!(sliding_sync.inner.position.lock().await.pos, Some("0".to_owned()));
+
+            // `past_positions` has been updated.
+            let past_positions = sliding_sync.inner.past_positions.read().unwrap();
+            assert_eq!(past_positions.len(), 1);
+            assert_eq!(past_positions.get(0).unwrap().pos, Some("0".to_owned()));
+        }
+
+        // Next request doesn't ask to enable the extension.
+        let (request, _, _, _) =
+            sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+        assert!(request.extensions.to_device.enabled.is_none());
+
+        // Next request is successful.
+        {
+            let _mock_guard = Mock::given(SlidingSyncMatcher)
+                .respond_with(|request: &Request| {
+                    // Repeat the txn_id in the response, if set.
+                    let request: PartialRequest = request.body_json().unwrap();
+
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "txn_id": request.txn_id,
+                        "pos": "1",
+                    }))
+                })
+                .mount_as_scoped(&server)
+                .await;
+
+            let next = sync.next().await;
+            assert_matches!(next, Some(Ok(_update_summary)));
+
+            // `pos` has been updated.
+            assert_eq!(sliding_sync.inner.position.lock().await.pos, Some("1".to_owned()));
+
+            // `past_positions` has been updated.
+            let past_positions = sliding_sync.inner.past_positions.read().unwrap();
+            assert_eq!(past_positions.len(), 2);
+            assert_eq!(past_positions.get(0).unwrap().pos, Some("0".to_owned()));
+            assert_eq!(past_positions.get(1).unwrap().pos, Some("1".to_owned()));
+        }
+
+        // Next request isn't successful because it receives an already
+        // received `pos` from the server.
+        {
+            // First response with an already seen `pos`.
+            let _mock_guard1 = Mock::given(SlidingSyncMatcher)
+                .respond_with(|request: &Request| {
+                    // Repeat the txn_id in the response, if set.
+                    let request: PartialRequest = request.body_json().unwrap();
+
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "txn_id": request.txn_id,
+                        "pos": "0", // <- already received!
+                    }))
+                })
+                .up_to_n_times(1) // run this mock only once.
+                .mount_as_scoped(&server)
+                .await;
+
+            // Second response with a new `pos`.
+            let _mock_guard2 = Mock::given(SlidingSyncMatcher)
+                .respond_with(|request: &Request| {
+                    // Repeat the txn_id in the response, if set.
+                    let request: PartialRequest = request.body_json().unwrap();
+
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "txn_id": request.txn_id,
+                        "pos": "2", // <- new!
+                    }))
+                })
+                .mount_as_scoped(&server)
+                .await;
+
+            let next = sync.next().await;
+            assert_matches!(next, Some(Ok(_update_summary)));
+
+            // `pos` has been updated.
+            assert_eq!(sliding_sync.inner.position.lock().await.pos, Some("2".to_owned()));
+
+            // `past_positions` has been updated.
+            let past_positions = sliding_sync.inner.past_positions.read().unwrap();
+            assert_eq!(past_positions.len(), 3);
+            assert_eq!(past_positions.get(0).unwrap().pos, Some("0".to_owned()));
+            assert_eq!(past_positions.get(1).unwrap().pos, Some("1".to_owned()));
+            assert_eq!(past_positions.get(2).unwrap().pos, Some("2".to_owned()));
+        }
+
+        // Stop responding with successful requests!
+        //
+        // When responding with M_UNKNOWN_POS, that regenerates the sticky parameters,
+        // so they're reset. It also resets the `pos`.
+        {
+            let _mock_guard = Mock::given(SlidingSyncMatcher)
+                .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                    "error": "foo",
+                    "errcode": "M_UNKNOWN_POS",
+                })))
+                .mount_as_scoped(&server)
+                .await;
+
+            let next = sync.next().await;
+
+            // The expected error is returned.
+            assert_matches!(next, Some(Err(err)) if err.client_api_error_kind() == Some(&ErrorKind::UnknownPos));
+
+            // `pos` has been reset.
+            assert!(sliding_sync.inner.position.lock().await.pos.is_none());
+
+            // `past_positions` has been reset.
+            assert!(sliding_sync.inner.past_positions.read().unwrap().is_empty());
+
+            // Next request asks to enable the extension again.
+            let (request, _, _, _) =
+                sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+
+            assert!(request.extensions.to_device.enabled.is_some());
+
+            // `sync` has been stopped.
+            assert!(sync.next().await.is_none());
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "e2e-encryption")]
+    #[async_test]
+    async fn test_sliding_sync_doesnt_remember_pos() -> Result<()> {
+        let server = MockServer::start().await;
+
+        #[derive(Deserialize)]
+        struct PartialRequest {
+            txn_id: Option<String>,
+        }
+
+        let server_pos = Arc::new(Mutex::new(0));
         let _mock_guard = Mock::given(SlidingSyncMatcher)
-            .respond_with(|request: &Request| {
+            .respond_with(move |request: &Request| {
                 // Repeat the txn_id in the response, if set.
                 let request: PartialRequest = request.body_json().unwrap();
+                let pos = {
+                    let mut pos = server_pos.lock().unwrap();
+                    let prev = *pos;
+                    *pos += 1;
+                    prev
+                };
+
                 ResponseTemplate::new(200).set_body_json(json!({
                     "txn_id": request.txn_id,
-                    "pos": "0"
+                    "pos": pos.to_string(),
                 }))
             })
             .mount_as_scoped(&server)
             .await;
 
+        let client = logged_in_client(Some(server.uri())).await;
+
+        let sliding_sync = client.sliding_sync("forgetful-sync")?.build().await?;
+
+        // `pos` is `None` to start with.
+        {
+            assert!(sliding_sync.inner.position.lock().await.pos.is_none());
+
+            let (request, _, _, _) =
+                sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+            assert!(request.pos.is_none());
+        }
+
+        let sync = sliding_sync.sync();
+        pin_mut!(sync);
+
+        // Sync goes well, and then the position is saved both into the internal memory
+        // and the database.
         let next = sync.next().await;
         assert_matches!(next, Some(Ok(_update_summary)));
 
-        // `pos` has been updated.
-        assert_eq!(sliding_sync.inner.position.read().unwrap().pos, Some("0".to_owned()));
+        assert_eq!(sliding_sync.inner.position.lock().await.pos.as_deref(), Some("0"));
 
-        // Next request doesn't ask to enable the extension.
-        let (request, _, _) =
-            sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
-        assert!(request.extensions.to_device.enabled.is_none());
+        let restored_fields = restore_sliding_sync_state(
+            &client,
+            &sliding_sync.inner.storage_key,
+            &*sliding_sync.inner.lists.read().await,
+        )
+        .await?
+        .expect("must have restored fields");
 
-        let next = sync.next().await;
-        assert_matches!(next, Some(Ok(_update_summary)));
+        // While it has been saved into the database, it's not necessarily going to be
+        // used later!
+        assert_eq!(restored_fields.pos.as_deref(), Some("0"));
 
-        // Stop responding with successful requests!
-        drop(_mock_guard);
+        // Now, even if we mess with the position stored in the database, the sliding
+        // sync instance isn't configured to reload the stream position from the
+        // database, so it won't be changed.
+        {
+            let other_sync = client.sliding_sync("forgetful-sync")?.build().await?;
 
-        // When responding with M_UNKNOWN_POS, that regenerates the sticky parameters,
-        // so they're reset. It also resets the `pos`.
+            let mut position_guard = other_sync.inner.position.lock().await;
+            position_guard.pos = Some("yolo".to_owned());
+
+            other_sync.cache_to_storage(&position_guard).await?;
+        }
+
+        // It's still 0, not "yolo".
+        {
+            assert_eq!(sliding_sync.inner.position.lock().await.pos.as_deref(), Some("0"));
+            let (request, _, _, _) =
+                sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+            assert_eq!(request.pos.as_deref(), Some("0"));
+        }
+
+        // Recreating a sliding sync with the same ID doesn't preload the pos, if not
+        // asked to.
+        {
+            let sliding_sync = client.sliding_sync("forgetful-sync")?.build().await?;
+            assert!(sliding_sync.inner.position.lock().await.pos.is_none());
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "e2e-encryption")]
+    #[async_test]
+    async fn test_sliding_sync_does_remember_pos() -> Result<()> {
+        let server = MockServer::start().await;
+
+        #[derive(Deserialize)]
+        struct PartialRequest {
+            txn_id: Option<String>,
+        }
+
+        let server_pos = Arc::new(Mutex::new(0));
         let _mock_guard = Mock::given(SlidingSyncMatcher)
-            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-                "error": "foo",
-                "errcode": "M_UNKNOWN_POS",
-            })))
+            .respond_with(move |request: &Request| {
+                // Repeat the txn_id in the response, if set.
+                let request: PartialRequest = request.body_json().unwrap();
+                let pos = {
+                    let mut pos = server_pos.lock().unwrap();
+                    let prev = *pos;
+                    *pos += 1;
+                    prev
+                };
+
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "txn_id": request.txn_id,
+                    "pos": pos.to_string(),
+                }))
+            })
             .mount_as_scoped(&server)
             .await;
 
+        let client = logged_in_client(Some(server.uri())).await;
+
+        let sliding_sync = client.sliding_sync("elephant-sync")?.share_pos().build().await?;
+
+        // `pos` is `None` to start with.
+        {
+            let (request, _, _, _) =
+                sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+
+            assert!(request.pos.is_none());
+            assert!(sliding_sync.inner.position.lock().await.pos.is_none());
+        }
+
+        let sync = sliding_sync.sync();
+        pin_mut!(sync);
+
+        // Sync goes well, and then the position is saved both into the internal memory
+        // and the database.
         let next = sync.next().await;
+        assert_matches!(next, Some(Ok(_update_summary)));
 
-        // The expected error is returned.
-        assert_matches!(next, Some(Err(err)) if err.client_api_error_kind() == Some(&ErrorKind::UnknownPos));
+        assert_eq!(sliding_sync.inner.position.lock().await.pos, Some("0".to_owned()));
 
-        // `pos` has been reset.
-        assert!(sliding_sync.inner.position.read().unwrap().pos.is_none());
+        let restored_fields = restore_sliding_sync_state(
+            &client,
+            &sliding_sync.inner.storage_key,
+            &*sliding_sync.inner.lists.read().await,
+        )
+        .await?
+        .expect("must have restored fields");
 
-        // Next request asks to enable the extension again.
-        let (request, _, _) =
-            sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+        // While it has been saved into the database, it's not necessarily going to be
+        // used later!
+        assert_eq!(restored_fields.pos.as_deref(), Some("0"));
 
-        assert!(request.extensions.to_device.enabled.is_some());
+        // Another process modifies the stream position under our feet...
+        {
+            let other_sync = client.sliding_sync("elephant-sync")?.build().await?;
 
-        // `sync` has been stopped.
-        assert!(sync.next().await.is_none());
+            let mut position_guard = other_sync.inner.position.lock().await;
+            position_guard.pos = Some("42".to_owned());
+
+            other_sync.cache_to_storage(&position_guard).await?;
+        }
+
+        // It's alright, the next request will load it from the database.
+        {
+            let (request, _, _, _) =
+                sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+            assert_eq!(request.pos.as_deref(), Some("42"));
+            assert_eq!(sliding_sync.inner.position.lock().await.pos.as_deref(), Some("42"));
+        }
+
+        // Recreating a sliding sync with the same ID will reload it too.
+        {
+            let sliding_sync = client.sliding_sync("elephant-sync")?.share_pos().build().await?;
+            assert_eq!(sliding_sync.inner.position.lock().await.pos.as_deref(), Some("42"));
+
+            let (request, _, _, _) =
+                sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+            assert_eq!(request.pos.as_deref(), Some("42"));
+        }
+
+        // Invalidating the session will remove the in-memory value AND the database
+        // value.
+        sliding_sync.expire_session().await;
+
+        {
+            assert!(sliding_sync.inner.position.lock().await.pos.is_none());
+
+            let (request, _, _, _) =
+                sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+            assert!(request.pos.is_none());
+        }
+
+        // And new sliding syncs with the same ID won't find it either.
+        {
+            let sliding_sync = client.sliding_sync("elephant-sync")?.share_pos().build().await?;
+            assert!(sliding_sync.inner.position.lock().await.pos.is_none());
+
+            let (request, _, _, _) =
+                sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+            assert!(request.pos.is_none());
+        }
 
         Ok(())
     }
@@ -1356,24 +1836,24 @@ mod tests {
             .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10))])
         .await?;
 
-        // Start the sync-loop.
+        // Start the sync loop.
         let stream = sliding_sync.sync();
         pin_mut!(stream);
 
-        // The sync-loop is actually running.
+        // The sync loop is actually running.
         assert!(stream.next().await.is_some());
 
-        // Stop the sync-loop.
+        // Stop the sync loop.
         sliding_sync.stop_sync()?;
 
-        // The sync-loop is actually stopped.
+        // The sync loop is actually stopped.
         assert!(stream.next().await.is_none());
 
-        // Start a new sync-loop.
+        // Start a new sync loop.
         let stream = sliding_sync.sync();
         pin_mut!(stream);
 
-        // The sync-loop is actually running.
+        // The sync loop is actually running.
         assert!(stream.next().await.is_some());
 
         Ok(())
@@ -1455,6 +1935,8 @@ mod tests {
         let no_overlap = room_id!("!omelette:example.org");
         let partial_overlap = room_id!("!fromage:example.org");
         let complete_overlap = room_id!("!baguette:example.org");
+        let no_new_events = room_id!("!pain:example.org");
+        let already_limited = room_id!("!paris:example.org");
 
         let response_timeline = vec![event_c.event.clone(), event_d.event.clone()];
 
@@ -1500,6 +1982,28 @@ mod tests {
                     vec![event_c.clone(), event_d.clone()],
                 ),
             ),
+            (
+                // We locally have events for this room, and receive none in the response: not
+                // limited.
+                no_new_events.to_owned(),
+                SlidingSyncRoom::new(
+                    client.clone(),
+                    no_new_events.to_owned(),
+                    v4::SlidingSyncRoom::default(),
+                    vec![event_c.clone(), event_d.clone()],
+                ),
+            ),
+            (
+                // Already limited, but would be marked limited if the flag wasn't ignored (same as
+                // partial overlap).
+                already_limited.to_owned(),
+                SlidingSyncRoom::new(
+                    client.clone(),
+                    already_limited.to_owned(),
+                    v4::SlidingSyncRoom::default(),
+                    vec![event_a.clone(), event_b.clone(), event_c.clone()],
+                ),
+            ),
         ]);
 
         let mut response_rooms = BTreeMap::from_iter([
@@ -1528,6 +2032,21 @@ mod tests {
                     timeline: vec![event_c.event.clone(), event_d.event.clone()],
                 }),
             ),
+            (
+                no_new_events.to_owned(),
+                assign!(v4::SlidingSyncRoom::default(), {
+                    initial: Some(true),
+                    timeline: vec![],
+                }),
+            ),
+            (
+                already_limited.to_owned(),
+                assign!(v4::SlidingSyncRoom::default(), {
+                    initial: Some(true),
+                    limited: true,
+                    timeline: vec![event_c.event.clone(), event_d.event.clone()],
+                }),
+            ),
         ]);
 
         compute_limited(&known_rooms, &mut response_rooms);
@@ -1536,5 +2055,286 @@ mod tests {
         assert!(response_rooms.get(no_overlap).unwrap().limited);
         assert!(!response_rooms.get(partial_overlap).unwrap().limited);
         assert!(!response_rooms.get(complete_overlap).unwrap().limited);
+        assert!(!response_rooms.get(no_new_events).unwrap().limited);
+        assert!(response_rooms.get(already_limited).unwrap().limited);
+    }
+
+    #[async_test]
+    #[cfg(feature = "e2e-encryption")]
+    async fn test_process_only_encryption_events() -> Result<()> {
+        let room = owned_room_id!("!croissant:example.org");
+
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+
+        let server_response = assign!(v4::Response::new("0".to_owned()), {
+            rooms: BTreeMap::from([(
+                room.clone(),
+                assign!(v4::SlidingSyncRoom::default(), {
+                    name: Some("Croissants lovers".to_owned()),
+                    timeline: Vec::new(),
+                }),
+            )]),
+
+            extensions: assign!(v4::Extensions::default(), {
+                e2ee: assign!(v4::E2EE::default(), {
+                    device_one_time_keys_count: BTreeMap::from([(DeviceKeyAlgorithm::SignedCurve25519, uint!(42))])
+                }),
+                to_device: Some(assign!(v4::ToDevice::default(), {
+                    next_batch: "to-device-token".to_owned(),
+                })),
+            })
+        });
+
+        // Don't process non-encryption events if the sliding sync is configured for
+        // encryption only.
+
+        let sliding_sync = client
+            .sliding_sync("test")?
+            .with_to_device_extension(
+                assign!(v4::ToDeviceConfig::default(), { enabled: Some(true)}),
+            )
+            .with_e2ee_extension(assign!(v4::E2EEConfig::default(), { enabled: Some(true)}))
+            .build()
+            .await?;
+
+        {
+            let mut position_guard = sliding_sync.inner.position.clone().lock_owned().await;
+
+            sliding_sync.handle_response(server_response.clone(), &mut position_guard).await?;
+        }
+
+        // E2EE has been properly handled.
+        let uploaded_key_count = client.encryption().uploaded_key_count().await?;
+        assert_eq!(uploaded_key_count, 42);
+
+        {
+            let olm_machine = &*client.olm_machine_for_testing().await;
+            assert_eq!(
+                olm_machine.as_ref().unwrap().store().next_batch_token().await?.as_deref(),
+                Some("to-device-token")
+            );
+        }
+
+        // Room events haven't.
+        assert!(client.get_room(&room).is_none());
+
+        // Conversely, only process room lists events if the sliding sync was configured
+        // as so.
+        let client = logged_in_client(Some(server.uri())).await;
+
+        let sliding_sync = client
+            .sliding_sync("test")?
+            .add_list(SlidingSyncList::builder("thelist"))
+            .build()
+            .await?;
+
+        {
+            let mut position_guard = sliding_sync.inner.position.clone().lock_owned().await;
+
+            sliding_sync.handle_response(server_response.clone(), &mut position_guard).await?;
+        }
+
+        // E2EE response has been ignored.
+        let uploaded_key_count = client.encryption().uploaded_key_count().await?;
+        assert_eq!(uploaded_key_count, 0);
+
+        {
+            let olm_machine = &*client.olm_machine_for_testing().await;
+            assert_eq!(
+                olm_machine.as_ref().unwrap().store().next_batch_token().await?.as_deref(),
+                None
+            );
+        }
+
+        // The room is now known.
+        assert!(client.get_room(&room).is_some());
+
+        // And it's also possible to set up both.
+        let client = logged_in_client(Some(server.uri())).await;
+
+        let sliding_sync = client
+            .sliding_sync("test")?
+            .add_list(SlidingSyncList::builder("thelist"))
+            .with_to_device_extension(
+                assign!(v4::ToDeviceConfig::default(), { enabled: Some(true)}),
+            )
+            .with_e2ee_extension(assign!(v4::E2EEConfig::default(), { enabled: Some(true)}))
+            .build()
+            .await?;
+
+        {
+            let mut position_guard = sliding_sync.inner.position.clone().lock_owned().await;
+
+            sliding_sync.handle_response(server_response.clone(), &mut position_guard).await?;
+        }
+
+        // E2EE has been properly handled.
+        let uploaded_key_count = client.encryption().uploaded_key_count().await?;
+        assert_eq!(uploaded_key_count, 42);
+
+        {
+            let olm_machine = &*client.olm_machine_for_testing().await;
+            assert_eq!(
+                olm_machine.as_ref().unwrap().store().next_batch_token().await?.as_deref(),
+                Some("to-device-token")
+            );
+        }
+
+        // The room is now known.
+        assert!(client.get_room(&room).is_some());
+
+        Ok(())
+    }
+
+    #[async_test]
+    async fn test_lock_multiple_requests() -> Result<()> {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+
+        let pos = Arc::new(Mutex::new(0));
+        let _mock_guard = Mock::given(SlidingSyncMatcher)
+            .respond_with(move |_: &Request| {
+                let mut pos = pos.lock().unwrap();
+                *pos += 1;
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "pos": pos.to_string(),
+                    "lists": {},
+                    "rooms": {}
+                }))
+            })
+            .mount_as_scoped(&server)
+            .await;
+
+        let sliding_sync = client
+            .sliding_sync("test")?
+            .with_to_device_extension(
+                assign!(v4::ToDeviceConfig::default(), { enabled: Some(true)}),
+            )
+            .with_e2ee_extension(assign!(v4::E2EEConfig::default(), { enabled: Some(true)}))
+            .build()
+            .await?;
+
+        // Spawn two requests in parallel. Before #2430, this lead to a deadlock and the
+        // test would never terminate.
+        let requests = join_all([sliding_sync.sync_once(), sliding_sync.sync_once()]);
+
+        for result in requests.await {
+            result?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))] // b/o tokio::time::sleep
+    #[async_test]
+    async fn test_aborted_request_doesnt_update_future_requests() -> Result<()> {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+
+        let pos = Arc::new(Mutex::new(0));
+        let _mock_guard = Mock::given(SlidingSyncMatcher)
+            .respond_with(move |_: &Request| {
+                let mut pos = pos.lock().unwrap();
+                *pos += 1;
+                // Respond slowly enough that we can skip one iteration.
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({
+                        "pos": pos.to_string(),
+                        "lists": {},
+                        "rooms": {}
+                    }))
+                    .set_delay(Duration::from_secs(2))
+            })
+            .mount_as_scoped(&server)
+            .await;
+
+        let sliding_sync =
+            client
+                .sliding_sync("test")?
+                .add_list(SlidingSyncList::builder("room-list").sync_mode(
+                    SlidingSyncMode::new_growing(10).maximum_number_of_rooms_to_fetch(100),
+                ))
+                .add_list(
+                    SlidingSyncList::builder("another-list")
+                        .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10)),
+                )
+                .build()
+                .await?;
+
+        let stream = sliding_sync.sync();
+        pin_mut!(stream);
+
+        let cloned_sync = sliding_sync.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            cloned_sync
+                .on_list("another-list", |list| {
+                    list.set_sync_mode(SlidingSyncMode::new_selective().add_range(10..=20));
+                    ready(())
+                })
+                .await;
+        });
+
+        assert_matches!(stream.next().await, Some(Ok(_)));
+
+        sliding_sync.stop_sync().unwrap();
+
+        assert_matches!(stream.next().await, None);
+
+        let mut num_requests = 0;
+
+        for request in server.received_requests().await.unwrap() {
+            if !SlidingSyncMatcher.matches(&request) {
+                continue;
+            }
+
+            let another_list_ranges = if num_requests == 0 {
+                // First request
+                json!([[0, 10]])
+            } else {
+                // Second request
+                json!([[10, 20]])
+            };
+
+            num_requests += 1;
+            assert!(num_requests <= 2, "more than one request hit the server");
+
+            let json_value = serde_json::from_slice::<serde_json::Value>(&request.body).unwrap();
+
+            if let Err(err) = assert_json_diff::assert_json_matches_no_panic(
+                &json_value,
+                &json!({
+                    "conn_id": "test",
+                    "lists": {
+                        "room-list": {
+                            "ranges": [[0, 9]],
+                            "required_state": [
+                                ["m.room.encryption", ""],
+                                ["m.room.tombstone", ""]
+                            ],
+                            "sort": ["by_recency", "by_name"]
+                        },
+                        "another-list": {
+                            "ranges": another_list_ranges,
+                            "required_state": [
+                                ["m.room.encryption", ""],
+                                ["m.room.tombstone", ""]
+                            ],
+                            "sort": ["by_recency", "by_name"]
+                        },
+                    }
+                }),
+                assert_json_diff::Config::new(assert_json_diff::CompareMode::Inclusive),
+            ) {
+                dbg!(json_value);
+                panic!("json differ: {err}");
+            }
+        }
+
+        assert_eq!(num_requests, 2);
+
+        Ok(())
     }
 }

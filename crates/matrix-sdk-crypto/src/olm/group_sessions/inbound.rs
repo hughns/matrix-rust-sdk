@@ -605,7 +605,7 @@ impl TryFrom<&DecryptedForwardedRoomKeyEvent> for InboundGroupSession {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use matrix_sdk_test::async_test;
     use ruma::{device_id, room_id, user_id, DeviceId, UserId};
     use vodozemac::{megolm::SessionOrdering, Curve25519PublicKey};
@@ -667,7 +667,7 @@ mod test {
 
     #[async_test]
     async fn session_comparison() {
-        let alice = ReadOnlyAccount::new(alice_id(), alice_device_id());
+        let alice = ReadOnlyAccount::with_device_id(alice_id(), alice_device_id());
         let room_id = room_id!("!test:localhost");
 
         let (_, inbound) = alice.create_group_session_pair_with_defaults(room_id).await;

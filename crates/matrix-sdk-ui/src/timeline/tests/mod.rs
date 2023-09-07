@@ -45,7 +45,7 @@ use ruma::{
     room_id,
     serde::Raw,
     server_name, uint, user_id, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId,
-    OwnedTransactionId, OwnedUserId, TransactionId, UserId,
+    OwnedTransactionId, OwnedUserId, RoomVersionId, TransactionId, UserId,
 };
 use serde_json::{json, Value as JsonValue};
 
@@ -64,6 +64,7 @@ mod edit;
 mod encryption;
 mod event_filter;
 mod invalid;
+mod polls;
 mod reaction_group;
 mod reactions;
 mod read_receipts;
@@ -72,6 +73,7 @@ mod virt;
 
 static ALICE: Lazy<&UserId> = Lazy::new(|| user_id!("@alice:server.name"));
 static BOB: Lazy<&UserId> = Lazy::new(|| user_id!("@bob:other.server"));
+static CAROL: Lazy<&UserId> = Lazy::new(|| user_id!("@carol:other.server"));
 
 fn sync_timeline_event(event: JsonValue) -> SyncTimelineEvent {
     let event = serde_json::from_value(event).unwrap();
@@ -228,7 +230,7 @@ impl TestTimeline {
 
     async fn handle_back_paginated_custom_event(&self, event: JsonValue) {
         let timeline_event = TimelineEvent::new(Raw::new(&event).unwrap().cast());
-        self.inner.handle_back_paginated_event(timeline_event).await;
+        self.inner.handle_back_paginated_events(vec![timeline_event]).await;
     }
 
     async fn handle_read_receipts(
@@ -408,6 +410,10 @@ struct TestRoomDataProvider;
 impl RoomDataProvider for TestRoomDataProvider {
     fn own_user_id(&self) -> &UserId {
         &ALICE
+    }
+
+    fn room_version(&self) -> RoomVersionId {
+        RoomVersionId::V10
     }
 
     async fn profile(&self, _user_id: &UserId) -> Option<Profile> {

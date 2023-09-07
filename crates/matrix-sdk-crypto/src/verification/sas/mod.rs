@@ -864,6 +864,8 @@ impl AcceptSettings {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use assert_matches::assert_matches;
     use matrix_sdk_test::async_test;
     use ruma::{
@@ -876,7 +878,7 @@ mod tests {
     use super::Sas;
     use crate::{
         olm::PrivateCrossSigningIdentity,
-        store::{IntoCryptoStore, MemoryStore},
+        store::{CryptoStoreWrapper, MemoryStore},
         verification::{
             event_enums::{AcceptContent, KeyContent, MacContent, OutgoingContent, StartContent},
             VerificationStore,
@@ -902,15 +904,15 @@ mod tests {
 
     async fn machine_pair() -> (VerificationStore, ReadOnlyDevice, VerificationStore, ReadOnlyDevice)
     {
-        let alice = ReadOnlyAccount::new(alice_id(), alice_device_id());
+        let alice = ReadOnlyAccount::with_device_id(alice_id(), alice_device_id());
         let alice_device = ReadOnlyDevice::from_account(&alice).await;
 
-        let bob = ReadOnlyAccount::new(bob_id(), bob_device_id());
+        let bob = ReadOnlyAccount::with_device_id(bob_id(), bob_device_id());
         let bob_device = ReadOnlyDevice::from_account(&bob).await;
 
         let alice_store = VerificationStore {
             account: alice.clone(),
-            inner: MemoryStore::new().into_crypto_store(),
+            inner: Arc::new(CryptoStoreWrapper::new(alice.user_id(), MemoryStore::new())),
             private_identity: Mutex::new(PrivateCrossSigningIdentity::empty(alice_id())).into(),
         };
 
@@ -919,7 +921,7 @@ mod tests {
 
         let bob_store = VerificationStore {
             account: bob.clone(),
-            inner: bob_store.into_crypto_store(),
+            inner: Arc::new(CryptoStoreWrapper::new(bob.user_id(), bob_store)),
             private_identity: Mutex::new(PrivateCrossSigningIdentity::empty(bob_id())).into(),
         };
 

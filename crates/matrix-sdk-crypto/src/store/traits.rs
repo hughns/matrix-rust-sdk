@@ -16,7 +16,9 @@ use std::{collections::HashMap, fmt, sync::Arc};
 
 use async_trait::async_trait;
 use matrix_sdk_common::AsyncTraitDeps;
-use ruma::{DeviceId, OwnedDeviceId, RoomId, TransactionId, UserId};
+use ruma::{
+    events::secret::request::SecretName, DeviceId, OwnedDeviceId, RoomId, TransactionId, UserId,
+};
 use tokio::sync::Mutex;
 
 use super::{BackupKeys, Changes, CryptoStoreError, Result, RoomKeyCounts, RoomSettings};
@@ -27,8 +29,8 @@ use crate::{
     },
     store::NoisyArc,
     types::events::room_key_withheld::RoomKeyWithheldEvent,
-    GossipRequest, ReadOnlyAccount, ReadOnlyDevice, ReadOnlyUserIdentities, SecretInfo,
-    TrackedUser,
+    GossipRequest, GossippedSecret, ReadOnlyAccount, ReadOnlyDevice, ReadOnlyUserIdentities,
+    SecretInfo, TrackedUser,
 };
 
 /// Represents a store that the `OlmMachine` uses to store E2EE data (such as
@@ -201,6 +203,17 @@ pub trait CryptoStore: AsyncTraitDeps {
         request_id: &TransactionId,
     ) -> Result<(), Self::Error>;
 
+    /// Get all the secrets with the given [`SecretName`] we have currently
+    /// stored.
+    async fn get_secrets_from_inbox(
+        &self,
+        secret_name: &SecretName,
+    ) -> Result<Vec<GossippedSecret>, Self::Error>;
+
+    /// Delete all the secrets with the given [`SecretName`] we have currently
+    /// stored.
+    async fn delete_secrets_from_inbox(&self, secret_name: &SecretName) -> Result<(), Self::Error>;
+
     /// Get the room settings, such as the encryption algorithm or whether to
     /// encrypt only for trusted devices.
     ///
@@ -245,6 +258,9 @@ pub trait CryptoStore: AsyncTraitDeps {
         key: &str,
         holder: &str,
     ) -> Result<bool, Self::Error>;
+
+    /// Load the next-batch token for a to-device query, if any.
+    async fn next_batch_token(&self) -> Result<Option<String>, Self::Error>;
 }
 
 #[repr(transparent)]
@@ -372,6 +388,17 @@ impl<T: CryptoStore> CryptoStore for EraseCryptoStoreError<T> {
         self.0.delete_outgoing_secret_requests(request_id).await.map_err(Into::into)
     }
 
+    async fn get_secrets_from_inbox(
+        &self,
+        secret_name: &SecretName,
+    ) -> Result<Vec<GossippedSecret>> {
+        self.0.get_secrets_from_inbox(secret_name).await.map_err(Into::into)
+    }
+
+    async fn delete_secrets_from_inbox(&self, secret_name: &SecretName) -> Result<()> {
+        self.0.delete_secrets_from_inbox(secret_name).await.map_err(Into::into)
+    }
+
     async fn get_withheld_info(
         &self,
         room_id: &RoomId,
@@ -399,6 +426,10 @@ impl<T: CryptoStore> CryptoStore for EraseCryptoStoreError<T> {
         holder: &str,
     ) -> Result<bool, Self::Error> {
         self.0.try_take_leased_lock(lease_duration_ms, key, holder).await.map_err(Into::into)
+    }
+
+    async fn next_batch_token(&self) -> Result<Option<String>, Self::Error> {
+        self.0.next_batch_token().await.map_err(Into::into)
     }
 }
 

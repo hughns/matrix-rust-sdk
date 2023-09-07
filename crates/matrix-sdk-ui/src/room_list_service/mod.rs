@@ -62,11 +62,12 @@
 //! [`RoomListService::state`] provides a way to get a stream of the state
 //! machine's state, which can be pretty helpful for the client app.
 
+pub mod filters;
 mod room;
 mod room_list;
 mod state;
 
-use std::{future::ready, sync::Arc};
+use std::{future::ready, sync::Arc, time::Duration};
 
 use async_stream::stream;
 use eyeball::{SharedObservable, Subscriber};
@@ -81,7 +82,8 @@ pub use room::*;
 pub use room_list::*;
 use ruma::{
     api::client::sync::sync_events::v4::{
-        AccountDataConfig, E2EEConfig, SyncRequestListFilters, ToDeviceConfig,
+        AccountDataConfig, E2EEConfig, ReceiptsConfig, RoomReceiptConfig, SyncRequestListFilters,
+        ToDeviceConfig,
     },
     assign,
     events::{StateEventType, TimelineEventType},
@@ -89,11 +91,29 @@ use ruma::{
 };
 pub use state::*;
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock};
+use tokio::{
+    sync::{Mutex, RwLock},
+    time::timeout,
+};
+
+/// Delay time before actually sending a [`SyncIndicator::Show`].
+///
+/// It's not because a `SyncIndicator` should be shown that it must be done
+/// immediately. In case of a normal network conditions, without any delay, it
+/// can lead to a “blinking” visual effect. This constant configures how long it
+/// takes to consider that a request is “slow”, and that the `SyncIndicator` is
+/// necessary to be shown.
+pub const SYNC_INDICATOR_DELAY_BEFORE_SHOWING: Duration = Duration::from_millis(200);
+
+/// Delay time before actually sending a [`SyncIndicator::Hide`].
+pub const SYNC_INDICATOR_DELAY_BEFORE_HIDING: Duration = Duration::from_millis(0);
 
 /// The [`RoomListService`] type. See the module's documentation to learn more.
 #[derive(Debug)]
 pub struct RoomListService {
+    /// Client that has created this [`RoomListService`].
+    client: Client,
+
     /// The Sliding Sync instance.
     sliding_sync: Arc<SlidingSync>,
 
@@ -145,7 +165,11 @@ impl RoomListService {
             .map_err(Error::SlidingSync)?
             .with_account_data_extension(
                 assign!(AccountDataConfig::default(), { enabled: Some(true) }),
-            );
+            )
+            .with_receipt_extension(assign!(ReceiptsConfig::default(), {
+                enabled: Some(true),
+                rooms: Some(vec![RoomReceiptConfig::AllSubscribed])
+            }));
 
         if with_encryption {
             builder = builder
@@ -156,11 +180,12 @@ impl RoomListService {
         }
 
         let sliding_sync = builder
-            // TODO revert to `add_cached_list` when reloading rooms from the cache is blazingly
-            // fast
-            .add_list(configure_all_or_visible_rooms_list(
+            .add_cached_list(configure_all_or_visible_rooms_list(
                 SlidingSyncList::builder(ALL_ROOMS_LIST_NAME)
-                    .sync_mode(SlidingSyncMode::new_selective().add_range(0..=19))
+                    .sync_mode(
+                        SlidingSyncMode::new_selective()
+                            .add_range(ALL_ROOMS_DEFAULT_SELECTIVE_RANGE),
+                    )
                     .timeline_limit(1)
                     .required_state(vec![
                         (StateEventType::RoomAvatar, "".to_owned()),
@@ -168,12 +193,36 @@ impl RoomListService {
                         (StateEventType::RoomPowerLevels, "".to_owned()),
                     ]),
             ))
+            .await
+            .map_err(Error::SlidingSync)?
+            .add_cached_list(
+                SlidingSyncList::builder(INVITES_LIST_NAME)
+                    .sync_mode(
+                        SlidingSyncMode::new_selective().add_range(INVITES_DEFAULT_SELECTIVE_RANGE),
+                    )
+                    .timeline_limit(0)
+                    .required_state(vec![
+                        (StateEventType::RoomAvatar, "".to_owned()),
+                        (StateEventType::RoomEncryption, "".to_owned()),
+                        (StateEventType::RoomMember, "$ME".to_owned()),
+                        (StateEventType::RoomCanonicalAlias, "".to_owned()),
+                    ])
+                    .filters(Some(assign!(SyncRequestListFilters::default(), {
+                        is_invite: Some(true),
+                        is_tombstoned: Some(false),
+                        not_room_types: vec!["m.space".to_owned()],
+
+                    }))),
+            )
+            .await
+            .map_err(Error::SlidingSync)?
             .build()
             .await
             .map(Arc::new)
             .map_err(Error::SlidingSync)?;
 
         Ok(Self {
+            client,
             sliding_sync,
             state: SharedObservable::new(State::Init),
             rooms: Arc::new(RwLock::new(RingBuffer::new(Self::ROOM_OBJECT_CACHE_SIZE))),
@@ -194,6 +243,10 @@ impl RoomListService {
     /// Stopping the [`Stream`] (i.e. by calling [`Self::stop_sync`]), and
     /// calling [`Self::sync`] again will resume from the previous state of
     /// the state machine.
+    ///
+    /// This should be used only for testing. In practice, most users should be
+    /// using the [`SyncService`] instead.
+    #[doc(hidden)]
     pub fn sync(&self) -> impl Stream<Item = Result<(), Error>> + '_ {
         stream! {
             let sync = self.sliding_sync.sync();
@@ -212,6 +265,7 @@ impl RoomListService {
 
                 // Do the sync.
                 match sync.next().await {
+                    // Got a successful result while syncing.
                     Some(Ok(_update_summary)) => {
                         // Update the state.
                         self.state.set(next_state);
@@ -219,6 +273,7 @@ impl RoomListService {
                         yield Ok(());
                     }
 
+                    // Got an error while syncing.
                     Some(Err(error)) => {
                         let next_state = State::Error { from: Box::new(next_state) };
                         self.state.set(next_state);
@@ -228,6 +283,7 @@ impl RoomListService {
                         break;
                     }
 
+                    // Sync loop has terminated.
                     None => {
                         let next_state = State::Terminated { from: Box::new(next_state) };
                         self.state.set(next_state);
@@ -242,10 +298,11 @@ impl RoomListService {
     /// Force to stop the sync of the `RoomListService` started by
     /// [`Self::sync`].
     ///
-    /// It's better to call this method rather than stop polling the `Stream`
-    /// returned by [`Self::sync`] because it will force the cancellation and
-    /// exit the sync-loop, i.e. it will cancel any in-flight HTTP requests,
-    /// cancel any pending futures etc.
+    /// It's of utter importance to call this method rather than stop polling
+    /// the `Stream` returned by [`Self::sync`] because it will force the
+    /// cancellation and exit the sync loop, i.e. it will cancel any
+    /// in-flight HTTP requests, cancel any pending futures etc. and put the
+    /// service into a termination state.
     ///
     /// Ideally, one wants to consume the `Stream` returned by [`Self::sync`]
     /// until it returns `None`, because of [`Self::stop_sync`], so that it
@@ -253,8 +310,90 @@ impl RoomListService {
     ///
     /// Stopping the sync of the room list via this method will put the
     /// state-machine into the [`State::Terminated`] state.
+    ///
+    /// This should be used only for testing. In practice, most users should be
+    /// using the [`SyncService`] instead.
+    #[doc(hidden)]
     pub fn stop_sync(&self) -> Result<(), Error> {
         self.sliding_sync.stop_sync().map_err(Error::SlidingSync)
+    }
+
+    /// Force the sliding sync session to expire.
+    ///
+    /// This is used by [`SyncService`][crate::SyncService].
+    ///
+    /// **Warning**: This method **must not** be called while the sync loop is
+    /// running!
+    pub(crate) async fn expire_sync_session(&self) {
+        self.sliding_sync.expire_session().await;
+
+        // Usually, when the session expires, it leads the state to be `Error`,
+        // thus some actions (like refreshing the lists) are executed. However,
+        // if the sync loop has been stopped manually, the state is `Terminated`, and
+        // when the session is forced to expire, the state remains `Terminated`, thus
+        // the actions aren't executed as expected. Consequently, let's update the
+        // state.
+        if let State::Terminated { from } = self.state.get() {
+            self.state.set(State::Error { from });
+        }
+    }
+
+    /// Get a [`Stream`] of [`SyncIndicator`].
+    ///
+    /// Read the documentation of [`SyncIndicator`] to learn more about it.
+    pub fn sync_indicator(&self) -> impl Stream<Item = SyncIndicator> {
+        let mut state = self.state();
+
+        stream! {
+            // Ensure the `SyncIndicator` is always hidden to start with.
+            yield SyncIndicator::Hide;
+
+            // Let's not wait for an update to happen. The `SyncIndicator` must be
+            // computed as fast as possible.
+            let mut current_state = state.next_now();
+
+            loop {
+                let (sync_indicator, yield_delay) = match current_state {
+                    State::Init | State::Recovering | State::Error { .. } => {
+                        (SyncIndicator::Show, SYNC_INDICATOR_DELAY_BEFORE_SHOWING)
+                    }
+
+                    State::SettingUp | State::Running | State::Terminated { .. } => {
+                        (SyncIndicator::Hide, SYNC_INDICATOR_DELAY_BEFORE_HIDING)
+                    }
+                };
+
+                // `state.next().await` has a maximum of `yield_delay` time to execute…
+                let next_state = match timeout(yield_delay, state.next()).await {
+                    // A new state has been received before `yield_delay` time. The new
+                    // `sync_indicator` value won't be yielded.
+                    Ok(next_state) => next_state,
+
+                    // No new state has been received before `yield_delay` time. The
+                    // `sync_indicator` value can be yielded.
+                    Err(_) => {
+                        yield sync_indicator;
+
+                        // Now that `sync_indicator` has been yielded, let's wait on
+                        // the next state again.
+                        state.next().await
+                    }
+                };
+
+                if let Some(next_state) = next_state {
+                    // Update the `current_state`.
+                    current_state = next_state;
+                } else {
+                    // Something is broken with `self.state`. Let's stop this stream too.
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Get the [`Client`] that has been used to create [`Self`].
+    pub fn client(&self) -> &Client {
+        &self.client
     }
 
     /// Get a subscriber to the state.
@@ -313,7 +452,8 @@ impl RoomListService {
     pub async fn room(&self, room_id: &RoomId) -> Result<Room, Error> {
         {
             let rooms = self.rooms.read().await;
-            if let Some(room) = rooms.iter().find(|room| room.id() == room_id) {
+
+            if let Some(room) = rooms.iter().rfind(|room| room.id() == room_id) {
                 return Ok(room.clone());
             }
         }
@@ -328,7 +468,7 @@ impl RoomListService {
         Ok(room)
     }
 
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     pub fn sliding_sync(&self) -> &SlidingSync {
         &self.sliding_sync
     }
@@ -360,7 +500,7 @@ fn configure_all_or_visible_rooms_list(
 #[derive(Debug, Error)]
 pub enum Error {
     /// Error from [`matrix_sdk::SlidingSync`].
-    #[error("SlidingSync failed")]
+    #[error("SlidingSync failed: {0}")]
     SlidingSync(SlidingSyncError),
 
     /// An operation has been requested on an unknown list.
@@ -402,19 +542,46 @@ pub enum InputResult {
     Ignored,
 }
 
+/// An hint whether a _sync spinner/loader/toaster_ should be prompted to the
+/// user, indicating that the [`RoomListService`] is syncing.
+///
+/// This is entirely arbitrary and optinionated. Of course, once
+/// [`RoomListService::sync`] has been called, it's going to be constantly
+/// syncing, until [`RoomListService::stop_sync`] is called, or until an error
+/// happened. But in some cases, it's better for the user experience to prompt
+/// to the user that a sync is happening. It's usually the first sync, or the
+/// recovering sync. However, the sync indicator must be prompted if the
+/// aforementioned sync is “slow”, otherwise the indicator is likely to “blink”
+/// pretty fast, which can be very confusing. It's also common to indicate to
+/// the user that a syncing is happening in case of a network error, that
+/// something is catching up etc.
+#[derive(Debug, Eq, PartialEq)]
+pub enum SyncIndicator {
+    /// Show the sync indicator.
+    Show,
+
+    /// Hide the sync indicator.
+    Hide,
+}
+
 #[cfg(test)]
 mod tests {
+    use std::future::ready;
+
+    use futures_util::{pin_mut, StreamExt};
     use matrix_sdk::{
         config::RequestConfig,
         matrix_auth::{Session, SessionTokens},
         reqwest::Url,
+        Client, SlidingSyncMode,
     };
     use matrix_sdk_base::SessionMeta;
     use matrix_sdk_test::async_test;
     use ruma::{api::MatrixVersion, device_id, user_id};
-    use wiremock::MockServer;
+    use serde_json::json;
+    use wiremock::{http::Method, Match, Mock, MockServer, Request, ResponseTemplate};
 
-    use super::*;
+    use super::{Error, RoomListService, State, ALL_ROOMS_LIST_NAME};
 
     async fn new_client() -> (Client, MockServer) {
         let session = Session {
@@ -442,6 +609,15 @@ mod tests {
         let (client, _) = new_client().await;
 
         RoomListService::new(client).await
+    }
+
+    struct SlidingSyncMatcher;
+
+    impl Match for SlidingSyncMatcher {
+        fn matches(&self, request: &Request) -> bool {
+            request.url.path() == "/_matrix/client/unstable/org.matrix.msc3575/sync"
+                && request.method == Method::Post
+        }
     }
 
     #[async_test]
@@ -498,6 +674,56 @@ mod tests {
         let extensions = with_encryption.sliding_sync.extensions_config();
         assert_eq!(extensions.e2ee.enabled, Some(true));
         assert_eq!(extensions.to_device.enabled, Some(true));
+
+        Ok(())
+    }
+
+    #[async_test]
+    async fn test_expire_sliding_sync_session_manually() -> Result<(), Error> {
+        let (client, server) = new_client().await;
+
+        let room_list = RoomListService::new(client).await?;
+
+        let sync = room_list.sync();
+        pin_mut!(sync);
+
+        // Run a first sync.
+        {
+            let _mock_guard = Mock::given(SlidingSyncMatcher)
+                .respond_with(move |_request: &Request| {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "pos": "0",
+                        "lists": {
+                            ALL_ROOMS_LIST_NAME: {
+                                "count": 0,
+                                "ops": [],
+                            },
+                        },
+                        "rooms": {},
+                    }))
+                })
+                .mount_as_scoped(&server)
+                .await;
+
+            let _ = sync.next().await;
+        }
+
+        assert_eq!(room_list.state().get(), State::SettingUp);
+
+        // Stop the sync.
+        room_list.stop_sync()?;
+
+        // Do another sync.
+        let _ = sync.next().await;
+
+        // State is `Terminated`, as expected!
+        assert_eq!(room_list.state.get(), State::Terminated { from: Box::new(State::Running) });
+
+        // Now, let's make the sliding sync session to expire.
+        room_list.expire_sync_session().await;
+
+        // State is `Error`, as a regular session expiration would generate!
+        assert_eq!(room_list.state.get(), State::Error { from: Box::new(State::Running) });
 
         Ok(())
     }

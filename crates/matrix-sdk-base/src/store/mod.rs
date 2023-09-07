@@ -47,7 +47,7 @@ use ruma::{
     events::{
         presence::PresenceEvent,
         receipt::ReceiptEventContent,
-        room::{member::StrippedRoomMemberEvent, redaction::OriginalSyncRoomRedactionEvent},
+        room::{member::StrippedRoomMemberEvent, redaction::SyncRoomRedactionEvent},
         AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
         AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
     },
@@ -276,8 +276,7 @@ pub struct StateChanges {
 
     /// A map of `RoomId` to maps of `OwnedEventId` to be redacted by
     /// `SyncRoomRedactionEvent`.
-    pub redactions:
-        BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, Raw<OriginalSyncRoomRedactionEvent>>>,
+    pub redactions: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, Raw<SyncRoomRedactionEvent>>>,
 
     /// A mapping of `RoomId` to a map of event type to a map of state key to
     /// `AnyStrippedStateEvent`.
@@ -369,7 +368,7 @@ impl StateChanges {
         &mut self,
         room_id: &RoomId,
         redacted_event_id: &EventId,
-        redaction: Raw<OriginalSyncRoomRedactionEvent>,
+        redaction: Raw<SyncRoomRedactionEvent>,
     ) {
         self.redactions
             .entry(room_id.to_owned())

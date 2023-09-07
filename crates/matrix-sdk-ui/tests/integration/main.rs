@@ -26,13 +26,11 @@ use wiremock::{
     Mock, MockServer, ResponseTemplate,
 };
 
-#[cfg(feature = "experimental-encryption-sync")]
-mod encryption_sync;
-#[cfg(feature = "experimental-notification-client")]
+mod encryption_sync_service;
 mod notification_client;
-#[cfg(feature = "experimental-room-list")]
 mod room_list_service;
 mod sliding_sync;
+mod sync_service;
 mod timeline;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

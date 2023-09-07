@@ -1,15 +1,19 @@
 //! Ruleset utility struct
 
+use imbl::HashSet;
 use ruma::{
     push::{
-        PredefinedContentRuleId, PredefinedOverrideRuleId, PredefinedUnderrideRuleId,
-        PushCondition, RuleKind, Ruleset,
+        AnyPushRuleRef, PredefinedContentRuleId, PredefinedOverrideRuleId,
+        PredefinedUnderrideRuleId, PushCondition, RuleKind, Ruleset,
     },
     RoomId,
 };
 
 use super::{command::Command, rule_commands::RuleCommands, RoomNotificationMode};
-use crate::error::NotificationSettingsError;
+use crate::{
+    error::NotificationSettingsError,
+    notification_settings::{IsEncrypted, IsOneToOne},
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Rules {
@@ -67,7 +71,7 @@ impl Rules {
             // enabled
             x.enabled &&
             // with a condition of type `EventMatch` for this `room_id`
-            // XXX why not checking against x.rule_id here?
+            // (checking on x.rule_id is not sufficient here as more than one override rule may have a condition matching on `room_id`)
             x.conditions.iter().any(|x| matches!(
                 x,
                 PushCondition::EventMatch { key, pattern } if key == "room_id" && pattern == room_id
@@ -95,15 +99,16 @@ impl Rules {
     ///
     /// # Arguments
     ///
-    /// * `is_encrypted` - `true` if the room is encrypted
-    /// * `members_count` - the room members count
+    /// * `is_encrypted` - `Yes` if the room is encrypted
+    /// * `is_one_to_one` - `Yes` if the room is a direct chat involving two
+    ///   people
     pub(crate) fn get_default_room_notification_mode(
         &self,
-        is_encrypted: bool,
-        members_count: u64,
+        is_encrypted: IsEncrypted,
+        is_one_to_one: IsOneToOne,
     ) -> RoomNotificationMode {
-        // get the correct default rule ID based on `is_encrypted` and `members_count`
-        let predefined_rule_id = get_predefined_underride_room_rule_id(is_encrypted, members_count);
+        // get the correct default rule ID based on `is_encrypted` and `is_one_to_one`
+        let predefined_rule_id = get_predefined_underride_room_rule_id(is_encrypted, is_one_to_one);
         let rule_id = predefined_rule_id.as_str();
 
         // If there is an `Underride` rule that should trigger a notification, the mode
@@ -118,16 +123,47 @@ impl Rules {
         }
     }
 
+    /// Get all room IDs for which a user-defined rule exists.
+    pub(crate) fn get_rooms_with_user_defined_rules(&self, enabled: Option<bool>) -> Vec<String> {
+        let test_if_enabled = enabled.is_some();
+        let must_be_enabled = enabled.unwrap_or(false);
+
+        let mut room_ids = HashSet::new();
+        for rule in &self.ruleset {
+            if rule.is_server_default() {
+                continue;
+            }
+            if test_if_enabled && rule.enabled() != must_be_enabled {
+                continue;
+            }
+            match rule {
+                AnyPushRuleRef::Override(r) | AnyPushRuleRef::Underride(r) => {
+                    for condition in &r.conditions {
+                        if let PushCondition::EventMatch { key, pattern } = condition {
+                            if key == "room_id" {
+                                room_ids.insert(pattern.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+                AnyPushRuleRef::Room(r) => {
+                    room_ids.insert(r.rule_id.to_string());
+                }
+                _ => {}
+            }
+        }
+        Vec::from_iter(room_ids)
+    }
+
     /// Get whether the `IsUserMention` rule is enabled.
     fn is_user_mention_enabled(&self) -> bool {
-        // Search for an enabled `Override` rule `IsUserMention` (MSC3952).
+        // Search for an `Override` rule `IsUserMention` (MSC3952).
         // This is a new push rule that may not yet be present.
         if let Some(rule) =
             self.ruleset.get(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention)
         {
-            if rule.enabled() {
-                return true;
-            }
+            return rule.enabled();
         }
 
         // Fallback to deprecated rules for compatibility.
@@ -154,14 +190,12 @@ impl Rules {
 
     /// Get whether the `IsRoomMention` rule is enabled.
     fn is_room_mention_enabled(&self) -> bool {
-        // Search for an enabled `Override` rule `IsRoomMention` (MSC3952).
+        // Search for an `Override` rule `IsRoomMention` (MSC3952).
         // This is a new push rule that may not yet be present.
         if let Some(rule) =
             self.ruleset.get(RuleKind::Override, PredefinedOverrideRuleId::IsRoomMention)
         {
-            if rule.enabled() {
-                return true;
-            }
+            return rule.enabled();
         }
 
         // Fallback to deprecated rule for compatibility
@@ -215,6 +249,9 @@ impl Rules {
                 Command::SetPushRuleEnabled { scope: _, kind, rule_id, enabled } => {
                     _ = self.ruleset.set_enabled(kind, rule_id, enabled);
                 }
+                Command::SetPushRuleActions { scope: _, kind, rule_id, actions } => {
+                    _ = self.ruleset.set_actions(kind, rule_id, actions);
+                }
             }
         }
     }
@@ -225,29 +262,33 @@ impl Rules {
 ///
 /// # Arguments
 ///
-/// * `is_encrypted` - `true` if the room is encrypted
-/// * `members_count` - the room members count
-fn get_predefined_underride_room_rule_id(
-    is_encrypted: bool,
-    members_count: u64,
+/// * `is_encrypted` - `Yes` if the room is encrypted
+/// * `is_one_to_one` - `Yes` if the room is a direct chat involving two people
+pub(crate) fn get_predefined_underride_room_rule_id(
+    is_encrypted: IsEncrypted,
+    is_one_to_one: IsOneToOne,
 ) -> PredefinedUnderrideRuleId {
-    match (is_encrypted, members_count) {
-        (true, 2) => PredefinedUnderrideRuleId::EncryptedRoomOneToOne,
-        (false, 2) => PredefinedUnderrideRuleId::RoomOneToOne,
-        (true, _) => PredefinedUnderrideRuleId::Encrypted,
-        (false, _) => PredefinedUnderrideRuleId::Message,
+    match (is_encrypted, is_one_to_one) {
+        (IsEncrypted::Yes, IsOneToOne::Yes) => PredefinedUnderrideRuleId::EncryptedRoomOneToOne,
+        (IsEncrypted::No, IsOneToOne::Yes) => PredefinedUnderrideRuleId::RoomOneToOne,
+        (IsEncrypted::Yes, IsOneToOne::No) => PredefinedUnderrideRuleId::Encrypted,
+        (IsEncrypted::No, IsOneToOne::No) => PredefinedUnderrideRuleId::Message,
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use matrix_sdk_test::async_test;
+    use imbl::HashSet;
+    use matrix_sdk_test::{
+        async_test,
+        notification_settings::{build_ruleset, get_server_default_ruleset},
+    };
     use ruma::{
         push::{
             Action, NewConditionalPushRule, NewPushRule, PredefinedContentRuleId,
-            PredefinedOverrideRuleId, PredefinedUnderrideRuleId, PushCondition, RuleKind, Ruleset,
+            PredefinedOverrideRuleId, PredefinedUnderrideRuleId, PushCondition, RuleKind,
         },
-        OwnedRoomId, RoomId, UserId,
+        OwnedRoomId, RoomId,
     };
 
     use super::RuleCommands;
@@ -255,29 +296,12 @@ pub(crate) mod tests {
         error::NotificationSettingsError,
         notification_settings::{
             rules::{self, Rules},
-            RoomNotificationMode,
+            IsEncrypted, IsOneToOne, RoomNotificationMode,
         },
     };
 
-    fn get_server_default_ruleset() -> Ruleset {
-        let user_id = UserId::parse("@user:matrix.org").unwrap();
-        Ruleset::server_default(&user_id)
-    }
-
     fn get_test_room_id() -> OwnedRoomId {
         RoomId::parse("!AAAaAAAAAaaAAaaaaa:matrix.org").unwrap()
-    }
-
-    fn build_rules(rule_list: Vec<(RuleKind, &RoomId, bool)>) -> Rules {
-        let mut rules = Rules::new(get_server_default_ruleset());
-        let mut commands = RuleCommands::new(rules.ruleset.clone());
-        for (kind, room_id, notify) in rule_list {
-            commands.insert_rule(kind, room_id, notify).unwrap();
-        }
-        // XXX this should not make use of `apply()`, see other comment. Such a helper
-        // should return a `Ruleset`, and not have to do anything with `Rules`.
-        rules.apply(commands);
-        rules
     }
 
     #[async_test]
@@ -288,19 +312,16 @@ pub(crate) mod tests {
         assert_eq!(rules.get_custom_rules_for_room(&room_id).len(), 0);
 
         // Initialize with one rule.
-        // XXX this is not testing things in isolation: `build_rules` makes use of
-        // `apply`, and then we use `get_custom_rules_for_room`. Instead, this
-        // test should create a `Ruleset` by hand, then test single functions in
-        // isolation in it. `build_rules` should not use `Rules` method, since
-        // we're testing `Rules` methods here!
-        let rules = build_rules(vec![(RuleKind::Override, &room_id, false)]);
+        let ruleset = build_ruleset(vec![(RuleKind::Override, &room_id, false)]);
+        let rules = Rules::new(ruleset);
         assert_eq!(rules.get_custom_rules_for_room(&room_id).len(), 1);
 
         // Insert a Room rule
-        let rules = build_rules(vec![
+        let ruleset = build_ruleset(vec![
             (RuleKind::Override, &room_id, false),
             (RuleKind::Room, &room_id, false),
         ]);
+        let rules = Rules::new(ruleset);
         assert_eq!(rules.get_custom_rules_for_room(&room_id).len(), 2);
     }
 
@@ -329,21 +350,24 @@ pub(crate) mod tests {
         assert_eq!(rules.get_user_defined_room_notification_mode(&room_id), None);
 
         // Initialize with an `Override` rule that doesn't notify
-        let rules = build_rules(vec![(RuleKind::Override, &room_id, false)]);
+        let ruleset = build_ruleset(vec![(RuleKind::Override, &room_id, false)]);
+        let rules = Rules::new(ruleset);
         assert_eq!(
             rules.get_user_defined_room_notification_mode(&room_id),
             Some(RoomNotificationMode::Mute)
         );
 
         // Initialize with a `Room` rule that doesn't notify
-        let rules = build_rules(vec![(RuleKind::Room, &room_id, false)]);
+        let ruleset = build_ruleset(vec![(RuleKind::Room, &room_id, false)]);
+        let rules = Rules::new(ruleset);
         assert_eq!(
             rules.get_user_defined_room_notification_mode(&room_id),
             Some(RoomNotificationMode::MentionsAndKeywordsOnly)
         );
 
         // Initialize with a `Room` rule that doesn't notify
-        let rules = build_rules(vec![(RuleKind::Room, &room_id, true)]);
+        let ruleset = build_ruleset(vec![(RuleKind::Room, &room_id, true)]);
+        let rules = Rules::new(ruleset);
         assert_eq!(
             rules.get_user_defined_room_notification_mode(&room_id),
             Some(RoomNotificationMode::AllMessages)
@@ -351,12 +375,13 @@ pub(crate) mod tests {
 
         let room_id_a = RoomId::parse("!AAAaAAAAAaaAAaaaaa:matrix.org").unwrap();
         let room_id_b = RoomId::parse("!BBBbBBBBBbbBBbbbbb:matrix.org").unwrap();
-        let rules = build_rules(vec![
+        let ruleset = build_ruleset(vec![
             // A mute rule for room_id_a
             (RuleKind::Override, &room_id_a, false),
             // A notifying rule for room_id_b
             (RuleKind::Override, &room_id_b, true),
         ]);
+        let rules = Rules::new(ruleset);
         let mode = rules.get_user_defined_room_notification_mode(&room_id_a);
 
         // The mode should be Mute as there is an Override rule that doesn't notify,
@@ -367,19 +392,19 @@ pub(crate) mod tests {
     #[async_test]
     async fn test_get_predefined_underride_room_rule_id() {
         assert_eq!(
-            rules::get_predefined_underride_room_rule_id(false, 3),
+            rules::get_predefined_underride_room_rule_id(IsEncrypted::No, IsOneToOne::No),
             PredefinedUnderrideRuleId::Message
         );
         assert_eq!(
-            rules::get_predefined_underride_room_rule_id(false, 2),
+            rules::get_predefined_underride_room_rule_id(IsEncrypted::No, IsOneToOne::Yes),
             PredefinedUnderrideRuleId::RoomOneToOne
         );
         assert_eq!(
-            rules::get_predefined_underride_room_rule_id(true, 3),
+            rules::get_predefined_underride_room_rule_id(IsEncrypted::Yes, IsOneToOne::No),
             PredefinedUnderrideRuleId::Encrypted
         );
         assert_eq!(
-            rules::get_predefined_underride_room_rule_id(true, 2),
+            rules::get_predefined_underride_room_rule_id(IsEncrypted::Yes, IsOneToOne::Yes),
             PredefinedUnderrideRuleId::EncryptedRoomOneToOne
         );
     }
@@ -393,7 +418,7 @@ pub(crate) mod tests {
             .unwrap();
 
         let rules = Rules::new(ruleset);
-        let mode = rules.get_default_room_notification_mode(false, 2);
+        let mode = rules.get_default_room_notification_mode(IsEncrypted::No, IsOneToOne::Yes);
         // Then the mode should be `MentionsAndKeywordsOnly`
         assert_eq!(mode, RoomNotificationMode::MentionsAndKeywordsOnly);
     }
@@ -407,7 +432,7 @@ pub(crate) mod tests {
             .unwrap();
 
         let rules = Rules::new(ruleset);
-        let mode = rules.get_default_room_notification_mode(false, 2);
+        let mode = rules.get_default_room_notification_mode(IsEncrypted::No, IsOneToOne::Yes);
         // Then the mode should be `AllMessages`
         assert_eq!(mode, RoomNotificationMode::AllMessages);
     }
@@ -415,10 +440,18 @@ pub(crate) mod tests {
     #[async_test]
     async fn test_is_user_mention_enabled() {
         // If `IsUserMention` is enable, then is_user_mention_enabled() should return
-        // `true`
+        // `true` even if the deprecated rules are disabled
         let mut ruleset = get_server_default_ruleset();
         ruleset
             .set_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention, true)
+            .unwrap();
+        #[allow(deprecated)]
+        ruleset
+            .set_enabled(RuleKind::Override, PredefinedOverrideRuleId::ContainsDisplayName, false)
+            .unwrap();
+        #[allow(deprecated)]
+        ruleset
+            .set_enabled(RuleKind::Content, PredefinedContentRuleId::ContainsUserName, false)
             .unwrap();
 
         let rules = Rules::new(ruleset);
@@ -429,8 +462,8 @@ pub(crate) mod tests {
             .is_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention.as_str())
             .unwrap());
 
-        // If `IsUserMention` is disabled, and one of the deprecated rules is enabled,
-        // then is_user_mention_enabled() should return `true`
+        // If `IsUserMention` is disabled, then is_user_mention_enabled() should return
+        // `false` even if the deprecated rules are enabled
         let mut ruleset = get_server_default_ruleset();
         ruleset
             .set_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention, false)
@@ -449,30 +482,7 @@ pub(crate) mod tests {
             .unwrap();
         #[allow(deprecated)]
         ruleset
-            .set_enabled(RuleKind::Content, PredefinedContentRuleId::ContainsUserName, false)
-            .unwrap();
-
-        let rules = Rules::new(ruleset);
-        assert!(rules.is_user_mention_enabled());
-        // is_enabled() should also return `true` for
-        // PredefinedOverrideRuleId::IsUserMention
-        assert!(rules
-            .is_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention.as_str())
-            .unwrap());
-
-        // If `IsUserMention` is disabled, and none of the deprecated rules is enabled,
-        // then is_user_mention_enabled() should return `false`
-        let mut ruleset = get_server_default_ruleset();
-        ruleset
-            .set_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention, false)
-            .unwrap();
-        #[allow(deprecated)]
-        ruleset
-            .set_enabled(RuleKind::Override, PredefinedOverrideRuleId::ContainsDisplayName, false)
-            .unwrap();
-        #[allow(deprecated)]
-        ruleset
-            .set_enabled(RuleKind::Content, PredefinedContentRuleId::ContainsUserName, false)
+            .set_enabled(RuleKind::Content, PredefinedContentRuleId::ContainsUserName, true)
             .unwrap();
 
         let rules = Rules::new(ruleset);
@@ -486,11 +496,15 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_is_room_mention_enabled() {
-        // If `IsRoomMention` is enable, then is_room_mention_enabled() should return
-        // `true`
+        // If `IsRoomMention` is present and enabled then is_room_mention_enabled()
+        // should return `true` even if the deprecated rule is disabled
         let mut ruleset = get_server_default_ruleset();
         ruleset
             .set_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsRoomMention, true)
+            .unwrap();
+        #[allow(deprecated)]
+        ruleset
+            .set_enabled(RuleKind::Override, PredefinedOverrideRuleId::RoomNotif, false)
             .unwrap();
 
         let rules = Rules::new(ruleset);
@@ -501,41 +515,14 @@ pub(crate) mod tests {
             .is_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsRoomMention.as_str())
             .unwrap());
 
-        // If `IsRoomMention` is not present, and the deprecated rules is enabled,
-        // then is_room_mention_enabled() should return `true`
+        // If `IsRoomMention` is present and disabled then is_room_mention_enabled()
+        // should return `false` even if the deprecated rule is enabled
         let mut ruleset = get_server_default_ruleset();
         ruleset
             .set_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsRoomMention, false)
             .unwrap();
         #[allow(deprecated)]
         ruleset.set_enabled(RuleKind::Override, PredefinedOverrideRuleId::RoomNotif, true).unwrap();
-        #[allow(deprecated)]
-        ruleset
-            .set_actions(
-                RuleKind::Override,
-                PredefinedOverrideRuleId::RoomNotif,
-                vec![Action::Notify],
-            )
-            .unwrap();
-
-        let rules = Rules::new(ruleset);
-        assert!(rules.is_room_mention_enabled());
-        // is_enabled() should also return `true` for
-        // PredefinedOverrideRuleId::IsRoomMention
-        assert!(rules
-            .is_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsRoomMention.as_str())
-            .unwrap());
-
-        // If `IsRoomMention` is disabled, and the deprecated rules is disabled,
-        // then is_room_mention_enabled() should return `false`
-        let mut ruleset = get_server_default_ruleset();
-        ruleset
-            .set_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsRoomMention, false)
-            .unwrap();
-        #[allow(deprecated)]
-        ruleset
-            .set_enabled(RuleKind::Override, PredefinedOverrideRuleId::RoomNotif, false)
-            .unwrap();
 
         let rules = Rules::new(ruleset);
         assert!(!rules.is_room_mention_enabled());
@@ -560,7 +547,8 @@ pub(crate) mod tests {
     async fn test_apply_delete_command() {
         let room_id = get_test_room_id();
         // Initialize with a custom rule
-        let mut rules = build_rules(vec![(RuleKind::Override, &room_id, false)]);
+        let ruleset = build_ruleset(vec![(RuleKind::Override, &room_id, false)]);
+        let mut rules = Rules::new(ruleset);
 
         // Build a `RuleCommands` deleting this rule
         let mut rules_commands = RuleCommands::new(rules.ruleset.clone());
@@ -575,7 +563,7 @@ pub(crate) mod tests {
     #[async_test]
     async fn test_apply_set_command() {
         let room_id = get_test_room_id();
-        let mut rules = build_rules(vec![]);
+        let mut rules = Rules::new(get_server_default_ruleset());
 
         // Build a `RuleCommands` inserting a rule
         let mut rules_commands = RuleCommands::new(rules.ruleset.clone());
@@ -589,7 +577,7 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_apply_set_enabled_command() {
-        let mut rules = build_rules(vec![]);
+        let mut rules = Rules::new(get_server_default_ruleset());
 
         rules
             .ruleset
@@ -612,5 +600,80 @@ pub(crate) mod tests {
         assert!(!rules
             .is_enabled(RuleKind::Override, PredefinedOverrideRuleId::Reaction.as_str())
             .unwrap());
+    }
+
+    #[async_test]
+    async fn test_get_rooms_with_user_defined_rules() {
+        // Without user-defined rules
+        let rules = Rules::new(get_server_default_ruleset());
+        let room_ids = rules.get_rooms_with_user_defined_rules(None);
+        assert!(room_ids.is_empty());
+
+        // With one rule.
+        let room_id = RoomId::parse("!room_a:matrix.org").unwrap();
+        let ruleset = build_ruleset(vec![(RuleKind::Override, &room_id, false)]);
+        let rules = Rules::new(ruleset);
+
+        let room_ids = rules.get_rooms_with_user_defined_rules(None);
+        assert_eq!(room_ids.len(), 1);
+
+        // With duplicates
+        let ruleset = build_ruleset(vec![
+            (RuleKind::Override, &room_id, false),
+            (RuleKind::Underride, &room_id, false),
+            (RuleKind::Room, &room_id, false),
+        ]);
+        let rules = Rules::new(ruleset);
+
+        let room_ids = rules.get_rooms_with_user_defined_rules(None);
+        assert_eq!(room_ids.len(), 1);
+        assert_eq!(room_ids[0], room_id.to_string());
+
+        // With multiple rules
+        let ruleset = build_ruleset(vec![
+            (RuleKind::Room, &RoomId::parse("!room_a:matrix.org").unwrap(), false),
+            (RuleKind::Room, &RoomId::parse("!room_b:matrix.org").unwrap(), false),
+            (RuleKind::Room, &RoomId::parse("!room_c:matrix.org").unwrap(), false),
+            (RuleKind::Override, &RoomId::parse("!room_d:matrix.org").unwrap(), false),
+            (RuleKind::Underride, &RoomId::parse("!room_e:matrix.org").unwrap(), false),
+        ]);
+        let rules = Rules::new(ruleset);
+
+        let room_ids = rules.get_rooms_with_user_defined_rules(None);
+        assert_eq!(room_ids.len(), 5);
+        let expected_set: HashSet<String> = vec![
+            "!room_a:matrix.org",
+            "!room_b:matrix.org",
+            "!room_c:matrix.org",
+            "!room_d:matrix.org",
+            "!room_e:matrix.org",
+        ]
+        .into_iter()
+        .collect();
+        assert!(expected_set.difference(HashSet::from(room_ids)).is_empty());
+
+        // Only disabled rules
+        let room_ids = rules.get_rooms_with_user_defined_rules(Some(false));
+        assert_eq!(room_ids.len(), 0);
+
+        // Only enabled rules
+        let room_ids = rules.get_rooms_with_user_defined_rules(Some(true));
+        assert_eq!(room_ids.len(), 5);
+
+        let mut ruleset = build_ruleset(vec![
+            (RuleKind::Room, &RoomId::parse("!room_a:matrix.org").unwrap(), false),
+            (RuleKind::Room, &RoomId::parse("!room_b:matrix.org").unwrap(), false),
+            (RuleKind::Override, &RoomId::parse("!room_c:matrix.org").unwrap(), false),
+            (RuleKind::Underride, &RoomId::parse("!room_d:matrix.org").unwrap(), false),
+        ]);
+        ruleset.set_enabled(RuleKind::Room, "!room_b:matrix.org", false).unwrap();
+        ruleset.set_enabled(RuleKind::Override, "!room_c:matrix.org", false).unwrap();
+        let rules = Rules::new(ruleset);
+        // Only room_a and room_d rules are enabled
+        let room_ids = rules.get_rooms_with_user_defined_rules(Some(true));
+        assert_eq!(room_ids.len(), 2);
+        let expected_set: HashSet<String> =
+            vec!["!room_a:matrix.org", "!room_d:matrix.org"].into_iter().collect();
+        assert!(expected_set.difference(HashSet::from(room_ids)).is_empty());
     }
 }

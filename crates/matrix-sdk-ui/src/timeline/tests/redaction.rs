@@ -12,18 +12,106 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
 use imbl::vector;
 use matrix_sdk_test::async_test;
-use ruma::events::{
-    reaction::{ReactionEventContent, RedactedReactionEventContent},
-    relation::Annotation,
-    room::message::{RedactedRoomMessageEventContent, RoomMessageEventContent},
+use ruma::{
+    events::{
+        reaction::{ReactionEventContent, RedactedReactionEventContent},
+        relation::Annotation,
+        room::{
+            message::{
+                AddMentions, ForwardThread, OriginalSyncRoomMessageEvent,
+                RedactedRoomMessageEventContent, RoomMessageEventContent,
+            },
+            name::RoomNameEventContent,
+        },
+        FullStateEventContent,
+    },
+    owned_room_id,
 };
 use serde_json::json;
 use stream_assert::assert_next_matches;
 
 use super::{sync_timeline_event, TestTimeline, ALICE, BOB};
+use crate::timeline::{AnyOtherFullStateEventContent, TimelineDetails, TimelineItemContent};
+
+#[async_test]
+async fn redact_state_event() {
+    let timeline = TestTimeline::new();
+    let mut stream = timeline.subscribe_events().await;
+
+    timeline
+        .handle_live_state_event(
+            &ALICE,
+            RoomNameEventContent::new(Some("Fancy room name".to_owned())),
+            None,
+        )
+        .await;
+
+    let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
+    let state = assert_matches!(item.content(), TimelineItemContent::OtherState(st) => st);
+    assert_matches!(
+        state.content,
+        AnyOtherFullStateEventContent::RoomName(FullStateEventContent::Original { .. })
+    );
+
+    timeline.handle_live_redaction(&ALICE, item.event_id().unwrap()).await;
+
+    let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
+    let state = assert_matches!(item.content(), TimelineItemContent::OtherState(st) => st);
+    assert_matches!(
+        state.content,
+        AnyOtherFullStateEventContent::RoomName(FullStateEventContent::Redacted(_))
+    );
+}
+
+#[async_test]
+async fn redact_replied_to_event() {
+    let timeline = TestTimeline::new();
+    let mut stream = timeline.subscribe_events().await;
+
+    timeline
+        .handle_live_message_event(&ALICE, RoomMessageEventContent::text_plain("Hello, world!"))
+        .await;
+
+    let first_item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
+    assert_matches!(first_item.content(), TimelineItemContent::Message(_));
+    let first_event: OriginalSyncRoomMessageEvent =
+        first_item.original_json().unwrap().deserialize_as().unwrap();
+
+    timeline
+        .handle_live_message_event(
+            &BOB,
+            RoomMessageEventContent::text_plain("Hello, alice.").make_reply_to(
+                &first_event.into_full_event(owned_room_id!("!whocares:local.host")),
+                ForwardThread::Yes,
+                AddMentions::No,
+            ),
+        )
+        .await;
+
+    let second_item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
+    let message = second_item.content().as_message().unwrap();
+    let in_reply_to = message.in_reply_to().unwrap();
+    let replied_to_event = assert_matches!(&in_reply_to.event, TimelineDetails::Ready(val) => val);
+    assert_matches!(replied_to_event.content(), TimelineItemContent::Message(_));
+
+    timeline.handle_live_redaction(&ALICE, first_item.event_id().unwrap()).await;
+
+    let first_item_again =
+        assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
+    assert_matches!(first_item_again.content(), TimelineItemContent::RedactedMessage);
+    assert_matches!(first_item_again.original_json(), None);
+
+    let second_item_again =
+        assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
+    let message = second_item_again.content().as_message().unwrap();
+    let in_reply_to = message.in_reply_to().unwrap();
+    let replied_to_event = assert_matches!(&in_reply_to.event, TimelineDetails::Ready(val) => val);
+    assert_matches!(replied_to_event.content(), TimelineItemContent::RedactedMessage);
+}
 
 #[async_test]
 async fn reaction_redaction() {

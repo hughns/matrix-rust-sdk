@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use matrix_sdk_base::SessionMeta;
-use serde::{Deserialize, Serialize};
 
 use crate::matrix_auth::{self, MatrixAuth, MatrixAuthData};
+#[cfg(feature = "experimental-oidc")]
+use crate::oidc::{self, Oidc, OidcAuthData};
 
 /// An enum over all the possible authentication APIs.
 #[derive(Debug, Clone)]
@@ -23,14 +24,22 @@ use crate::matrix_auth::{self, MatrixAuth, MatrixAuthData};
 pub enum AuthApi {
     /// The native Matrix authentication API.
     Matrix(MatrixAuth),
+
+    /// The OpenID Connect API.
+    #[cfg(feature = "experimental-oidc")]
+    Oidc(Oidc),
 }
 
 /// A user session using one of the available authentication APIs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum AuthSession {
     /// A session using the native Matrix authentication API.
     Matrix(matrix_auth::Session),
+
+    /// A session using the OpenID Connect API.
+    #[cfg(feature = "experimental-oidc")]
+    Oidc(oidc::FullSession),
 }
 
 impl AuthSession {
@@ -38,6 +47,8 @@ impl AuthSession {
     pub fn meta(&self) -> &SessionMeta {
         match self {
             AuthSession::Matrix(session) => &session.meta,
+            #[cfg(feature = "experimental-oidc")]
+            AuthSession::Oidc(session) => &session.user.meta,
         }
     }
 
@@ -45,6 +56,17 @@ impl AuthSession {
     pub fn access_token(&self) -> &str {
         match self {
             AuthSession::Matrix(session) => &session.tokens.access_token,
+            #[cfg(feature = "experimental-oidc")]
+            AuthSession::Oidc(session) => &session.user.tokens.access_token,
+        }
+    }
+
+    /// Get the refresh token of this session.
+    pub fn get_refresh_token(&self) -> Option<&str> {
+        match self {
+            AuthSession::Matrix(session) => session.tokens.refresh_token.as_deref(),
+            #[cfg(feature = "experimental-oidc")]
+            AuthSession::Oidc(session) => session.user.tokens.refresh_token.as_deref(),
         }
     }
 }
@@ -55,23 +77,47 @@ impl From<matrix_auth::Session> for AuthSession {
     }
 }
 
+#[cfg(feature = "experimental-oidc")]
+impl From<oidc::FullSession> for AuthSession {
+    fn from(session: oidc::FullSession) -> Self {
+        Self::Oidc(session)
+    }
+}
+
 /// Data for an authentication API.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) enum AuthData {
     /// Data for the native Matrix authentication API.
     Matrix(MatrixAuthData),
+    /// Data for the OpenID Connect API.
+    #[cfg(feature = "experimental-oidc")]
+    Oidc(OidcAuthData),
 }
 
 impl AuthData {
     pub(crate) fn as_matrix(&self) -> Option<&MatrixAuthData> {
         match self {
             AuthData::Matrix(d) => Some(d),
+            #[cfg(feature = "experimental-oidc")]
+            _ => None,
         }
     }
 
-    pub(crate) fn access_token(&self) -> String {
+    #[cfg(feature = "experimental-oidc")]
+    pub(crate) fn as_oidc(&self) -> Option<&OidcAuthData> {
         match self {
-            AuthData::Matrix(d) => d.tokens.get().access_token,
+            AuthData::Oidc(d) => Some(d),
+            _ => None,
         }
+    }
+
+    pub(crate) fn access_token(&self) -> Option<String> {
+        let token = match self {
+            AuthData::Matrix(d) => d.tokens.get().access_token,
+            #[cfg(feature = "experimental-oidc")]
+            AuthData::Oidc(d) => d.tokens.get()?.get().access_token,
+        };
+
+        Some(token)
     }
 }

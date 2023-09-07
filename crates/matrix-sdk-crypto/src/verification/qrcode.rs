@@ -891,7 +891,7 @@ mod tests {
 
     use crate::{
         olm::{PrivateCrossSigningIdentity, ReadOnlyAccount},
-        store::{Changes, DynCryptoStore, IntoCryptoStore, MemoryStore},
+        store::{Changes, CryptoStoreWrapper, MemoryStore},
         verification::{
             event_enums::{DoneContent, OutgoingContent, StartContent},
             FlowId, VerificationStore,
@@ -903,8 +903,8 @@ mod tests {
         user_id!("@example:localhost")
     }
 
-    fn memory_store() -> Arc<DynCryptoStore> {
-        MemoryStore::new().into_crypto_store()
+    fn memory_store(user_id: &UserId) -> Arc<CryptoStoreWrapper> {
+        Arc::new(CryptoStoreWrapper::new(user_id, MemoryStore::new()))
     }
 
     fn device_id() -> &'static DeviceId {
@@ -913,8 +913,8 @@ mod tests {
 
     #[async_test]
     async fn test_verification_creation() {
-        let store = memory_store();
-        let account = ReadOnlyAccount::new(user_id(), device_id());
+        let account = ReadOnlyAccount::with_device_id(user_id(), device_id());
+        let store = memory_store(account.user_id());
 
         let private_identity = PrivateCrossSigningIdentity::new(user_id().to_owned()).await;
         let master_key = private_identity.master_public_key().await.unwrap();
@@ -978,8 +978,8 @@ mod tests {
     #[async_test]
     async fn test_reciprocate_receival() {
         let test = |flow_id: FlowId| async move {
-            let alice_account = ReadOnlyAccount::new(user_id(), device_id());
-            let store = memory_store();
+            let alice_account = ReadOnlyAccount::with_device_id(user_id(), device_id());
+            let store = memory_store(alice_account.user_id());
 
             let private_identity = PrivateCrossSigningIdentity::new(user_id().to_owned()).await;
 
@@ -990,7 +990,7 @@ mod tests {
             };
 
             let bob_account =
-                ReadOnlyAccount::new(alice_account.user_id(), device_id!("BOBDEVICE"));
+                ReadOnlyAccount::with_device_id(alice_account.user_id(), device_id!("BOBDEVICE"));
 
             let private_identity = PrivateCrossSigningIdentity::new(user_id().to_owned()).await;
             let identity = private_identity.to_public_identity().await.unwrap();
@@ -1018,7 +1018,7 @@ mod tests {
             );
             assert_matches!(alice_verification.state(), QrVerificationState::Started);
 
-            let bob_store = memory_store();
+            let bob_store = memory_store(bob_account.user_id());
 
             let private_identity = PrivateCrossSigningIdentity::new(user_id().to_owned()).await;
             let bob_store = VerificationStore {

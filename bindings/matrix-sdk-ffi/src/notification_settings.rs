@@ -106,16 +106,14 @@ impl Drop for NotificationSettings {
 impl NotificationSettings {
     pub fn set_delegate(&self, delegate: Option<Box<dyn NotificationSettingsDelegate>>) {
         if let Some(delegate) = delegate {
-            let delegate = Arc::new(delegate);
-            // Declare an event handler to listen to `PushRulesEvent`
-            let handler = move |_: PushRulesEvent| {
-                let delegate = delegate.clone();
-                async move {
+            let delegate: Arc<dyn NotificationSettingsDelegate> = Arc::from(delegate);
+
+            // Add an event handler to listen to `PushRulesEvent`
+            let event_handler =
+                self.sdk_client.add_event_handler(move |_: PushRulesEvent| async move {
                     delegate.settings_did_change();
-                }
-            };
-            // Add the event handler
-            let event_handler = self.sdk_client.add_event_handler(handler);
+                });
+
             RUNTIME.block_on(async move {
                 *self.pushrules_event_handler.write().await = Some(event_handler);
             });
@@ -131,19 +129,19 @@ impl NotificationSettings {
         }
     }
 
-    /// Gets the notification settings for a room.
+    /// Get the notification settings for a room.
     ///
     /// # Arguments
     ///
     /// * `room_id` - the room ID
     /// * `is_encrypted` - whether the room is encrypted
-    /// * `active_members_count` - the room's active members count (joined +
-    ///   invited)
+    /// * `is_one_to_one` - whether the room is a direct chat involving two
+    ///   people
     pub async fn get_room_notification_settings(
         &self,
         room_id: String,
         is_encrypted: bool,
-        active_members_count: u64,
+        is_one_to_one: bool,
     ) -> Result<RoomNotificationSettings, NotificationSettingsError> {
         let notification_settings = self.sdk_notification_settings.read().await;
         let parsed_room_id = RoomId::parse(&room_id)
@@ -158,22 +156,40 @@ impl NotificationSettings {
         // If the user has not defined a notification mode, return the default one for
         // this room
         let mode = notification_settings
-            .get_default_room_notification_mode(is_encrypted, active_members_count)
+            .get_default_room_notification_mode(is_encrypted.into(), is_one_to_one.into())
             .await;
         Ok(RoomNotificationSettings::new(mode.into(), true))
     }
 
-    /// Sets the notification mode for a room.
+    /// Set the notification mode for a room.
     pub async fn set_room_notification_mode(
         &self,
         room_id: String,
         mode: RoomNotificationMode,
     ) -> Result<(), NotificationSettingsError> {
         let notification_settings = self.sdk_notification_settings.read().await;
-        let parsed_room_idom_id = RoomId::parse(&room_id)
+        let parsed_room_id = RoomId::parse(&room_id)
             .map_err(|_e| NotificationSettingsError::InvalidRoomId(room_id))?;
-        notification_settings.set_room_notification_mode(&parsed_room_idom_id, mode.into()).await?;
+        notification_settings.set_room_notification_mode(&parsed_room_id, mode.into()).await?;
         Ok(())
+    }
+
+    /// Get the user defined room notification mode
+    pub async fn get_user_defined_room_notification_mode(
+        &self,
+        room_id: String,
+    ) -> Result<Option<RoomNotificationMode>, NotificationSettingsError> {
+        let notification_settings = self.sdk_notification_settings.read().await;
+        let parsed_room_id = RoomId::parse(&room_id)
+            .map_err(|_e| NotificationSettingsError::InvalidRoomId(room_id))?;
+        // Get the current user defined mode for this room
+        if let Some(mode) =
+            notification_settings.get_user_defined_room_notification_mode(&parsed_room_id).await
+        {
+            Ok(Some(mode.into()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Get the default room notification mode
@@ -184,30 +200,61 @@ impl NotificationSettings {
     /// # Arguments
     ///
     /// * `is_encrypted` - whether the room is encrypted
-    /// * `active_members_count` - the room's active members count (joined +
-    ///   invited)
+    /// * `is_one_to_one` - whether the room is a direct chats involving two
+    ///   people
     pub async fn get_default_room_notification_mode(
         &self,
         is_encrypted: bool,
-        active_members_count: u64,
+        is_one_to_one: bool,
     ) -> RoomNotificationMode {
         let notification_settings = self.sdk_notification_settings.read().await;
         let mode = notification_settings
-            .get_default_room_notification_mode(is_encrypted, active_members_count)
+            .get_default_room_notification_mode(is_encrypted.into(), is_one_to_one.into())
             .await;
         mode.into()
     }
 
-    /// Restores the default notification mode for a room
+    /// Set the default room notification mode
+    ///
+    /// # Arguments
+    ///
+    /// * `is_encrypted` - whether the mode is for encrypted rooms
+    /// * `is_one_to_one` - whether the mode is for direct chats involving two
+    ///   people
+    /// * `mode` - the new default mode
+    pub async fn set_default_room_notification_mode(
+        &self,
+        is_encrypted: bool,
+        is_one_to_one: bool,
+        mode: RoomNotificationMode,
+    ) -> Result<(), NotificationSettingsError> {
+        let notification_settings = self.sdk_notification_settings.read().await;
+        notification_settings
+            .set_default_room_notification_mode(
+                is_encrypted.into(),
+                is_one_to_one.into(),
+                mode.into(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Restore the default notification mode for a room
     pub async fn restore_default_room_notification_mode(
         &self,
         room_id: String,
     ) -> Result<(), NotificationSettingsError> {
         let notification_settings = self.sdk_notification_settings.read().await;
-        let parsed_room_idom_id = RoomId::parse(&room_id)
+        let parsed_room_id = RoomId::parse(&room_id)
             .map_err(|_e| NotificationSettingsError::InvalidRoomId(room_id))?;
-        notification_settings.delete_user_defined_room_rules(&parsed_room_idom_id).await?;
+        notification_settings.delete_user_defined_room_rules(&parsed_room_id).await?;
         Ok(())
+    }
+
+    /// Get all room IDs for which a user-defined rule exists.
+    pub async fn get_rooms_with_user_defined_rules(&self, enabled: Option<bool>) -> Vec<String> {
+        let notification_settings = self.sdk_notification_settings.read().await;
+        notification_settings.get_rooms_with_user_defined_rules(enabled).await
     }
 
     /// Get whether some enabled keyword rules exist.
@@ -295,17 +342,24 @@ impl NotificationSettings {
     }
 
     /// Unmute a room.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - the room to unmute
+    /// * `is_encrypted` - whether the room is encrypted
+    /// * `is_one_to_one` - whether the room is a direct chat involving two
+    ///   people
     pub async fn unmute_room(
         &self,
         room_id: String,
         is_encrypted: bool,
-        members_count: u64,
+        is_one_to_one: bool,
     ) -> Result<(), NotificationSettingsError> {
         let notification_settings = self.sdk_notification_settings.read().await;
-        let parsed_room_idom_id = RoomId::parse(&room_id)
+        let parsed_room_id = RoomId::parse(&room_id)
             .map_err(|_e| NotificationSettingsError::InvalidRoomId(room_id))?;
         notification_settings
-            .unmute_room(&parsed_room_idom_id, is_encrypted, members_count)
+            .unmute_room(&parsed_room_id, is_encrypted.into(), is_one_to_one.into())
             .await?;
         Ok(())
     }

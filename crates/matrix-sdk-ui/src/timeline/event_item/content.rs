@@ -18,10 +18,7 @@ use imbl::{vector, Vector};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use matrix_sdk::{deserialized_responses::TimelineEvent, Result};
-#[cfg(feature = "experimental-sliding-sync")]
 use matrix_sdk_base::latest_event::{is_suitable_for_latest_event, PossibleLatestEvent};
-#[cfg(feature = "experimental-sliding-sync")]
-use ruma::events::{AnySyncTimelineEvent, OriginalSyncMessageLikeEvent};
 use ruma::{
     assign,
     events::{
@@ -41,10 +38,7 @@ use ruma::{
             history_visibility::RoomHistoryVisibilityEventContent,
             join_rules::RoomJoinRulesEventContent,
             member::{Change, RoomMemberEventContent},
-            message::{
-                self, sanitize::RemoveReplyFallback, MessageType, Relation,
-                RoomMessageEventContent, SyncRoomMessageEvent,
-            },
+            message::{self, MessageType, Relation, RoomMessageEventContent, SyncRoomMessageEvent},
             name::RoomNameEventContent,
             pinned_events::RoomPinnedEventsEventContent,
             power_levels::RoomPowerLevelsEventContent,
@@ -56,18 +50,19 @@ use ruma::{
         space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
         sticker::StickerEventContent,
         AnyFullStateEventContent, AnyMessageLikeEventContent, AnySyncMessageLikeEvent,
-        AnyTimelineEvent, BundledMessageLikeRelations, FullStateEventContent, MessageLikeEventType,
-        StateEventType,
+        AnySyncTimelineEvent, AnyTimelineEvent, BundledMessageLikeRelations, FullStateEventContent,
+        MessageLikeEventType, StateEventType,
     },
-    OwnedDeviceId, OwnedEventId, OwnedMxcUri, OwnedTransactionId, OwnedUserId, UserId,
+    html::RemoveReplyFallback,
+    OwnedDeviceId, OwnedEventId, OwnedMxcUri, OwnedTransactionId, OwnedUserId, RoomVersionId,
+    UserId,
 };
-#[cfg(feature = "experimental-sliding-sync")]
-use tracing::warn;
-use tracing::{debug, error};
+use tracing::{error, warn};
 
-use super::{EventItemIdentifier, EventTimelineItem, Profile, ReactionSenderData, TimelineDetails};
+use super::{EventItemIdentifier, EventTimelineItem, Profile, TimelineDetails};
 use crate::timeline::{
-    traits::RoomDataProvider, Error as TimelineError, TimelineItem, DEFAULT_SANITIZER_MODE,
+    polls::PollState, traits::RoomDataProvider, Error as TimelineError, ReactionSenderData,
+    TimelineItem, DEFAULT_SANITIZER_MODE,
 };
 
 /// The content of an [`EventTimelineItem`][super::EventTimelineItem].
@@ -114,18 +109,22 @@ pub enum TimelineItemContent {
         /// The deserialization error.
         error: Arc<serde_json::Error>,
     },
+
+    /// An `m.poll.start` event.
+    Poll(PollState),
 }
 
 impl TimelineItemContent {
     /// If the supplied event is suitable to be used as a latest_event in a
     /// message preview, extract its contents and wrap it as a
     /// TimelineItemContent.
-    #[cfg(feature = "experimental-sliding-sync")]
     pub(crate) fn from_latest_event_content(
         event: AnySyncTimelineEvent,
     ) -> Option<TimelineItemContent> {
         match is_suitable_for_latest_event(&event) {
-            PossibleLatestEvent::YesMessageLike(m) => Self::from_suitable_latest_event_content(m),
+            PossibleLatestEvent::YesMessageLike(m) => {
+                Some(Self::from_suitable_latest_event_content(m))
+            }
             PossibleLatestEvent::NoUnsupportedEventType => {
                 // TODO: when we support state events in message previews, this will need change
                 warn!("Found a state event cached as latest_event! ID={}", event.event_id());
@@ -145,39 +144,37 @@ impl TimelineItemContent {
                 warn!("Found an encrypted event cached as latest_event! ID={}", event.event_id());
                 None
             }
-            PossibleLatestEvent::NoRedacted => {
-                warn!("Found a redacted event cached as latest_event! ID={}", event.event_id());
-                None
-            }
         }
     }
 
     /// Given some message content that is from an event that we have already
     /// determined is suitable for use as a latest event in a message preview,
     /// extract its contents and wrap it as a TimelineItemContent.
-    #[cfg(feature = "experimental-sliding-sync")]
-    fn from_suitable_latest_event_content(
-        message: &OriginalSyncMessageLikeEvent<RoomMessageEventContent>,
-    ) -> Option<TimelineItemContent> {
-        // Grab the content of this event
-        let event_content = message.content.clone();
+    fn from_suitable_latest_event_content(event: &SyncRoomMessageEvent) -> TimelineItemContent {
+        match event {
+            SyncRoomMessageEvent::Original(event) => {
+                // Grab the content of this event
+                let event_content = event.content.clone();
 
-        // We don't have access to any relations via the AnySyncTimelineEvent (I think -
-        // andyb) so we pretend there are none. This might be OK for the message preview
-        // use case.
-        let relations = BundledMessageLikeRelations::new();
+                // We don't have access to any relations via the AnySyncTimelineEvent (I think -
+                // andyb) so we pretend there are none. This might be OK for the message preview
+                // use case.
+                let relations = BundledMessageLikeRelations::new();
 
-        // If this message is a reply, we would look up in this list the message it was
-        // replying to. Since we probably won't show this in the message preview,
-        // it's probably OK to supply an empty list here.
-        // Message::from_event marks the original event as Unavailable if it can't be
-        // found inside the timeline_items.
-        let timeline_items = Vector::new();
-        Some(TimelineItemContent::Message(Message::from_event(
-            event_content,
-            relations,
-            &timeline_items,
-        )))
+                // If this message is a reply, we would look up in this list the message it was
+                // replying to. Since we probably won't show this in the message preview,
+                // it's probably OK to supply an empty list here.
+                // Message::from_event marks the original event as Unavailable if it can't be
+                // found inside the timeline_items.
+                let timeline_items = Vector::new();
+                TimelineItemContent::Message(Message::from_event(
+                    event_content,
+                    relations,
+                    &timeline_items,
+                ))
+            }
+            SyncRoomMessageEvent::Redacted(_) => TimelineItemContent::RedactedMessage,
+        }
     }
 
     /// If `self` is of the [`Message`][Self::Message] variant, return the inner
@@ -280,6 +277,20 @@ impl TimelineItemContent {
                     change: None,
                 })
             }
+        }
+    }
+
+    pub(in crate::timeline) fn redact(&self, room_version: &RoomVersionId) -> Self {
+        match self {
+            Self::Message(_)
+            | Self::RedactedMessage
+            | Self::Sticker(_)
+            | Self::Poll(_)
+            | Self::UnableToDecrypt(_) => Self::RedactedMessage,
+            Self::MembershipChange(ev) => Self::MembershipChange(ev.redact(room_version)),
+            Self::ProfileChange(ev) => Self::ProfileChange(ev.redact()),
+            Self::OtherState(ev) => Self::OtherState(ev.redact(room_version)),
+            Self::FailedToParseMessageLike { .. } | Self::FailedToParseState { .. } => self.clone(),
         }
     }
 }
@@ -423,8 +434,7 @@ impl InReplyToDetails {
             .iter()
             .filter_map(|it| it.as_event())
             .find(|it| it.event_id() == Some(&*event_id))
-            .and_then(RepliedToEvent::from_timeline_item)
-            .map(Box::new);
+            .map(|item| Box::new(RepliedToEvent::from_timeline_item(item)));
 
         InReplyToDetails { event_id, event: TimelineDetails::from_initial_value(event) }
     }
@@ -433,15 +443,15 @@ impl InReplyToDetails {
 /// An event that is replied to.
 #[derive(Clone, Debug)]
 pub struct RepliedToEvent {
-    pub(in crate::timeline) message: Message,
+    pub(in crate::timeline) content: TimelineItemContent,
     pub(in crate::timeline) sender: OwnedUserId,
     pub(in crate::timeline) sender_profile: TimelineDetails<Profile>,
 }
 
 impl RepliedToEvent {
     /// Get the message of this event.
-    pub fn message(&self) -> &Message {
-        &self.message
+    pub fn content(&self) -> &TimelineItemContent {
+        &self.content
     }
 
     /// Get the sender of this event.
@@ -454,21 +464,20 @@ impl RepliedToEvent {
         &self.sender_profile
     }
 
-    fn from_timeline_item(timeline_item: &EventTimelineItem) -> Option<Self> {
-        let message = match &timeline_item.content {
-            TimelineItemContent::Message(msg) => msg.to_owned(),
-            // FIXME: Handle redacted messages
-            _ => {
-                debug!("Replied-to event is not a message, discarding");
-                return None;
-            }
-        };
-
-        Some(Self {
-            message,
+    fn from_timeline_item(timeline_item: &EventTimelineItem) -> Self {
+        Self {
+            content: timeline_item.content.clone(),
             sender: timeline_item.sender.clone(),
             sender_profile: timeline_item.sender_profile.clone(),
-        })
+        }
+    }
+
+    pub(in crate::timeline) fn redact(&self, room_version: &RoomVersionId) -> Self {
+        Self {
+            content: self.content.redact(room_version),
+            sender: self.sender.clone(),
+            sender_profile: self.sender_profile.clone(),
+        }
     }
 
     pub(in crate::timeline) async fn try_from_timeline_event<P: RoomDataProvider>(
@@ -486,12 +495,13 @@ impl RepliedToEvent {
             return Err(TimelineError::UnsupportedEvent);
         };
 
-        let message = Message::from_event(c, event.relations(), &vector![]);
+        let content =
+            TimelineItemContent::Message(Message::from_event(c, event.relations(), &vector![]));
         let sender = event.sender().to_owned();
         let sender_profile =
             TimelineDetails::from_initial_value(room_data_provider.profile(&sender).await);
 
-        Ok(Self { message, sender, sender_profile })
+        Ok(Self { content, sender, sender_profile })
     }
 }
 
@@ -625,6 +635,14 @@ impl RoomMembershipChange {
     pub fn change(&self) -> Option<MembershipChange> {
         self.change
     }
+
+    fn redact(&self, room_version: &RoomVersionId) -> Self {
+        Self {
+            user_id: self.user_id.clone(),
+            content: FullStateEventContent::Redacted(self.content.clone().redact(room_version)),
+            change: self.change,
+        }
+    }
 }
 
 /// An enum over all the possible room membership changes.
@@ -707,6 +725,18 @@ impl MemberProfileChange {
     /// The avatar URL change induced by this event.
     pub fn avatar_url_change(&self) -> Option<&Change<Option<OwnedMxcUri>>> {
         self.avatar_url_change.as_ref()
+    }
+
+    fn redact(&self) -> Self {
+        Self {
+            user_id: self.user_id.clone(),
+            // FIXME: This isn't actually right, the profile is reset to an
+            // empty one when the member event is redacted. This can't be
+            // implemented without further architectural changes and is a
+            // somewhat rare edge case, so it should be fine for now.
+            displayname_change: None,
+            avatar_url_change: None,
+        }
     }
 }
 
@@ -839,6 +869,72 @@ impl AnyOtherFullStateEventContent {
             Self::_Custom { event_type } => event_type.as_str().into(),
         }
     }
+
+    fn redact(&self, room_version: &RoomVersionId) -> Self {
+        match self {
+            Self::PolicyRuleRoom(c) => Self::PolicyRuleRoom(FullStateEventContent::Redacted(
+                c.clone().redact(room_version),
+            )),
+            Self::PolicyRuleServer(c) => Self::PolicyRuleServer(FullStateEventContent::Redacted(
+                c.clone().redact(room_version),
+            )),
+            Self::PolicyRuleUser(c) => Self::PolicyRuleUser(FullStateEventContent::Redacted(
+                c.clone().redact(room_version),
+            )),
+            Self::RoomAliases(c) => {
+                Self::RoomAliases(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+            }
+            Self::RoomAvatar(c) => {
+                Self::RoomAvatar(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+            }
+            Self::RoomCanonicalAlias(c) => Self::RoomCanonicalAlias(
+                FullStateEventContent::Redacted(c.clone().redact(room_version)),
+            ),
+            Self::RoomCreate(c) => {
+                Self::RoomCreate(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+            }
+            Self::RoomEncryption(c) => Self::RoomEncryption(FullStateEventContent::Redacted(
+                c.clone().redact(room_version),
+            )),
+            Self::RoomGuestAccess(c) => Self::RoomGuestAccess(FullStateEventContent::Redacted(
+                c.clone().redact(room_version),
+            )),
+            Self::RoomHistoryVisibility(c) => Self::RoomHistoryVisibility(
+                FullStateEventContent::Redacted(c.clone().redact(room_version)),
+            ),
+            Self::RoomJoinRules(c) => {
+                Self::RoomJoinRules(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+            }
+            Self::RoomName(c) => {
+                Self::RoomName(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+            }
+            Self::RoomPinnedEvents(c) => Self::RoomPinnedEvents(FullStateEventContent::Redacted(
+                c.clone().redact(room_version),
+            )),
+            Self::RoomPowerLevels(c) => Self::RoomPowerLevels(FullStateEventContent::Redacted(
+                c.clone().redact(room_version),
+            )),
+            Self::RoomServerAcl(c) => {
+                Self::RoomServerAcl(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+            }
+            Self::RoomThirdPartyInvite(c) => Self::RoomThirdPartyInvite(
+                FullStateEventContent::Redacted(c.clone().redact(room_version)),
+            ),
+            Self::RoomTombstone(c) => {
+                Self::RoomTombstone(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+            }
+            Self::RoomTopic(c) => {
+                Self::RoomTopic(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+            }
+            Self::SpaceChild(c) => {
+                Self::SpaceChild(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+            }
+            Self::SpaceParent(c) => {
+                Self::SpaceParent(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+            }
+            Self::_Custom { event_type } => Self::_Custom { event_type: event_type.clone() },
+        }
+    }
 }
 
 /// A state event that doesn't have its own variant.
@@ -857,5 +953,9 @@ impl OtherState {
     /// The content of the event.
     pub fn content(&self) -> &AnyOtherFullStateEventContent {
         &self.content
+    }
+
+    fn redact(&self, room_version: &RoomVersionId) -> Self {
+        Self { state_key: self.state_key.clone(), content: self.content.redact(room_version) }
     }
 }

@@ -25,12 +25,9 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use bytesize::ByteSize;
 use eyeball::SharedObservable;
-use ruma::{
-    api::{
-        error::{FromHttpResponseError, IntoHttpError},
-        AuthScheme, MatrixVersion, OutgoingRequest, OutgoingRequestAppserviceExt, SendAccessToken,
-    },
-    UserId,
+use ruma::api::{
+    error::{FromHttpResponseError, IntoHttpError},
+    AuthScheme, MatrixVersion, OutgoingRequest, SendAccessToken,
 };
 use tracing::{debug, field::debug, instrument, trace};
 
@@ -46,7 +43,7 @@ pub(crate) use native::HttpSettings;
 
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct HttpClient {
     pub(crate) inner: reqwest::Client,
     pub(crate) request_config: RequestConfig,
@@ -69,7 +66,6 @@ impl HttpClient {
         config: RequestConfig,
         homeserver: String,
         access_token: Option<&str>,
-        user_id: Option<&UserId>,
         server_versions: &[MatrixVersion],
     ) -> Result<http::Request<Bytes>, IntoHttpError>
     where
@@ -77,53 +73,28 @@ impl HttpClient {
     {
         trace!(request_type = type_name::<R>(), "Serializing request");
 
-        // We can't assert the identity without a user_id.
-        let request = if let Some((access_token, user_id)) =
-            access_token.filter(|_| config.assert_identity).zip(user_id)
-        {
-            request.try_into_http_request_with_user_id::<BytesMut>(
-                &homeserver,
-                SendAccessToken::Always(access_token),
-                user_id,
-                server_versions,
-            )?
-        } else {
-            let send_access_token = match access_token {
-                Some(access_token) => {
-                    if config.force_auth {
-                        SendAccessToken::Always(access_token)
-                    } else {
-                        SendAccessToken::IfRequired(access_token)
-                    }
+        let send_access_token = match access_token {
+            Some(access_token) => {
+                if config.force_auth {
+                    SendAccessToken::Always(access_token)
+                } else {
+                    SendAccessToken::IfRequired(access_token)
                 }
-                None => SendAccessToken::None,
-            };
-
-            request.try_into_http_request::<BytesMut>(
-                &homeserver,
-                send_access_token,
-                server_versions,
-            )?
+            }
+            None => SendAccessToken::None,
         };
 
-        let request = request.map(|body| body.freeze());
+        let request = request
+            .try_into_http_request::<BytesMut>(&homeserver, send_access_token, server_versions)?
+            .map(|body| body.freeze());
 
         Ok(request)
     }
 
     #[allow(clippy::too_many_arguments)]
     #[instrument(
-        skip(self, access_token, config, request, user_id, send_progress),
-        fields(
-            config,
-            path,
-            user_id,
-            request_size,
-            request_body,
-            request_id,
-            status,
-            response_size,
-        )
+        skip(self, access_token, config, request, send_progress),
+        fields(config, path, request_size, request_body, request_id, status, response_size,)
     )]
     pub async fn send<R>(
         &self,
@@ -131,7 +102,6 @@ impl HttpClient {
         config: Option<RequestConfig>,
         homeserver: String,
         access_token: Option<&str>,
-        user_id: Option<&UserId>,
         server_versions: &[MatrixVersion],
         send_progress: SharedObservable<TransmissionProgress>,
     ) -> Result<R::IncomingResponse, HttpError>
@@ -154,25 +124,13 @@ impl HttpClient {
             // why we record it here, instead of in the #[instrument] macro.
             span.record("config", debug(config)).record("request_id", request_id);
 
-            // The user ID is only used if we're an app-service. Only log the user_id if
-            // it's `Some` and if assert_identity is set.
-            if config.assert_identity {
-                span.record("user_id", user_id.map(debug));
-            }
-
             let auth_scheme = R::METADATA.authentication;
             if !matches!(auth_scheme, AuthScheme::AccessToken | AuthScheme::None) {
                 return Err(HttpError::NotClientRequest);
             }
 
-            let request = self.serialize_request(
-                request,
-                config,
-                homeserver,
-                access_token,
-                user_id,
-                server_versions,
-            )?;
+            let request =
+                self.serialize_request(request, config, homeserver, access_token, server_versions)?;
 
             let request_size = ByteSize(request.body().len().try_into().unwrap_or(u64::MAX));
             span.record("request_size", request_size.to_string_as(true));
@@ -238,4 +196,29 @@ async fn response_to_http_response(
     let body = response.bytes().await?;
 
     Ok(http_builder.body(body).expect("Can't construct a response using the given body"))
+}
+
+#[cfg(feature = "experimental-oidc")]
+impl tower::Service<http::Request<Bytes>> for HttpClient {
+    type Response = http::Response<Bytes>;
+    type Error = tower::BoxError;
+    type Future = futures_core::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: http::Request<Bytes>) -> Self::Future {
+        let inner = self.inner.clone();
+
+        let fut = async move {
+            native::send_request(&inner, &req, DEFAULT_REQUEST_TIMEOUT, Default::default())
+                .await
+                .map_err(Into::into)
+        };
+        Box::pin(fut)
+    }
 }

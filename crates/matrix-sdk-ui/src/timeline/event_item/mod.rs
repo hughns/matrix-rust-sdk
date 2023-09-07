@@ -15,19 +15,15 @@
 use std::sync::Arc;
 
 use indexmap::IndexMap;
-#[cfg(feature = "experimental-sliding-sync")]
-use matrix_sdk::SlidingSyncRoom;
-use matrix_sdk::{deserialized_responses::EncryptionInfo, Error};
-#[cfg(feature = "experimental-sliding-sync")]
+use matrix_sdk::{deserialized_responses::EncryptionInfo, Client, Error};
 use matrix_sdk_base::deserialized_responses::SyncTimelineEvent;
 use once_cell::sync::Lazy;
 use ruma::{
     events::{receipt::Receipt, room::message::MessageType, AnySyncTimelineEvent},
     serde::Raw,
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, OwnedTransactionId,
-    OwnedUserId, TransactionId, UserId,
+    OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
 };
-#[cfg(feature = "experimental-sliding-sync")]
 use tracing::warn;
 
 mod content;
@@ -81,17 +77,6 @@ pub enum EventItemIdentifier {
     EventId(OwnedEventId),
 }
 
-/// Data associated with a reaction sender. It can be used to display
-/// a details UI component for a reaction with both sender
-/// names and the date at which they sent a reaction.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReactionSenderData {
-    /// Sender identifier.
-    pub sender_id: OwnedUserId,
-    /// Date at which the sender reacted.
-    pub timestamp: MilliSecondsSinceUnixEpoch,
-}
-
 impl EventTimelineItem {
     pub(super) fn new(
         sender: OwnedUserId,
@@ -105,15 +90,14 @@ impl EventTimelineItem {
 
     /// If the supplied low-level SyncTimelineEventy is suitable for use as the
     /// latest_event in a message preview, wrap it as an EventTimelineItem,
-    #[cfg(feature = "experimental-sliding-sync")]
-    pub(crate) async fn from_latest_event(
-        room: &SlidingSyncRoom,
+    pub async fn from_latest_event(
+        client: Client,
+        room_id: &RoomId,
         sync_event: SyncTimelineEvent,
     ) -> Option<EventTimelineItem> {
         use super::traits::RoomDataProvider;
 
         let raw_sync_event = sync_event.event;
-
         let encryption_info = sync_event.encryption_info;
 
         let Ok(event) = raw_sync_event.deserialize_as::<AnySyncTimelineEvent>() else {
@@ -124,7 +108,7 @@ impl EventTimelineItem {
         let timestamp = event.origin_server_ts();
         let sender = event.sender().to_owned();
         let event_id = event.event_id().to_owned();
-        let is_own = room.client().user_id().map(|uid| uid == sender).unwrap_or(false);
+        let is_own = client.user_id().map(|uid| uid == sender).unwrap_or(false);
 
         // If we don't (yet) know how to handle this type of message, return None here.
         // If we do, convert it into a TimelineItemContent.
@@ -154,13 +138,13 @@ impl EventTimelineItem {
             is_own,
             is_highlighted,
             encryption_info,
-            original_json: raw_sync_event,
+            original_json: Some(raw_sync_event),
             latest_edit_json,
             origin,
         }
         .into();
 
-        let room = room.client().get_room(room.room_id());
+        let room = client.get_room(room_id);
         let sender_profile = if let Some(room) = room {
             room.profile(&sender)
                 .await
@@ -179,6 +163,10 @@ impl EventTimelineItem {
     /// back the full event as part of a sync response.
     pub fn is_local_echo(&self) -> bool {
         matches!(self.kind, EventTimelineItemKind::Local(_))
+    }
+
+    pub(super) fn is_remote_event(&self) -> bool {
+        matches!(self.kind, EventTimelineItemKind::Remote(_))
     }
 
     /// Get the `LocalEventTimelineItem` if `self` is `Local`.
@@ -329,7 +317,7 @@ impl EventTimelineItem {
     pub fn original_json(&self) -> Option<&Raw<AnySyncTimelineEvent>> {
         match &self.kind {
             EventTimelineItemKind::Local(_local_event) => None,
-            EventTimelineItemKind::Remote(remote_event) => Some(&remote_event.original_json),
+            EventTimelineItemKind::Remote(remote_event) => remote_event.original_json.as_ref(),
         }
     }
 
@@ -385,6 +373,21 @@ impl EventTimelineItem {
     /// Clone the current event item, and update its `sender_profile`.
     pub(super) fn with_sender_profile(&self, sender_profile: TimelineDetails<Profile>) -> Self {
         Self { sender_profile, ..self.clone() }
+    }
+
+    pub(super) fn redact(&self, room_version: &RoomVersionId) -> Self {
+        let content = self.content.redact(room_version);
+        let kind = match &self.kind {
+            EventTimelineItemKind::Local(l) => EventTimelineItemKind::Local(l.clone()),
+            EventTimelineItemKind::Remote(r) => EventTimelineItemKind::Remote(r.redact()),
+        };
+        Self {
+            sender: self.sender.clone(),
+            sender_profile: self.sender_profile.clone(),
+            timestamp: self.timestamp,
+            content,
+            kind,
+        }
     }
 }
 
@@ -446,11 +449,8 @@ impl<T> TimelineDetails<T> {
         matches!(self, Self::Unavailable)
     }
 
-    pub(crate) fn contains<U>(&self, value: &U) -> bool
-    where
-        T: PartialEq<U>,
-    {
-        matches!(self, Self::Ready(v) if v == value)
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
     }
 }
 
@@ -466,38 +466,39 @@ pub enum EventItemOrigin {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use assert_matches::assert_matches;
     use matrix_sdk::{config::RequestConfig, Client, ClientBuilder};
-    use matrix_sdk_base::{BaseClient, SessionMeta};
+    use matrix_sdk_base::{deserialized_responses::SyncTimelineEvent, BaseClient, SessionMeta};
     use matrix_sdk_test::async_test;
     use ruma::{
         api::{client::sync::sync_events::v4, MatrixVersion},
         device_id,
-        events::room::message::MessageFormat,
-        room_id, user_id, RoomId, UInt,
+        events::{
+            room::message::{MessageFormat, MessageType},
+            AnySyncTimelineEvent,
+        },
+        room_id,
+        serde::Raw,
+        user_id, RoomId, UInt, UserId,
     };
     use serde_json::json;
 
-    use super::*;
+    use super::{EventTimelineItem, Profile};
+    use crate::timeline::TimelineDetails;
 
     #[async_test]
-    #[cfg(feature = "experimental-sliding-sync")]
     async fn latest_message_event_can_be_wrapped_as_a_timeline_item() {
         // Given a sync event that is suitable to be used as a latest_event
 
         let room_id = room_id!("!q:x.uk");
         let user_id = user_id!("@t:o.uk");
         let event = message_event(room_id, user_id, "**My M**", "<b>My M</b>", 122344);
-        let room = SlidingSyncRoom::new(
-            logged_in_client(None).await,
-            room_id.to_owned(),
-            v4::SlidingSyncRoom::new(),
-            Vec::new(),
-        );
+        let client = logged_in_client(None).await;
 
         // When we construct a timeline event from it
-        let timeline_item = EventTimelineItem::from_latest_event(&room, event).await.unwrap();
+        let timeline_item =
+            EventTimelineItem::from_latest_event(client, room_id, event).await.unwrap();
 
         // Then its properties correctly translate
         assert_eq!(timeline_item.sender, user_id);
@@ -514,7 +515,6 @@ mod test {
     }
 
     #[async_test]
-    #[cfg(feature = "experimental-sliding-sync")]
     async fn latest_message_event_can_be_wrapped_as_a_timeline_item_with_sender() {
         // Given a sync event that is suitable to be used as a latest_event, and a room
         // with a member event for the sender
@@ -526,15 +526,14 @@ mod test {
         let client = logged_in_client(None).await;
         let mut room = v4::SlidingSyncRoom::new();
         room.timeline.push(member_event(room_id, user_id, "Alice Margatroid", "mxc://e.org/SEs"));
-        let ss_room =
-            SlidingSyncRoom::new(client.clone(), room_id.to_owned(), room.clone(), Vec::new());
 
         // And the room is stored in the client so it can be extracted when needed
         let response = response_with_room(room_id, room).await;
         client.process_sliding_sync(&response).await.unwrap();
 
         // When we construct a timeline event from it
-        let timeline_item = EventTimelineItem::from_latest_event(&ss_room, event).await.unwrap();
+        let timeline_item =
+            EventTimelineItem::from_latest_event(client, room_id, event).await.unwrap();
 
         // Then its sender is properly populated
         let profile = assert_matches!(timeline_item.sender_profile, TimelineDetails::Ready(p) => p);
@@ -578,14 +577,12 @@ mod test {
         .unwrap()
     }
 
-    #[cfg(feature = "experimental-sliding-sync")]
     async fn response_with_room(room_id: &RoomId, room: v4::SlidingSyncRoom) -> v4::Response {
         let mut response = v4::Response::new("6".to_owned());
         response.rooms.insert(room_id.to_owned(), room);
         response
     }
 
-    #[cfg(feature = "experimental-sliding-sync")]
     fn message_event(
         room_id: &RoomId,
         user_id: &UserId,

@@ -12,21 +12,19 @@ use std::{
     sync::{Arc, RwLock as StdRwLock},
 };
 
-pub use builder::*;
 use eyeball::Observable;
 use eyeball_im::{ObservableVector, VectorDiff};
 use eyeball_im_util::{FilterVectorSubscriber, VectorExt};
-pub(super) use frozen::FrozenSlidingSyncList;
 use futures_core::Stream;
 use imbl::Vector;
-pub(super) use request_generator::*;
-pub use room_list_entry::RoomListEntry;
 use ruma::{api::client::sync::sync_events::v4, assign, OwnedRoomId, TransactionId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::Sender;
 use tracing::{instrument, warn};
 
 use self::sticky::SlidingSyncListStickyParameters;
+pub use self::{builder::*, room_list_entry::RoomListEntry};
+pub(super) use self::{frozen::FrozenSlidingSyncList, request_generator::*};
 use super::{
     sticky_parameters::{LazyTransactionId, SlidingSyncStickyManager},
     Error, SlidingSyncInternalMessage,
@@ -60,8 +58,6 @@ pub type Ranges = Vec<Range>;
 pub struct SlidingSyncList {
     inner: Arc<SlidingSyncListInner>,
 }
-
-type BoxedRoomListEntryFilter = Box<dyn Fn(&RoomListEntry) -> bool + Sync + Send>;
 
 impl SlidingSyncList {
     /// Create a new [`SlidingSyncListBuilder`] with the given name.
@@ -169,11 +165,11 @@ impl SlidingSyncList {
     pub fn room_list_filtered_stream<F>(
         &self,
         filter: F,
-    ) -> (Vector<RoomListEntry>, FilterVectorSubscriber<RoomListEntry, BoxedRoomListEntryFilter>)
+    ) -> (Vector<RoomListEntry>, FilterVectorSubscriber<RoomListEntry, F>)
     where
-        F: Fn(&RoomListEntry) -> bool + Sync + Send + 'static,
+        F: Fn(&RoomListEntry) -> bool,
     {
-        ObservableVector::subscribe_filter(&self.inner.room_list.read().unwrap(), Box::new(filter))
+        ObservableVector::subscribe_filter(&self.inner.room_list.read().unwrap(), filter)
     }
 
     /// Get the maximum number of rooms. See [`Self::maximum_number_of_rooms`]
@@ -373,6 +369,7 @@ impl SlidingSyncListInner {
     #[instrument(skip(self), fields(name = self.name))]
     fn request(&self, ranges: Ranges, txn_id: &mut LazyTransactionId) -> v4::SyncRequestList {
         use ruma::UInt;
+
         let ranges =
             ranges.into_iter().map(|r| (UInt::from(*r.start()), UInt::from(*r.end()))).collect();
 
@@ -493,7 +490,7 @@ impl SlidingSyncListInner {
     }
 
     /// Send a message over the internal channel if there is a receiver, i.e. if
-    /// the sync-loop is running.
+    /// the sync loop is running.
     #[instrument]
     fn internal_channel_send_if_possible(&self, message: SlidingSyncInternalMessage) {
         // If there is no receiver, the send will fail, but that's OK here.
@@ -892,13 +889,18 @@ impl SlidingSyncMode {
 mod tests {
     use std::{
         cell::Cell,
+        collections::HashSet,
         sync::{Arc, Mutex},
     };
 
+    use eyeball_im::{ObservableVector, VectorDiff};
     use futures_util::StreamExt;
     use imbl::vector;
     use matrix_sdk_test::async_test;
-    use ruma::{api::client::sync::sync_events::v4::SlidingOp, room_id, uint};
+    use ruma::{
+        api::client::sync::sync_events::v4::{self, SlidingOp},
+        room_id, uint, OwnedRoomId,
+    };
     use serde_json::json;
     use tokio::{
         spawn,
@@ -908,7 +910,11 @@ mod tests {
         },
     };
 
-    use super::*;
+    use super::{
+        apply_sync_operations, RoomListEntry, SlidingSyncList, SlidingSyncListLoadingState,
+        SlidingSyncMode,
+    };
+    use crate::sliding_sync::{sticky_parameters::LazyTransactionId, SlidingSyncInternalMessage};
 
     macro_rules! assert_json_roundtrip {
         (from $type:ty: $rust_value:expr => $json_value:expr) => {

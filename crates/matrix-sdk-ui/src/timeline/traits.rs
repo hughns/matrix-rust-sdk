@@ -14,17 +14,17 @@
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
-use matrix_sdk::room;
+use matrix_sdk::Room;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk::{deserialized_responses::TimelineEvent, Result};
 use ruma::{
     events::receipt::{Receipt, ReceiptThread, ReceiptType},
     push::{PushConditionRoomCtx, Ruleset},
-    EventId, OwnedUserId, UserId,
+    EventId, OwnedUserId, RoomVersionId, UserId,
 };
 #[cfg(feature = "e2e-encryption")]
 use ruma::{events::AnySyncTimelineEvent, serde::Raw};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use super::{Profile, TimelineBuilder};
 use crate::timeline::Timeline;
@@ -52,7 +52,7 @@ pub trait RoomExt {
 }
 
 #[async_trait]
-impl RoomExt for room::Common {
+impl RoomExt for Room {
     async fn timeline(&self) -> Timeline {
         self.timeline_builder().build().await
     }
@@ -65,15 +65,23 @@ impl RoomExt for room::Common {
 #[async_trait]
 pub(super) trait RoomDataProvider: Clone + Send + Sync + 'static {
     fn own_user_id(&self) -> &UserId;
+    fn room_version(&self) -> RoomVersionId;
     async fn profile(&self, user_id: &UserId) -> Option<Profile>;
     async fn read_receipts_for_event(&self, event_id: &EventId) -> IndexMap<OwnedUserId, Receipt>;
     async fn push_rules_and_context(&self) -> Option<(Ruleset, PushConditionRoomCtx)>;
 }
 
 #[async_trait]
-impl RoomDataProvider for room::Common {
+impl RoomDataProvider for Room {
     fn own_user_id(&self) -> &UserId {
         (**self).own_user_id()
+    }
+
+    fn room_version(&self) -> RoomVersionId {
+        (**self).clone_info().room_version().cloned().unwrap_or_else(|| {
+            warn!("Unknown room version, falling back to v10");
+            RoomVersionId::V10
+        })
     }
 
     async fn profile(&self, user_id: &UserId) -> Option<Profile> {
@@ -90,7 +98,7 @@ impl RoomDataProvider for room::Common {
             }),
             Ok(None) => None,
             Err(e) => {
-                error!(%user_id, "Failed to getch room member information: {e}");
+                error!(%user_id, "Failed to fetch room member information: {e}");
                 None
             }
         }
@@ -137,7 +145,7 @@ pub(super) trait Decryptor: Clone + Send + Sync + 'static {
 
 #[cfg(feature = "e2e-encryption")]
 #[async_trait]
-impl Decryptor for room::Common {
+impl Decryptor for Room {
     async fn decrypt_event_impl(&self, raw: &Raw<AnySyncTimelineEvent>) -> Result<TimelineEvent> {
         self.decrypt_event(raw.cast_ref()).await
     }

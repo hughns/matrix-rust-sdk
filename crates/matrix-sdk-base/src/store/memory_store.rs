@@ -15,14 +15,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     iter,
-    sync::{Arc, RwLock},
+    sync::RwLock,
 };
 
 use async_trait::async_trait;
 use dashmap::DashMap;
 use matrix_sdk_common::instant::Instant;
 use ruma::{
-    canonical_json::redact,
+    canonical_json::{redact, RedactedBecause},
     events::{
         presence::PresenceEvent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
@@ -46,72 +46,39 @@ use crate::{
 ///
 /// Default if no other is configured at startup.
 #[allow(clippy::type_complexity)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
 pub struct MemoryStore {
-    user_avatar_url: Arc<DashMap<String, String>>,
-    sync_token: Arc<RwLock<Option<String>>>,
-    filters: Arc<DashMap<String, String>>,
-    account_data: Arc<DashMap<GlobalAccountDataEventType, Raw<AnyGlobalAccountDataEvent>>>,
-    profiles: Arc<DashMap<OwnedRoomId, DashMap<OwnedUserId, MinimalRoomMemberEvent>>>,
-    display_names: Arc<DashMap<OwnedRoomId, DashMap<String, BTreeSet<OwnedUserId>>>>,
-    members: Arc<DashMap<OwnedRoomId, DashMap<OwnedUserId, MembershipState>>>,
-    room_info: Arc<DashMap<OwnedRoomId, RoomInfo>>,
+    user_avatar_url: DashMap<String, String>,
+    sync_token: RwLock<Option<String>>,
+    filters: DashMap<String, String>,
+    account_data: DashMap<GlobalAccountDataEventType, Raw<AnyGlobalAccountDataEvent>>,
+    profiles: DashMap<OwnedRoomId, DashMap<OwnedUserId, MinimalRoomMemberEvent>>,
+    display_names: DashMap<OwnedRoomId, DashMap<String, BTreeSet<OwnedUserId>>>,
+    members: DashMap<OwnedRoomId, DashMap<OwnedUserId, MembershipState>>,
+    room_info: DashMap<OwnedRoomId, RoomInfo>,
     room_state:
-        Arc<DashMap<OwnedRoomId, DashMap<StateEventType, DashMap<String, Raw<AnySyncStateEvent>>>>>,
+        DashMap<OwnedRoomId, DashMap<StateEventType, DashMap<String, Raw<AnySyncStateEvent>>>>,
     room_account_data:
-        Arc<DashMap<OwnedRoomId, DashMap<RoomAccountDataEventType, Raw<AnyRoomAccountDataEvent>>>>,
-    stripped_room_state: Arc<
+        DashMap<OwnedRoomId, DashMap<RoomAccountDataEventType, Raw<AnyRoomAccountDataEvent>>>,
+    stripped_room_state:
         DashMap<OwnedRoomId, DashMap<StateEventType, DashMap<String, Raw<AnyStrippedStateEvent>>>>,
+    stripped_members: DashMap<OwnedRoomId, DashMap<OwnedUserId, MembershipState>>,
+    presence: DashMap<OwnedUserId, Raw<PresenceEvent>>,
+    room_user_receipts: DashMap<
+        OwnedRoomId,
+        DashMap<(String, Option<String>), DashMap<OwnedUserId, (OwnedEventId, Receipt)>>,
     >,
-    stripped_members: Arc<DashMap<OwnedRoomId, DashMap<OwnedUserId, MembershipState>>>,
-    presence: Arc<DashMap<OwnedUserId, Raw<PresenceEvent>>>,
-    room_user_receipts: Arc<
-        DashMap<
-            OwnedRoomId,
-            DashMap<(String, Option<String>), DashMap<OwnedUserId, (OwnedEventId, Receipt)>>,
-        >,
+    room_event_receipts: DashMap<
+        OwnedRoomId,
+        DashMap<(String, Option<String>), DashMap<OwnedEventId, DashMap<OwnedUserId, Receipt>>>,
     >,
-    room_event_receipts: Arc<
-        DashMap<
-            OwnedRoomId,
-            DashMap<(String, Option<String>), DashMap<OwnedEventId, DashMap<OwnedUserId, Receipt>>>,
-        >,
-    >,
-    custom: Arc<DashMap<Vec<u8>, Vec<u8>>>,
-}
-
-impl Default for MemoryStore {
-    fn default() -> Self {
-        Self::new()
-    }
+    custom: DashMap<Vec<u8>, Vec<u8>>,
 }
 
 impl MemoryStore {
-    #[allow(dead_code)]
     /// Create a new empty MemoryStore
     pub fn new() -> Self {
-        Self {
-            user_avatar_url: Default::default(),
-            sync_token: Default::default(),
-            filters: Default::default(),
-            account_data: Default::default(),
-            profiles: Default::default(),
-            display_names: Default::default(),
-            members: Default::default(),
-            room_info: Default::default(),
-            room_state: Default::default(),
-            room_account_data: Default::default(),
-            stripped_room_state: Default::default(),
-            stripped_members: Default::default(),
-            presence: Default::default(),
-            room_user_receipts: Default::default(),
-            room_event_receipts: Default::default(),
-            #[cfg(feature = "memory-media-cache")]
-            media: Arc::new(tokio::sync::Mutex::new(LruCache::new(
-                100.try_into().expect("100 is a non-zero usize"),
-            ))),
-            custom: DashMap::new().into(),
-        }
+        Default::default()
     }
 
     async fn get_kv_data(&self, key: StateStoreDataKey<'_>) -> Result<Option<StateStoreDataValue>> {
@@ -344,7 +311,7 @@ impl MemoryStore {
                                 let redacted = redact(
                                     raw_evt.deserialize_as::<CanonicalJsonObject>()?,
                                     room_version.get_or_insert_with(|| make_room_version(room_id)),
-                                    Some(redaction.try_into()?),
+                                    Some(RedactedBecause::from_raw_event(redaction)?),
                                 )
                                 .map_err(StoreError::Redaction)?;
                                 *raw_evt = Raw::new(&redacted)?.cast();

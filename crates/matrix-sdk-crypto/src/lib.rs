@@ -18,6 +18,7 @@
 
 #[cfg(feature = "backups_v1")]
 pub mod backups;
+pub mod dehydrated_devices;
 mod error;
 mod file_encryption;
 mod gossiping;
@@ -73,12 +74,12 @@ pub use file_encryption::{
     decrypt_room_key_export, encrypt_room_key_export, AttachmentDecryptor, AttachmentEncryptor,
     DecryptorError, KeyExportError, MediaEncryptionInfo,
 };
-pub use gossiping::GossipRequest;
+pub use gossiping::{GossipRequest, GossippedSecret};
 pub use identities::{
     Device, LocalTrust, OwnUserIdentity, ReadOnlyDevice, ReadOnlyOwnUserIdentity,
     ReadOnlyUserIdentities, ReadOnlyUserIdentity, UserDevices, UserIdentities, UserIdentity,
 };
-pub use machine::OlmMachine;
+pub use machine::{EncryptionSyncChanges, OlmMachine};
 #[cfg(feature = "qrcode")]
 pub use matrix_sdk_qrcode;
 pub use olm::{CrossSigningStatus, EncryptionSettings, ReadOnlyAccount, Session};

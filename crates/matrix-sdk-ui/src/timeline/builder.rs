@@ -18,14 +18,14 @@ use async_std::sync::Mutex;
 use eyeball::SharedObservable;
 use imbl::Vector;
 use matrix_sdk::{
-    deserialized_responses::SyncTimelineEvent, executor::spawn, room, sync::RoomUpdate,
+    deserialized_responses::SyncTimelineEvent, executor::spawn, sync::RoomUpdate, Room,
 };
 use ruma::events::{
     receipt::{ReceiptThread, ReceiptType},
     AnySyncTimelineEvent,
 };
 use tokio::sync::{broadcast, mpsc};
-use tracing::{error, info, warn};
+use tracing::{error, info, info_span, trace, warn, Instrument};
 
 #[cfg(feature = "e2e-encryption")]
 use super::to_device::{handle_forwarded_room_key_event, handle_room_key_event};
@@ -40,14 +40,14 @@ use super::{
 #[must_use]
 #[derive(Debug)]
 pub struct TimelineBuilder {
-    room: room::Common,
+    room: Room,
     prev_token: Option<String>,
     events: Vector<SyncTimelineEvent>,
     settings: TimelineInnerSettings,
 }
 
 impl TimelineBuilder {
-    pub(super) fn new(room: &room::Common) -> Self {
+    pub(super) fn new(room: &Room) -> Self {
         Self {
             room: room.clone(),
             prev_token: None,
@@ -57,7 +57,6 @@ impl TimelineBuilder {
     }
 
     /// Add initial events to the timeline.
-    #[cfg(feature = "experimental-sliding-sync")]
     pub(crate) fn events(
         mut self,
         prev_token: Option<String>,
@@ -174,6 +173,7 @@ impl TimelineBuilder {
         let client = room.client();
 
         let start_token = Arc::new(Mutex::new(prev_token));
+        let end_token = Arc::new(Mutex::new(None));
 
         let mut room_update_rx = room.subscribe_to_updates();
         let room_update_join_handle = spawn({
@@ -190,6 +190,8 @@ impl TimelineBuilder {
                             continue;
                         }
                     };
+
+                    trace!("Handling a room update");
 
                     let update_start_token = |prev_batch: &Option<_>| {
                         // Only update start_token if it's not currently locked.
@@ -214,6 +216,27 @@ impl TimelineBuilder {
                             warn!("Room is in invited state, can't build or update its timeline");
                         }
                     }
+                }
+            }
+            .instrument(info_span!("room_update_handler", room_id = ?room.room_id()))
+        });
+
+        let mut ignore_user_list_stream = client.subscribe_to_ignore_user_list_changes();
+        let ignore_user_list_update_join_handle = spawn({
+            let inner = inner.clone();
+            let start_token = start_token.clone();
+            let end_token = end_token.clone();
+            async move {
+                while ignore_user_list_stream.next().await.is_some() {
+                    // Same as `Timeline::reset`, but Timeline is s not clonable
+                    // and we need to avoid circular references
+                    let mut start_lock = start_token.lock().await;
+                    let mut end_lock = end_token.lock().await;
+
+                    *start_lock = None;
+                    *end_lock = None;
+
+                    inner.clear().await;
                 }
             }
         });
@@ -246,12 +269,13 @@ impl TimelineBuilder {
             start_token,
             start_token_condvar: Default::default(),
             back_pagination_status: SharedObservable::new(BackPaginationStatus::Idle),
-            _end_token: Mutex::new(None),
+            _end_token: end_token,
             msg_sender,
             drop_handle: Arc::new(TimelineDropHandle {
                 client,
                 event_handler_handles: handles,
                 room_update_join_handle,
+                ignore_user_list_update_join_handle,
             }),
         };
 
@@ -260,10 +284,6 @@ impl TimelineBuilder {
             // The events we're injecting might be encrypted events, but we might
             // have received the room key to decrypt them while nobody was listening to the
             // `m.room_key` event, let's retry now.
-            //
-            // TODO: We could spawn a task here and put this into the background, though it
-            // might not be worth it depending on the number of events we injected.
-            // Some measuring needs to be done.
             timeline.retry_decryption_for_all_events().await;
         }
 

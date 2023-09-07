@@ -1,14 +1,20 @@
-use std::ops::Not;
+use std::{
+    ops::Not,
+    time::{Duration, Instant},
+};
 
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, FutureExt, StreamExt};
 use imbl::vector;
+use matrix_sdk::Client;
 use matrix_sdk_test::async_test;
 use matrix_sdk_ui::{
     room_list_service::{
-        Error, Input, InputResult, RoomListEntry, RoomListLoadingState, State,
+        filters::{new_filter_all, new_filter_fuzzy_match_room_name},
+        Error, Input, InputResult, RoomListEntry, RoomListLoadingState, State, SyncIndicator,
         ALL_ROOMS_LIST_NAME as ALL_ROOMS, INVITES_LIST_NAME as INVITES,
+        SYNC_INDICATOR_DELAY_BEFORE_HIDING, SYNC_INDICATOR_DELAY_BEFORE_SHOWING,
         VISIBLE_ROOMS_LIST_NAME as VISIBLE_ROOMS,
     },
     timeline::{TimelineItemKind, VirtualTimelineItem},
@@ -17,12 +23,12 @@ use matrix_sdk_ui::{
 use ruma::{
     api::client::sync::sync_events::{v4::RoomSubscription, UnreadNotificationsCount},
     assign, event_id,
-    events::StateEventType,
-    room_id, uint,
+    events::{room::message::RoomMessageEventContent, StateEventType},
+    mxc_uri, room_id, uint, TransactionId,
 };
 use serde_json::json;
 use stream_assert::{assert_next_matches, assert_pending};
-use tokio::task::yield_now;
+use tokio::{spawn, sync::mpsc::channel, task::yield_now};
 use wiremock::MockServer;
 
 use crate::{
@@ -30,11 +36,11 @@ use crate::{
     timeline::sliding_sync::{assert_timeline_stream, timeline_event},
 };
 
-async fn new_room_list_service() -> Result<(MockServer, RoomListService), Error> {
+async fn new_room_list_service() -> Result<(Client, MockServer, RoomListService), Error> {
     let (client, server) = logged_in_client().await;
-    let room_list = RoomListService::new(client).await?;
+    let room_list = RoomListService::new(client.clone()).await?;
 
-    Ok((server, room_list))
+    Ok((client, server, room_list))
 }
 
 // Same macro as in the main, with additional checking that the state
@@ -45,6 +51,7 @@ macro_rules! sync_then_assert_request_and_fake_response {
         $( states = $pre_state:pat => $post_state:pat, )?
         assert request $assert_request:tt { $( $request_json:tt )* },
         respond with = $( ( code $code:expr ) )? { $( $response_json:tt )* }
+        $( , after delay = $response_delay:expr )?
         $(,)?
     ) => {
         sync_then_assert_request_and_fake_response! {
@@ -53,6 +60,7 @@ macro_rules! sync_then_assert_request_and_fake_response {
             $( states = $pre_state => $post_state, )?
             assert request $assert_request { $( $request_json )* },
             respond with = $( ( code $code ) )? { $( $response_json )* },
+            $( after delay = $response_delay, )?
         }
     };
 
@@ -62,6 +70,7 @@ macro_rules! sync_then_assert_request_and_fake_response {
         $( states = $pre_state:pat => $post_state:pat, )?
         assert request $assert_request:tt { $( $request_json:tt )* },
         respond with = $( ( code $code:expr ) )? { $( $response_json:tt )* }
+        $( , after delay = $response_delay:expr )?
         $(,)?
     ) => {
         {
@@ -78,6 +87,7 @@ macro_rules! sync_then_assert_request_and_fake_response {
                 sync matches $sync_result,
                 assert request $assert_request { $( $request_json )* },
                 respond with = $( ( code $code ) )? { $( $response_json )* },
+                $( after delay = $response_delay, )?
             };
 
             $( assert_matches!(state.next().now_or_never(), Some(Some($post_state)), "post state"); )?
@@ -111,17 +121,17 @@ macro_rules! entries {
 
 macro_rules! assert_entries_stream {
     // `append [$entries]`
-    ( @_ [ $stream:ident ] [ append [ $( $entries:tt )+ ] ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+    ( @_ [ $entries:ident ] [ append [ $( $entry:tt )+ ] ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
         assert_entries_stream!(
             @_
-            [ $stream ]
+            [ $entries ]
             [ $( $rest )* ]
             [
                 $( $accumulator )*
                 assert_matches!(
-                    $stream.next().now_or_never(),
-                    Some(Some(VectorDiff::Append { values })) => {
-                        assert_eq!(values, entries!( $( $entries )+ ));
+                    $entries.next(),
+                    Some(&VectorDiff::Append { ref values }) => {
+                        assert_eq!(values, &entries!( $( $entry )+ ));
                     }
                 );
             ]
@@ -129,17 +139,17 @@ macro_rules! assert_entries_stream {
     };
 
     // `set [$nth] [$entry]`
-    ( @_ [ $stream:ident ] [ set [ $index:literal ] [ $( $entry:tt )+ ] ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+    ( @_ [ $entries:ident ] [ set [ $index:literal ] [ $( $entry:tt )+ ] ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
         assert_entries_stream!(
             @_
-            [ $stream ]
+            [ $entries ]
             [ $( $rest )* ]
             [
                 $( $accumulator )*
                 assert_matches!(
-                    $stream.next().now_or_never(),
-                    Some(Some(VectorDiff::Set { index: $index, value })) => {
-                        assert_eq!(value, entries!( $( $entry )+ )[0]);
+                    $entries.next(),
+                    Some(&VectorDiff::Set { index: $index, ref value }) => {
+                        assert_eq!(value, &entries!( $( $entry )+ )[0]);
                     }
                 );
             ]
@@ -147,33 +157,51 @@ macro_rules! assert_entries_stream {
     };
 
     // `remove [$nth]`
-    ( @_ [ $stream:ident ] [ remove [ $index:literal ] ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+    ( @_ [ $entries:ident ] [ remove [ $index:literal ] ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
         assert_entries_stream!(
             @_
-            [ $stream ]
+            [ $entries ]
             [ $( $rest )* ]
             [
                 $( $accumulator )*
                 assert_eq!(
-                    $stream.next().now_or_never(),
-                    Some(Some(VectorDiff::Remove { index: $index })),
+                    $entries.next(),
+                    Some(&VectorDiff::Remove { index: $index }),
                 );
             ]
         )
     };
 
-    // `insert [$nth] [ $entry ]`
-    ( @_ [ $stream:ident ] [ insert [ $index:literal ] [ $( $entry:tt )+ ] ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+    // `insert [$nth] [$entry]`
+    ( @_ [ $entries:ident ] [ insert [ $index:literal ] [ $( $entry:tt )+ ] ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
         assert_entries_stream!(
             @_
-            [ $stream ]
+            [ $entries ]
             [ $( $rest )* ]
             [
                 $( $accumulator )*
                 assert_matches!(
-                    $stream.next().now_or_never(),
-                    Some(Some(VectorDiff::Insert { index: $index, value })) => {
-                        assert_eq!(value, entries!( $( $entry )+ )[0]);
+                    $entries.next(),
+                    Some(&VectorDiff::Insert { index: $index, ref value }) => {
+                        assert_eq!(value, &entries!( $( $entry )+ )[0]);
+                    }
+                );
+            ]
+        )
+    };
+
+    // `reset [$entries]`
+    ( @_ [ $entries:ident ] [ reset [ $( $entry:tt )+ ] ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+        assert_entries_stream!(
+            @_
+            [ $entries ]
+            [ $( $rest )* ]
+            [
+                $( $accumulator )*
+                assert_matches!(
+                    $entries.next(),
+                    Some(&VectorDiff::Reset { ref values }) => {
+                        assert_eq!(values, &entries!( $( $entry )+ ));
                     }
                 );
             ]
@@ -181,30 +209,41 @@ macro_rules! assert_entries_stream {
     };
 
     // `pending`
-    ( @_ [ $stream:ident ] [ pending ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+    ( @_ [ $entries:ident ] [ pending ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
         assert_entries_stream!(
             @_
-            [ $stream ]
+            [ $entries ]
             [ $( $rest )* ]
             [
                 $( $accumulator )*
-                assert_eq!($stream.next().now_or_never(), None);
+                assert_eq!($entries.next(), None);
             ]
         )
     };
 
-    ( @_ [ $stream:ident ] [] [ $( $accumulator:tt )* ] ) => {
+    ( @_ [ $entries:ident ] [] [ $( $accumulator:tt )* ] ) => {
         $( $accumulator )*
     };
 
     ( [ $stream:ident ] $( $all:tt )* ) => {
-        assert_entries_stream!( @_ [ $stream ] [ $( $all )* ] [] )
+        // Wait on Tokio to run all the tasks. Necessary only when testing.
+        yield_now().await;
+
+        let entries = $stream
+            .next()
+            .now_or_never()
+            .expect("stream entry wasn't in the ready state")
+            .expect("stream was stopped");
+
+        let mut entries = entries.iter();
+
+        assert_entries_stream!( @_ [ entries ] [ $( $all )* ] [] )
     };
 }
 
 #[async_test]
 async fn test_sync_all_states() -> Result<(), Error> {
-    let (server, room_list) = new_room_list_service().await?;
+    let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
     pin_mut!(sync);
@@ -216,9 +255,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
             "conn_id": "room-list",
             "lists": {
                 ALL_ROOMS: {
-                    "ranges": [
-                        [0, 19],
-                    ],
+                    "ranges": [[0, 19]],
                     "required_state": [
                         ["m.room.avatar", ""],
                         ["m.room.encryption", ""],
@@ -237,10 +274,30 @@ async fn test_sync_all_states() -> Result<(), Error> {
                     "sort": ["by_recency", "by_name"],
                     "timeline_limit": 1,
                 },
+                INVITES: {
+                    "ranges": [[0, 0]],
+                    "required_state": [
+                        ["m.room.avatar", ""],
+                        ["m.room.encryption", ""],
+                        ["m.room.member", "$ME"],
+                        ["m.room.canonical_alias", ""],
+                    ],
+                    "filters": {
+                        "is_invite": true,
+                        "is_tombstoned": false,
+                        "not_room_types": ["m.space"],
+                    },
+                    "sort": ["by_recency", "by_name"],
+                    "timeline_limit": 0,
+                },
             },
             "extensions": {
                 "account_data": {
                     "enabled": true
+                },
+                "receipts": {
+                    "enabled": true,
+                    "rooms": ["*"]
                 }
             },
         },
@@ -248,10 +305,14 @@ async fn test_sync_all_states() -> Result<(), Error> {
             "pos": "0",
             "lists": {
                 ALL_ROOMS: {
-                    "count": 1000,
+                    "count": 420,
                     "ops": [
                         // let's ignore them for now
                     ],
+                },
+                INVITES: {
+                    "count": 40,
+                    "ops": [],
                 },
             },
             "rooms": {
@@ -268,14 +329,13 @@ async fn test_sync_all_states() -> Result<(), Error> {
             "conn_id": "room-list",
             "lists": {
                 ALL_ROOMS: {
-                    "ranges": [
-                        [0, 199],
-                    ],
+                    "ranges": [[0, 99]],
                 },
                 VISIBLE_ROOMS: {
                     "ranges": [[0, 19]],
                     "required_state": [
                         ["m.room.encryption", ""],
+                        ["m.room.member", "$LAZY"],
                     ],
                     "filters": {
                         "is_invite": false,
@@ -291,20 +351,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
                     "timeline_limit": 20,
                 },
                 INVITES: {
-                    "ranges": [[0, 99]],
-                    "required_state": [
-                        ["m.room.avatar", ""],
-                        ["m.room.encryption", ""],
-                        ["m.room.member", "$ME"],
-                        ["m.room.canonical_alias", ""],
-                    ],
-                    "filters": {
-                        "is_invite": true,
-                        "is_tombstoned": false,
-                        "not_room_types": ["m.space"],
-                    },
-                    "sort": ["by_recency", "by_name"],
-                    "timeline_limit": 0,
+                    "ranges": [[0, 19]],
                 },
             },
         },
@@ -312,7 +359,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
             "pos": "1",
             "lists": {
                 ALL_ROOMS: {
-                    "count": 1000,
+                    "count": 420,
                     "ops": [
                         // let's ignore them for now
                     ],
@@ -339,7 +386,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
             "conn_id": "room-list",
             "lists": {
                 ALL_ROOMS: {
-                    "ranges": [[0, 399]],
+                    "ranges": [[0, 199]],
                 },
                 VISIBLE_ROOMS: {
                     "ranges": [[0, 19]],
@@ -353,7 +400,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
             "pos": "2",
             "lists": {
                 ALL_ROOMS: {
-                    "count": 1000,
+                    "count": 420,
                     "ops": [
                         // let's ignore them for now
                     ],
@@ -380,7 +427,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
             "conn_id": "room-list",
             "lists": {
                 ALL_ROOMS: {
-                    "ranges": [[0, 599]],
+                    "ranges": [[0, 299]],
                 },
                 VISIBLE_ROOMS: {
                     "ranges": [[0, 19]],
@@ -391,10 +438,10 @@ async fn test_sync_all_states() -> Result<(), Error> {
             },
         },
         respond with = {
-            "pos": "2",
+            "pos": "3",
             "lists": {
                 ALL_ROOMS: {
-                    "count": 1000,
+                    "count": 420,
                     "ops": [
                         // let's ignore them for now
                     ],
@@ -421,7 +468,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
             "conn_id": "room-list",
             "lists": {
                 ALL_ROOMS: {
-                    "ranges": [[0, 799]],
+                    "ranges": [[0, 399]],
                 },
                 VISIBLE_ROOMS: {
                     "ranges": [[0, 19]],
@@ -432,10 +479,10 @@ async fn test_sync_all_states() -> Result<(), Error> {
             },
         },
         respond with = {
-            "pos": "2",
+            "pos": "4",
             "lists": {
                 ALL_ROOMS: {
-                    "count": 1000,
+                    "count": 420,
                     "ops": [
                         // let's ignore them for now
                     ],
@@ -460,7 +507,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
 
 #[async_test]
 async fn test_sync_resumes_from_previous_state() -> Result<(), Error> {
-    let (server, room_list) = new_room_list_service().await?;
+    let (_, server, room_list) = new_room_list_service().await?;
 
     // Start a sync, and drop it at the end of the block.
     {
@@ -507,7 +554,7 @@ async fn test_sync_resumes_from_previous_state() -> Result<(), Error> {
                         "ranges": [[0, 19]],
                     },
                     INVITES: {
-                        "ranges": [[0, 99]],
+                        "ranges": [[0, 19]],
                     },
                 },
             },
@@ -579,12 +626,11 @@ async fn test_sync_resumes_from_previous_state() -> Result<(), Error> {
 
 #[async_test]
 async fn test_sync_resumes_from_error() -> Result<(), Error> {
-    let (server, room_list) = new_room_list_service().await?;
+    let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
     pin_mut!(sync);
 
-    // Simulate an error from the `Init` state.
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
         sync matches Some(Err(_)),
@@ -595,6 +641,10 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                     // The default range, in selective sync-mode.
                     "ranges": [[0, 19]],
                 },
+                INVITES: {
+                    // The default range, in selective sync-mode.
+                    "ranges": [[0, 0]],
+                },
             },
         },
         respond with = (code 400) {
@@ -610,7 +660,6 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
     let sync = room_list.sync();
     pin_mut!(sync);
 
-    // Do a regular sync from the `Error` state.
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
         states = Error { .. } => SettingUp,
@@ -620,20 +669,23 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                     // Still the default range, in selective sync-mode.
                     "ranges": [[0, 19]],
                 },
+                INVITES: {
+                    // Stil the default range, in selective sync-mode.
+                    "ranges": [[0, 0]],
+                },
             },
         },
         respond with = {
             "pos": "1",
             "lists": {
                 ALL_ROOMS: {
-                    "count": 410,
+                    "count": 210,
                 },
             },
             "rooms": {},
         },
     };
 
-    // Simulate an error from the `SettingUp` state.
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
         sync matches Some(Err(_)),
@@ -641,17 +693,17 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
-                    // In `SettingUp`, the sync-mode has changed to growing, with
-                    // its initial range.
-                    "ranges": [[0, 199]],
+                    // The sync-mode has changed to growing, with its initial range.
+                    "ranges": [[0, 99]],
                 },
                 VISIBLE_ROOMS: {
                     // Hello new list.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 20,
                 },
                 INVITES: {
-                    // Hello new list.
-                    "ranges": [[0, 99]],
+                    // The sync-mode has changed to growing, with its initial range.
+                    "ranges": [[0, 19]],
                 },
             },
         },
@@ -671,24 +723,24 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
     // Update the viewport, just to be sure it's not reset later.
     assert_eq!(room_list.apply_input(Input::Viewport(vec![5..=10])).await?, InputResult::Applied);
 
-    // Do a regular sync from the `Error` state.
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Error { .. } => Running,
+        states = Error { .. } => Recovering,
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
-                    // In `Running`, the sync-mode is still growing, but the range
-                    // hasn't been modified due to previous error.
-                    "ranges": [[0, 199]],
+                    // Due to previous error, the sync-mode is back to selective, with its initial range.
+                    "ranges": [[0, 19]],
                 },
                 VISIBLE_ROOMS: {
                     // We have set a viewport, which reflects here.
                     "ranges": [[5, 10]],
+                    // The `timeline_limit` has been set to zero.
+                    "timeline_limit": 0,
                 },
                 INVITES: {
-                    // The range hasn't been modified due to previous error.
-                    "ranges": [[0, 99]],
+                    // Due to previous error, the sync-mode is back to selective, with its initial range.
+                    "ranges": [[0, 0]],
                 },
             },
         },
@@ -696,17 +748,51 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
             "pos": "2",
             "lists": {
                 ALL_ROOMS: {
-                    "count": 410,
+                    "count": 210,
                 },
                 INVITES: {
-                    "count": 3,
+                    "count": 30,
                 }
             },
             "rooms": {},
         },
     };
 
-    // Simulate an error from the `Running` state.
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        states = Recovering => Running,
+        assert request >= {
+            "lists": {
+                ALL_ROOMS: {
+                    // Sync-mode is now growing.
+                    "ranges": [[0, 99]],
+                },
+                VISIBLE_ROOMS: {
+                    // Viewport hasn't changed.
+                    "ranges": [[5, 10]],
+                    // The `timeline_limit` has been restored.
+                    "timeline_limit": 20,
+                },
+                INVITES: {
+                    // Sync-mode is now growing.
+                    "ranges": [[0, 19]],
+                },
+            },
+        },
+        respond with = {
+            "pos": "3",
+            "lists": {
+                ALL_ROOMS: {
+                    "count": 210,
+                },
+                INVITES: {
+                    "count": 30,
+                }
+            },
+            "rooms": {},
+        },
+    };
+
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
         sync matches Some(Err(_)),
@@ -714,17 +800,17 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
-                    // In `Running`, the sync-mode is still growing, and the range
-                    // has made progress.
-                    "ranges": [[0, 399]],
+                    // The sync-mode is still growing, and the range has made progress.
+                    "ranges": [[0, 199]],
                 },
                 VISIBLE_ROOMS: {
-                    // Despites the error, the range is kept.
+                    // The range is kept.
                     "ranges": [[5, 10]],
+                    // `timeline_limit` is a sticky parameter, so it's absent now.
                 },
                 INVITES: {
-                    // Despites the error, the range has made progress.
-                    "ranges": [[0, 2]],
+                    // The sync-mode is still growing, and the range has made progress.
+                    "ranges": [[0, 29]],
                 },
             },
         },
@@ -741,57 +827,23 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
     let sync = room_list.sync();
     pin_mut!(sync);
 
-    // Do a regular sync from the `Error` state.
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Error { .. } => Running,
+        states = Error { .. } => Recovering,
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
-                    // Due to the error, the range is reset to its initial value.
-                    "ranges": [[0, 199]],
+                    // Due to previous error, the sync-mode is back to selective, with its initial range.
+                    "ranges": [[0, 19]],
                 },
                 VISIBLE_ROOMS: {
-                    // Despites the error, the range is kept.
+                    // We have set a viewport, which reflects here.
                     "ranges": [[5, 10]],
+                    // The `timeline_limit` has been set to 0.
+                    "timeline_limit": 0,
                 },
                 INVITES: {
-                    // Despites the error, the range is kept.
-                    "ranges": [[0, 2]],
-                }
-            },
-        },
-        respond with = {
-            "pos": "3",
-            "lists": {
-                ALL_ROOMS: {
-                    "count": 410,
-                },
-                INVITES: {
-                    "count": 0,
-                },
-            },
-            "rooms": {},
-        },
-    };
-
-    // Do a regular sync from the `Running` state to update the `ALL_ROOMS` list
-    // again.
-    sync_then_assert_request_and_fake_response! {
-        [server, room_list, sync]
-        states = Running => Running,
-        assert request >= {
-            "lists": {
-                ALL_ROOMS: {
-                    // No error. The range is making progress.
-                    "ranges": [[0, 399]],
-                },
-                VISIBLE_ROOMS: {
-                    // No error. The range is still here.
-                    "ranges": [[5, 10]],
-                },
-                INVITES: {
-                    // The range is making progress.
+                    // Due to previous error, the range has been reset.
                     "ranges": [[0, 0]],
                 },
             },
@@ -800,14 +852,85 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
             "pos": "4",
             "lists": {
                 ALL_ROOMS: {
-                    "count": 410,
+                    "count": 210,
                 },
+                INVITES: {
+                    "count": 4,
+                }
             },
             "rooms": {},
         },
     };
 
-    // Simulate an error from the `Running` state.
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        states = Recovering => Running,
+        assert request >= {
+            "lists": {
+                ALL_ROOMS: {
+                    // The sync-mode is now growing.
+                    "ranges": [[0, 99]],
+                },
+                VISIBLE_ROOMS: {
+                    // Viewport hasn't changed.
+                    "ranges": [[5, 10]],
+                    // The `timeline_limit` has been restored.
+                    "timeline_limit": 20,
+                },
+                INVITES: {
+                    // The sync-mode is now growing, and has reached its maximum.
+                    "ranges": [[0, 3]],
+                },
+            },
+        },
+        respond with = {
+            "pos": "5",
+            "lists": {
+                ALL_ROOMS: {
+                    "count": 210,
+                },
+                INVITES: {
+                    "count": 4,
+                }
+            },
+            "rooms": {},
+        },
+    };
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        states = Running => Running,
+        assert request >= {
+            "lists": {
+                ALL_ROOMS: {
+                    // No error. The range is making progress.
+                    "ranges": [[0, 199]],
+                },
+                VISIBLE_ROOMS: {
+                    // No error. The range is still here.
+                    "ranges": [[5, 10]],
+                    // `timeline_limit` is a sticky parameter, so it's absent now.
+                },
+                INVITES: {
+                    // The range has reached its maximum.
+                    "ranges": [[0, 3]],
+                },
+            },
+        },
+        respond with = {
+            "pos": "6",
+            "lists": {
+                ALL_ROOMS: {
+                    "count": 210,
+                },
+                INVITES: {
+                    "count": 7,
+                }
+            },
+            "rooms": {},
+        },
+    };
+
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
         sync matches Some(Err(_)),
@@ -817,15 +940,16 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Range is making progress and is even reaching the maximum
                     // number of rooms.
-                    "ranges": [[0, 409]],
+                    "ranges": [[0, 209]],
                 },
                 VISIBLE_ROOMS: {
                     // The range is still here.
                     "ranges": [[5, 10]],
+                    // `timeline_limit` is a sticky parameter, so it's absent now.
                 },
                 INVITES: {
-                    // The range is kept as it was.
-                    "ranges": [[0, 0]],
+                    // The range has reached a new maximum.
+                    "ranges": [[0, 6]],
                 },
             },
         },
@@ -842,45 +966,84 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
     let sync = room_list.sync();
     pin_mut!(sync);
 
-    // Do a regular sync from the `Error` state.
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Error { .. } => Running,
+        states = Error { .. } => Recovering,
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
-                    // An error was received at the previous sync iteration.
-                    // The list is still in growing sync-mode, but its range has
-                    // been reset.
-                    "ranges": [[0, 199]],
+                    // Due to previous error, the sync-mode is back to selective, with its initial range.
+                    "ranges": [[0, 19]],
                 },
                 VISIBLE_ROOMS: {
-                    // The range is still here.
+                    // We have set a viewport, which reflects here.
                     "ranges": [[5, 10]],
+                    // The `timeline_limit` has been set to 0.
+                    "timeline_limit": 0,
                 },
                 INVITES: {
-                    // The range is kept as it was.
+                    // Due to previous error, the range is back to selective, with its initial range.
                     "ranges": [[0, 0]],
                 },
             },
         },
         respond with = {
-            "pos": "5",
+            "pos": "7",
             "lists": {
                 ALL_ROOMS: {
-                    "count": 410,
+                    "count": 210,
                 },
+                INVITES: {
+                    "count": 4,
+                }
             },
             "rooms": {},
         },
     };
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        states = Recovering => Running,
+        assert request >= {
+            "lists": {
+                ALL_ROOMS: {
+                    // Sync-mode is now growing.
+                    "ranges": [[0, 99]],
+                },
+                VISIBLE_ROOMS: {
+                    // Viewport hasn't changed.
+                    "ranges": [[5, 10]],
+                    // The `timeline_limit` has been restored.
+                    "timeline_limit": 20,
+                },
+                INVITES: {
+                    // Sync-mode is now growing, and has reached its maximum.
+                    "ranges": [[0, 3]],
+                },
+            },
+        },
+        respond with = {
+            "pos": "8",
+            "lists": {
+                ALL_ROOMS: {
+                    "count": 210,
+                },
+                INVITES: {
+                    "count": 4,
+                }
+            },
+            "rooms": {},
+        },
+    };
+
+    // etc.
 
     Ok(())
 }
 
 #[async_test]
 async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
-    let (server, room_list) = new_room_list_service().await?;
+    let (_, server, room_list) = new_room_list_service().await?;
 
     // Let's stop the sync before actually syncing (we never know!).
     // We get an error, obviously.
@@ -889,7 +1052,6 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
     let sync = room_list.sync();
     pin_mut!(sync);
 
-    // Do a first sync.
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
         states = Init => SettingUp,
@@ -899,13 +1061,17 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
                     // The default range, in selective sync-mode.
                     "ranges": [[0, 19]],
                 },
+                INVITES: {
+                    // The default range, in selective sync-mode.
+                    "ranges": [[0, 0]],
+                }
             },
         },
         respond with = {
-            "pos": "1",
+            "pos": "0",
             "lists": {
                 ALL_ROOMS: {
-                    "count": 1000,
+                    "count": 150,
                 },
             },
             "rooms": {},
@@ -920,24 +1086,59 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
     let sync = room_list.sync();
     pin_mut!(sync);
 
-    // Do a regular sync from the `Terminated` state.
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Terminated { .. } => Running,
+        states = Terminated { .. } => Recovering,
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
-                    // In `SettingUp`, the sync-mode has changed to growing, with
-                    // its initial range.
-                    "ranges": [[0, 199]],
+                    // The sync-mode is still selective, with its initial range.
+                    "ranges": [[0, 19]],
                 },
                 VISIBLE_ROOMS: {
                     // Hello new list.
                     "ranges": [[0, 19]],
+                    // `timeline_limit` has been set to zero.
+                    "timeline_limit": 0,
                 },
                 INVITES: {
-                    // Hello new list.
+                    // The sync-mode is still selective, with its initial range.
+                    "ranges": [[0, 0]],
+                },
+            },
+        },
+        respond with = {
+            "pos": "1",
+            "lists": {
+                ALL_ROOMS: {
+                    "count": 150,
+                },
+                INVITES: {
+                    "count": 30,
+                },
+            },
+            "rooms": {},
+        },
+    };
+
+    // Do a regular sync from the `Recovering` state.
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        states = Recovering => Running,
+        assert request >= {
+            "lists": {
+                ALL_ROOMS: {
+                    // The sync-mode is now growing, with its initial range.
                     "ranges": [[0, 99]],
+                },
+                VISIBLE_ROOMS: {
+                    "ranges": [[0, 19]],
+                    // `timeline_limit` has been restored.
+                    "timeline_limit": 20,
+                },
+                INVITES: {
+                    // The sync-mode is now growing, with its initial range.
+                    "ranges": [[0, 19]],
                 },
             },
         },
@@ -945,8 +1146,11 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
             "pos": "2",
             "lists": {
                 ALL_ROOMS: {
-                    "count": 1000,
+                    "count": 150,
                 },
+                INVITES: {
+                    "count": 3,
+                }
             },
             "rooms": {},
         },
@@ -966,64 +1170,22 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
     // Do a regular sync from the `Terminated` state.
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Terminated { .. } => Running,
+        states = Terminated { .. } => Recovering,
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
-                    // In `Running`, the sync-mode is still growing, the previous termination
-                    // didn't restart the whole growing.
-                    "ranges": [[0, 399]],
+                    // The sync-mode is back to selective.
+                    "ranges": [[0, 19]],
                 },
                 VISIBLE_ROOMS: {
                     // We have set a viewport, which reflects here.
                     "ranges": [[5, 10]],
+                    // `timeline_limit` has been set to zero.
+                    "timeline_limit": 0,
                 },
                 INVITES: {
-                    // The range hasn't been modified due to previous termination.
-                    "ranges": [[0, 99]],
-                },
-            },
-        },
-        respond with = {
-            "pos": "2",
-            "lists": {
-                ALL_ROOMS: {
-                    "count": 1000,
-                },
-                INVITES: {
-                    "count": 3,
-                }
-            },
-            "rooms": {},
-        },
-    };
-
-    // Stop the sync.
-    room_list.stop_sync()?;
-    assert!(sync.next().await.is_none());
-
-    // Start a new sync.
-    let sync = room_list.sync();
-    pin_mut!(sync);
-
-    // Do a regular sync from the `Terminated` state.
-    sync_then_assert_request_and_fake_response! {
-        [server, room_list, sync]
-        states = Terminated { .. } => Running,
-        assert request >= {
-            "lists": {
-                ALL_ROOMS: {
-                    // In `Running`, the sync-mode is still growing, the previous termination
-                    // didn't restart the whole growing.
-                    "ranges": [[0, 599]],
-                },
-                VISIBLE_ROOMS: {
-                    // Despites the termination, the range is kept.
-                    "ranges": [[5, 10]],
-                },
-                INVITES: {
-                    // Despites the error, the range has made progress.
-                    "ranges": [[0, 2]],
+                    // The sync-mode is back to selective..
+                    "ranges": [[0, 0]],
                 },
             },
         },
@@ -1031,34 +1193,35 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
             "pos": "3",
             "lists": {
                 ALL_ROOMS: {
-                    "count": 1000,
+                    "count": 150,
                 },
                 INVITES: {
-                    "count": 0,
+                    "count": 4,
                 }
             },
             "rooms": {},
         },
     };
 
-    // Do a regular sync from the `Running` state to update the `ALL_ROOMS` list
-    // again.
+    // Do a regular sync from the `Recovering` state.
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Running => Running,
+        states = Recovering => Running,
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
-                    // No termination.
-                    "ranges": [[0, 799]],
+                    // Sync-mode is growing, with its initial range.
+                    "ranges": [[0, 99]],
                 },
                 VISIBLE_ROOMS: {
-                    // No termination. The range is still here.
+                    // We have set a viewport, which reflects here.
                     "ranges": [[5, 10]],
+                    // `timeline_limit` has been restored.
+                    "timeline_limit": 20,
                 },
                 INVITES: {
-                    // The range is making progress.
-                    "ranges": [[0, 0]],
+                    // Sync-mode is growing, and has reached its maximum.
+                    "ranges": [[0, 3]],
                 },
             },
         },
@@ -1066,39 +1229,34 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
             "pos": "4",
             "lists": {
                 ALL_ROOMS: {
-                    "count": 1000,
+                    "count": 150,
                 },
+                INVITES: {
+                    "count": 4,
+                }
             },
             "rooms": {},
         },
     };
 
-    // Stop the sync.
-    room_list.stop_sync()?;
-    assert!(sync.next().await.is_none());
-
-    // Start a new sync.
-    let sync = room_list.sync();
-    pin_mut!(sync);
-
-    // Do a regular sync from the `Terminated` state.
+    // Do a regular sync from the `Running` state.
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Terminated { .. } => Running,
+        states = Running => Running,
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
-                    // The termination doesn't invalidate the range, we're still in the stable
-                    // state.
-                    "ranges": [[0, 999]],
+                    // Range is making progress, and has reached its maximum.
+                    "ranges": [[0, 149]],
                 },
                 VISIBLE_ROOMS: {
-                    // The range is still here.
+                    // We have set a viewport, which reflects here.
                     "ranges": [[5, 10]],
+                    // `timeline_limit` is a sticky parameter, so it's absent now.
                 },
                 INVITES: {
-                    // The range is kept as it was.
-                    "ranges": [[0, 0]],
+                    // Range has reached its maximum.
+                    "ranges": [[0, 3]],
                 },
             },
         },
@@ -1106,8 +1264,11 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
             "pos": "5",
             "lists": {
                 ALL_ROOMS: {
-                    "count": 1000,
+                    "count": 150,
                 },
+                INVITES: {
+                    "count": 4,
+                }
             },
             "rooms": {},
         },
@@ -1118,7 +1279,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
 
 #[async_test]
 async fn test_loading_states() -> Result<(), Error> {
-    let (server, room_list) = new_room_list_service().await?;
+    let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
     pin_mut!(sync);
@@ -1151,7 +1312,7 @@ async fn test_loading_states() -> Result<(), Error> {
         },
     };
 
-    // Wait on Tokio to run all the tasks. It won't happen in the main app.
+    // Wait on Tokio to run all the tasks. Necessary only when testing.
     yield_now().await;
 
     // There is a loading state update, it's loaded now!
@@ -1183,7 +1344,7 @@ async fn test_loading_states() -> Result<(), Error> {
         },
     };
 
-    // Wait on Tokio to run all the tasks. It won't happen in the main app.
+    // Wait on Tokio to run all the tasks. Necessary only when testing.
     yield_now().await;
 
     // There is a loading state update because the number of rooms has been updated.
@@ -1215,7 +1376,7 @@ async fn test_loading_states() -> Result<(), Error> {
         },
     };
 
-    // Wait on Tokio to run all the tasks. It won't happen in the main app.
+    // Wait on Tokio to run all the tasks. Necessary only when testing.
     yield_now().await;
 
     // No loading state update.
@@ -1226,7 +1387,7 @@ async fn test_loading_states() -> Result<(), Error> {
 
 #[async_test]
 async fn test_entries_stream() -> Result<(), Error> {
-    let (server, room_list) = new_room_list_service().await?;
+    let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
     pin_mut!(sync);
@@ -1306,7 +1467,7 @@ async fn test_entries_stream() -> Result<(), Error> {
                     "ranges": [[0, 19]],
                 },
                 INVITES: {
-                    "ranges": [[0, 99]],
+                    "ranges": [[0, 19]],
                 },
             },
         },
@@ -1360,8 +1521,8 @@ async fn test_entries_stream() -> Result<(), Error> {
 }
 
 #[async_test]
-async fn test_entries_stream_with_updated_filter() -> Result<(), Error> {
-    let (server, room_list) = new_room_list_service().await?;
+async fn test_entries_stream_with_filters() -> Result<(), Error> {
+    let (client, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
     pin_mut!(sync);
@@ -1399,7 +1560,7 @@ async fn test_entries_stream_with_updated_filter() -> Result<(), Error> {
             },
             "rooms": {
                 "!r0:bar.org": {
-                    "name": "Room #0",
+                    "name": "Matrix Foobar",
                     "initial": true,
                     "timeline": [],
                 },
@@ -1415,13 +1576,32 @@ async fn test_entries_stream_with_updated_filter() -> Result<(), Error> {
         pending;
     };
 
-    let (previous_entries, entries_stream) = all_rooms.entries_filtered(|room_list_entry| {
-        matches!(
-            room_list_entry.as_room_id(),
-            Some(room_id) if room_id.server_name() == "bar.org"
-        )
-    });
-    pin_mut!(entries_stream);
+    // 1. Test with a static filter.
+    let (previous_entries_static_filter, entries_stream_static_filter) =
+        all_rooms.entries_with_static_filter(new_filter_fuzzy_match_room_name(&client, "mat ba"));
+    pin_mut!(entries_stream_static_filter);
+
+    // 2. Test with a dynamic filter.
+    let (entries_stream_dynamic_filter, dynamic_filter) = all_rooms.entries_with_dynamic_filter();
+    pin_mut!(entries_stream_dynamic_filter);
+
+    // Assert the static filter.
+    assert_eq!(previous_entries_static_filter, entries![F("!r0:bar.org")]);
+
+    // Ensure the dynamic filter stream is pending because there is no filter set
+    // yet.
+    assert_pending!(entries_stream_dynamic_filter);
+
+    // Now, let's define a filter.
+    dynamic_filter.set(new_filter_fuzzy_match_room_name(&client, "mat ba"));
+
+    // Assert the dynamic filter.
+    assert_entries_stream! {
+        [entries_stream_dynamic_filter]
+        // Receive a `reset` because the filter has been reset/set for the first time.
+        reset [ F("!r0:bar.org") ];
+        pending;
+    };
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -1435,7 +1615,7 @@ async fn test_entries_stream_with_updated_filter() -> Result<(), Error> {
                     "ranges": [[0, 19]],
                 },
                 INVITES: {
-                    "ranges": [[0, 99]],
+                    "ranges": [[0, 19]],
                 },
             },
         },
@@ -1450,8 +1630,8 @@ async fn test_entries_stream_with_updated_filter() -> Result<(), Error> {
                             "range": [1, 4],
                             "room_ids": [
                                 "!r1:bar.org",
-                                "!r2:qux.org",
-                                "!r3:qux.org",
+                                "!r2:bar.org",
+                                "!r3:bar.org",
                                 "!r4:bar.org",
                             ],
                         },
@@ -1466,22 +1646,22 @@ async fn test_entries_stream_with_updated_filter() -> Result<(), Error> {
             },
             "rooms": {
                 "!r1:bar.org": {
-                    "name": "Room #1",
+                    "name": "Matrix Bar",
                     "initial": true,
                     "timeline": [],
                 },
-                "!r2:qux.org": {
-                    "name": "Room #2",
+                "!r2:bar.org": {
+                    "name": "Hello",
                     "initial": true,
                     "timeline": [],
                 },
-                "!r3:qux.org": {
-                    "name": "Room #3",
+                "!r3:bar.org": {
+                    "name": "Helios live",
                     "initial": true,
                     "timeline": [],
                 },
                 "!r4:bar.org": {
-                    "name": "Room #4",
+                    "name": "Matrix Baz",
                     "initial": true,
                     "timeline": [],
                 },
@@ -1489,11 +1669,126 @@ async fn test_entries_stream_with_updated_filter() -> Result<(), Error> {
         },
     };
 
-    assert_eq!(previous_entries, entries![F("!r0:bar.org")]);
+    // Assert the static filter.
     assert_entries_stream! {
-        [entries_stream]
+        [entries_stream_static_filter]
         insert[1] [ F("!r1:bar.org") ];
         insert[2] [ F("!r4:bar.org") ];
+        pending;
+    };
+
+    // Assert the dynamic filter.
+    assert_entries_stream! {
+        [entries_stream_dynamic_filter]
+        insert[1] [ F("!r1:bar.org") ];
+        insert[2] [ F("!r4:bar.org") ];
+        pending;
+    };
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        states = Running => Running,
+        assert request >= {
+            "lists": {
+                ALL_ROOMS: {
+                    "ranges": [[0, 9]],
+                },
+                VISIBLE_ROOMS: {
+                    "ranges": [[0, 19]],
+                },
+                INVITES: {
+                    "ranges": [[0, 0]],
+                },
+            },
+        },
+        respond with = {
+            "pos": "2",
+            "lists": {
+                ALL_ROOMS: {
+                    "count": 10,
+                    "ops": [
+                        {
+                            "op": "SYNC",
+                            "range": [5, 7],
+                            "room_ids": [
+                                "!r5:bar.org",
+                                "!r6:bar.org",
+                                "!r7:bar.org",
+                            ],
+                        },
+                    ],
+                },
+                VISIBLE_ROOMS: {
+                    "count": 0,
+                },
+                INVITES: {
+                    "count": 0,
+                },
+            },
+            "rooms": {
+                "!r5:bar.org": {
+                    "name": "Matrix Barracuda Room",
+                    "initial": true,
+                    "timeline": [],
+                },
+                "!r6:bar.org": {
+                    "name": "Matrix is real as hell",
+                    "initial": true,
+                    "timeline": [],
+                },
+                "!r7:bar.org": {
+                    "name": "Matrix Baraka",
+                    "initial": true,
+                    "timeline": [],
+                },
+            },
+        },
+    };
+
+    // Assert the static filter.
+    assert_entries_stream! {
+        [entries_stream_static_filter]
+        insert[3] [ F("!r5:bar.org") ];
+        insert[4] [ F("!r7:bar.org") ];
+        pending;
+    };
+
+    // Assert the dynamic filter.
+    assert_entries_stream! {
+        [entries_stream_dynamic_filter]
+        insert[3] [ F("!r5:bar.org") ];
+        insert[4] [ F("!r7:bar.org") ];
+        pending;
+    };
+
+    // Now, let's change the dynamic filter!
+    dynamic_filter.set(new_filter_fuzzy_match_room_name(&client, "hell"));
+
+    // Assert the dynamic filter.
+    assert_entries_stream! {
+        [entries_stream_dynamic_filter]
+        // Receive a `reset` again because the filter has been reset.
+        reset [ F("!r2:bar.org"), F("!r3:bar.org"), F("!r6:bar.org") ];
+        pending;
+    };
+
+    // Now, let's change again the dynamic filter!
+    dynamic_filter.set(new_filter_all());
+
+    // Assert the dynamic filter.
+    assert_entries_stream! {
+        [entries_stream_dynamic_filter]
+        // Receive a `reset` again because the filter has been reset.
+        reset [
+            F("!r0:bar.org"),
+            F("!r1:bar.org"),
+            F("!r2:bar.org"),
+            F("!r3:bar.org"),
+            F("!r4:bar.org"),
+            F("!r5:bar.org"),
+            F("!r6:bar.org"),
+            F("!r7:bar.org"),
+        ];
         pending;
     };
 
@@ -1502,13 +1797,15 @@ async fn test_entries_stream_with_updated_filter() -> Result<(), Error> {
 
 #[async_test]
 async fn test_invites_stream() -> Result<(), Error> {
-    let (server, room_list) = new_room_list_service().await?;
+    let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
     pin_mut!(sync);
 
-    // The invites aren't accessible yet.
-    assert!(room_list.invites().await.is_err());
+    // The invites is accessible from the beginning.
+    assert!(room_list.invites().await.is_ok());
+
+    let room_id_0 = room_id!("!r0:bar.org");
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -1518,47 +1815,15 @@ async fn test_invites_stream() -> Result<(), Error> {
                 ALL_ROOMS: {
                     "ranges": [[0, 19]],
                 },
+                INVITES: {
+                    "ranges": [[0, 0]],
+                },
             },
         },
         respond with = {
             "pos": "0",
             "lists": {
                 ALL_ROOMS: {
-                    "count": 0,
-                },
-            },
-            "rooms": {},
-        },
-    };
-
-    // The invites aren't accessible yet.
-    assert!(room_list.invites().await.is_err());
-
-    let room_id_0 = room_id!("!r0:bar.org");
-
-    sync_then_assert_request_and_fake_response! {
-        [server, room_list, sync]
-        states = SettingUp => Running,
-        assert request >= {
-            "lists": {
-                ALL_ROOMS: {
-                    "ranges": [[0, 0]],
-                },
-                VISIBLE_ROOMS: {
-                    "ranges": [[0, 19]],
-                },
-                INVITES: {
-                    "ranges": [[0, 99]],
-                },
-            },
-        },
-        respond with = {
-            "pos": "1",
-            "lists": {
-                ALL_ROOMS: {
-                    "count": 0,
-                },
-                VISIBLE_ROOMS: {
                     "count": 0,
                 },
                 INVITES: {
@@ -1572,7 +1837,7 @@ async fn test_invites_stream() -> Result<(), Error> {
                             ],
                         },
                     ],
-                },
+                }
             },
             "rooms": {
                 room_id_0: {
@@ -1593,14 +1858,9 @@ async fn test_invites_stream() -> Result<(), Error> {
         assert_eq!(room_id, room_id_0);
     });
 
-    assert_entries_stream! {
-        [invites_stream]
-        pending;
-    };
-
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Running => Running,
+        states = SettingUp => Running,
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -1660,7 +1920,7 @@ async fn test_invites_stream() -> Result<(), Error> {
 
 #[async_test]
 async fn test_room() -> Result<(), Error> {
-    let (server, room_list) = new_room_list_service().await?;
+    let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
     pin_mut!(sync);
@@ -1691,6 +1951,7 @@ async fn test_room() -> Result<(), Error> {
             "rooms": {
                 room_id_0: {
                     "name": "Room #0",
+                    "avatar": "mxc://homeserver/media",
                     "initial": true,
                 },
                 room_id_1: {
@@ -1700,13 +1961,22 @@ async fn test_room() -> Result<(), Error> {
         },
     };
 
-    // Room has received a name from sliding sync.
     let room0 = room_list.room(room_id_0).await?;
+
+    // Room has received a name from sliding sync.
     assert_eq!(room0.name().await, Some("Room #0".to_owned()));
 
-    // Room has not received a name from sliding sync, then it's calculated.
+    // Room has received an avatar from sliding sync.
+    assert_eq!(room0.avatar_url(), Some(mxc_uri!("mxc://homeserver/media").to_owned()));
+
     let room1 = room_list.room(room_id_1).await?;
+
+    // Room has not received a name from sliding sync, then it's calculated.
     assert_eq!(room1.name().await, Some("Empty Room".to_owned()));
+
+    // Room has not received an avatar from sliding sync, then it's calculated, but
+    // there is nothing to calculate from, so there is no URL.
+    assert_eq!(room1.avatar_url(), None);
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -1730,6 +2000,7 @@ async fn test_room() -> Result<(), Error> {
             "rooms": {
                 room_id_1: {
                     "name": "Room #1",
+                    "avatar": "mxc://homeserver/other-media",
                 },
             },
         },
@@ -1738,12 +2009,15 @@ async fn test_room() -> Result<(), Error> {
     // Room has _now_ received a name from sliding sync!
     assert_eq!(room1.name().await, Some("Room #1".to_owned()));
 
+    // Room has _now_ received an avatar URL from sliding sync!
+    assert_eq!(room1.avatar_url(), Some(mxc_uri!("mxc://homeserver/other-media").to_owned()));
+
     Ok(())
 }
 
 #[async_test]
 async fn test_room_not_found() -> Result<(), Error> {
-    let (_server, room_list) = new_room_list_service().await?;
+    let (_, _, room_list) = new_room_list_service().await?;
 
     let room_id = room_id!("!foo:bar.org");
 
@@ -1759,7 +2033,7 @@ async fn test_room_not_found() -> Result<(), Error> {
 
 #[async_test]
 async fn test_room_subscription() -> Result<(), Error> {
-    let (server, room_list) = new_room_list_service().await?;
+    let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
     pin_mut!(sync);
@@ -1880,7 +2154,7 @@ async fn test_room_subscription() -> Result<(), Error> {
 
 #[async_test]
 async fn test_room_unread_notifications() -> Result<(), Error> {
-    let (server, room_list) = new_room_list_service().await?;
+    let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
     pin_mut!(sync);
@@ -1967,7 +2241,7 @@ async fn test_room_unread_notifications() -> Result<(), Error> {
 
 #[async_test]
 async fn test_room_timeline() -> Result<(), Error> {
-    let (server, room_list) = new_room_list_service().await?;
+    let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
     pin_mut!(sync);
@@ -2012,7 +2286,7 @@ async fn test_room_timeline() -> Result<(), Error> {
         [server, room_list, sync]
         assert request >= {},
         respond with = {
-            "pos": "0",
+            "pos": "1",
             "lists": {},
             "rooms": {
                 room_id: {
@@ -2051,7 +2325,7 @@ async fn test_room_timeline() -> Result<(), Error> {
 
 #[async_test]
 async fn test_room_latest_event() -> Result<(), Error> {
-    let (server, room_list) = new_room_list_service().await?;
+    let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
     pin_mut!(sync);
@@ -2093,7 +2367,7 @@ async fn test_room_latest_event() -> Result<(), Error> {
         [server, room_list, sync]
         assert request >= {},
         respond with = {
-            "pos": "0",
+            "pos": "1",
             "lists": {},
             "rooms": {
                 room_id: {
@@ -2109,6 +2383,7 @@ async fn test_room_latest_event() -> Result<(), Error> {
     assert_matches!(
         room.latest_event().await,
         Some(event) => {
+            assert!(event.is_local_echo().not());
             assert_eq!(event.event_id(), Some(event_id!("$x0:bar.org")));
         }
     );
@@ -2117,7 +2392,7 @@ async fn test_room_latest_event() -> Result<(), Error> {
         [server, room_list, sync]
         assert request >= {},
         respond with = {
-            "pos": "0",
+            "pos": "2",
             "lists": {},
             "rooms": {
                 room_id: {
@@ -2130,10 +2405,49 @@ async fn test_room_latest_event() -> Result<(), Error> {
     };
 
     // The latest event has been updated.
+    let latest_event = assert_matches!(
+        room.latest_event().await,
+        Some(event) => {
+            assert!(event.is_local_echo().not());
+            assert_eq!(event.event_id(), Some(event_id!("$x1:bar.org")));
+
+            event
+        }
+    );
+
+    // Now let's compare with the result of the `Timeline`.
+    let timeline = room.timeline().await;
+
+    // The latest event matches the latest event of the `Timeline`.
+    assert_matches!(
+        timeline.latest_event().await,
+        Some(timeline_event) => {
+            assert_eq!(timeline_event.event_id(), latest_event.event_id());
+        }
+    );
+
+    // Insert a local event in the `Timeline`.
+    let txn_id: &TransactionId = "foobar-txn-id".into();
+
+    timeline.send(RoomMessageEventContent::text_plain("Hello, World!").into(), Some(txn_id)).await;
+
+    // The latest event of the `Timeline` is a local event.
+    assert_matches!(
+        timeline.latest_event().await,
+        Some(timeline_event) => {
+            assert!(timeline_event.is_local_echo());
+            assert_eq!(timeline_event.event_id(), None);
+            assert_eq!(timeline_event.transaction_id(), Some(txn_id));
+        }
+    );
+
+    // The latest event is a local event.
     assert_matches!(
         room.latest_event().await,
         Some(event) => {
-            assert_eq!(event.event_id(), Some(event_id!("$x1:bar.org")));
+            assert!(event.is_local_echo());
+            assert_eq!(event.event_id(), None);
+            assert_eq!(event.transaction_id(), Some(txn_id));
         }
     );
 
@@ -2142,7 +2456,7 @@ async fn test_room_latest_event() -> Result<(), Error> {
 
 #[async_test]
 async fn test_input_viewport() -> Result<(), Error> {
-    let (server, room_list) = new_room_list_service().await?;
+    let (_, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
     pin_mut!(sync);
@@ -2177,14 +2491,14 @@ async fn test_input_viewport() -> Result<(), Error> {
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
-                    "ranges": [[0, 199]],
+                    "ranges": [[0, 99]],
                 },
                 VISIBLE_ROOMS: {
                     "ranges": [[0, 19]],
                     "timeline_limit": 20,
                 },
                 INVITES: {
-                    "ranges": [[0, 99]],
+                    "ranges": [[0, 19]],
                 },
             },
         },
@@ -2214,22 +2528,207 @@ async fn test_input_viewport() -> Result<(), Error> {
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
-                    "ranges": [[0, 199]],
+                    "ranges": [[0, 99]],
                 },
                 VISIBLE_ROOMS: {
                     "ranges": [[10, 15], [20, 25]],
                 },
                 INVITES: {
-                    "ranges": [[0, 99]],
+                    "ranges": [[0, 19]],
                 },
             },
         },
         respond with = {
-            "pos": "1",
+            "pos": "2",
             "lists": {},
             "rooms": {},
         },
     };
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_sync_indicator() -> Result<(), Error> {
+    let (_, server, room_list) = new_room_list_service().await?;
+
+    let sync = room_list.sync();
+    pin_mut!(sync);
+
+    let sync_indicator = room_list.sync_indicator();
+
+    let request_margin = Duration::from_millis(20);
+    let request_1_delay = SYNC_INDICATOR_DELAY_BEFORE_SHOWING * 2;
+    let request_2_delay = SYNC_INDICATOR_DELAY_BEFORE_SHOWING * 3;
+    let request_4_delay = SYNC_INDICATOR_DELAY_BEFORE_SHOWING * 2;
+    let request_5_delay = SYNC_INDICATOR_DELAY_BEFORE_SHOWING * 2;
+
+    let (in_between_requests_synchronizer_sender, mut in_between_requests_synchronizer) =
+        channel(1);
+
+    macro_rules! assert_next_sync_indicator {
+        ($sync_indicator:ident, $pattern:pat, now $(,)?) => {
+            assert_matches!($sync_indicator.next().now_or_never(), Some(Some($pattern)));
+        };
+
+        ($sync_indicator:ident, $pattern:pat, under $time:expr $(,)?) => {
+            let now = Instant::now();
+            assert_matches!($sync_indicator.next().await, Some($pattern));
+            assert!(now.elapsed() < $time);
+        };
+    }
+
+    let sync_indicator_task = spawn(async move {
+        pin_mut!(sync_indicator);
+
+        // `SyncIndicator` is forced to be hidden to begin with.
+        assert_next_sync_indicator!(sync_indicator, SyncIndicator::Hide, now);
+
+        // Request 1.
+        {
+            // Sync has started, the `SyncIndicator` must be shown… but not immediately!
+            assert_next_sync_indicator!(
+                sync_indicator,
+                SyncIndicator::Show,
+                under SYNC_INDICATOR_DELAY_BEFORE_SHOWING + request_margin,
+            );
+
+            // Then, once the sync is done, the `SyncIndicator` must be hidden.
+            assert_next_sync_indicator!(
+                sync_indicator,
+                SyncIndicator::Hide,
+                under request_1_delay - SYNC_INDICATOR_DELAY_BEFORE_SHOWING
+                    + SYNC_INDICATOR_DELAY_BEFORE_HIDING
+                    + request_margin,
+            );
+        }
+
+        in_between_requests_synchronizer.recv().await.unwrap();
+        assert_pending!(sync_indicator);
+
+        // Request 2.
+        {
+            // Nothing happens, as the state transitions from `SettingUp` to
+            // `Running`, no `SyncIndicator` must be shown.
+        }
+
+        in_between_requests_synchronizer.recv().await.unwrap();
+        assert_pending!(sync_indicator);
+
+        // Request 3.
+        {
+            // Sync has errored, the `SyncIndicator` should be show. Fortunately
+            // for us (fictional situation), the sync is restarted
+            // immediately, and `SyncIndicator` doesn't have time to
+            // be shown for this particular state update.
+        }
+
+        in_between_requests_synchronizer.recv().await.unwrap();
+        assert_pending!(sync_indicator);
+
+        // Request 4.
+        {
+            // The system is recovering, It takes times (fictional situation)!
+            // `SyncIndicator` has time to show (off).
+            assert_next_sync_indicator!(
+                sync_indicator,
+                SyncIndicator::Show,
+                under SYNC_INDICATOR_DELAY_BEFORE_SHOWING + request_margin,
+            );
+        }
+
+        in_between_requests_synchronizer.recv().await.unwrap();
+        assert_pending!(sync_indicator);
+
+        // Request 5.
+        {
+            // It takes time for the system to recover…
+            assert_next_sync_indicator!(
+                sync_indicator,
+                SyncIndicator::Show,
+                under SYNC_INDICATOR_DELAY_BEFORE_SHOWING + request_margin,
+            );
+
+            // But finally, the system has recovered and is running. Time to hide the
+            // `SyncIndicator`.
+            assert_next_sync_indicator!(
+                sync_indicator,
+                SyncIndicator::Hide,
+                under request_5_delay - SYNC_INDICATOR_DELAY_BEFORE_SHOWING
+                    + SYNC_INDICATOR_DELAY_BEFORE_HIDING
+                    + request_margin,
+            );
+        }
+    });
+
+    // Request 1.
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        states = Init => SettingUp,
+        assert request >= {},
+        respond with = {
+            "pos": "0",
+        },
+        after delay = request_1_delay, // Slow request!
+    };
+
+    in_between_requests_synchronizer_sender.send(()).await.unwrap();
+
+    // Request 2.
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        states = SettingUp => Running,
+        assert request >= {},
+        respond with = {
+            "pos": "1",
+        },
+        after delay = request_2_delay, // Slow request!
+    };
+
+    in_between_requests_synchronizer_sender.send(()).await.unwrap();
+
+    // Request 3.
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        sync matches Some(Err(_)),
+        states = Running => Error { .. },
+        assert request >= {},
+        respond with = (code 400) {
+            "error": "foo",
+            "errcode": "M_UNKNOWN",
+        },
+    };
+
+    let sync = room_list.sync();
+    pin_mut!(sync);
+
+    in_between_requests_synchronizer_sender.send(()).await.unwrap();
+
+    // Request 4.
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        states = Error { .. } => Recovering,
+        assert request >= {},
+        respond with = {
+            "pos": "2",
+        },
+        after delay = request_4_delay, // Slow request!
+    };
+
+    in_between_requests_synchronizer_sender.send(()).await.unwrap();
+
+    // Request 5.
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        states = Recovering => Running,
+        assert request >= {},
+        respond with = {
+            "pos": "3",
+        },
+        after delay = request_5_delay, // Slow request!
+    };
+
+    sync_indicator_task.await.unwrap();
 
     Ok(())
 }

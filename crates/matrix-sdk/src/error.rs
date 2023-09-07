@@ -14,7 +14,7 @@
 
 //! Error conditions.
 
-use std::io::Error as IoError;
+use std::{io::Error as IoError, sync::Arc};
 
 #[cfg(feature = "qrcode")]
 use matrix_sdk_base::crypto::ScanError;
@@ -22,7 +22,7 @@ use matrix_sdk_base::crypto::ScanError;
 use matrix_sdk_base::crypto::{
     CryptoStoreError, DecryptorError, KeyExportError, MegolmError, OlmError,
 };
-use matrix_sdk_base::{Error as SdkBaseError, StoreError};
+use matrix_sdk_base::{Error as SdkBaseError, RoomState, StoreError};
 use reqwest::Error as ReqwestError;
 use ruma::{
     api::{
@@ -246,10 +246,21 @@ pub enum Error {
     #[error(transparent)]
     SlidingSync(#[from] crate::sliding_sync::Error),
 
+    /// Attempted to call a method on a room that requires the user to have a
+    /// specific membership state in the room, but the membership state is
+    /// different.
+    #[error("wrong room state: {0}")]
+    WrongRoomState(WrongRoomState),
+
     /// The client is in inconsistent state. This happens when we set a room to
     /// a specific type, but then cannot get it in this type.
     #[error("The internal client state is inconsistent.")]
     InconsistentState,
+
+    /// An error occurred interacting with the OpenID Connect API.
+    #[cfg(feature = "experimental-oidc")]
+    #[error(transparent)]
+    Oidc(#[from] crate::oidc::OidcError),
 
     /// An other error was raised
     /// this might happen because encryption was enabled on the base-crate
@@ -410,18 +421,18 @@ pub enum ImageError {
 /// [handling refresh tokens]: crate::ClientBuilder::handle_refresh_tokens()
 #[derive(Debug, Error, Clone)]
 pub enum RefreshTokenError {
-    /// The Matrix endpoint returned an error.
-    #[error(transparent)]
-    ClientApi(#[from] ruma::api::client::Error),
-
     /// Tried to send a refresh token request without a refresh token.
     #[error("missing refresh token")]
     RefreshTokenRequired,
 
-    /// There was an ongoing refresh token call that failed and the error could
-    /// not be forwarded.
-    #[error("the access token could not be refreshed")]
-    UnableToRefreshToken,
+    /// An error occurred interacting with the native Matrix authentication API.
+    #[error(transparent)]
+    MatrixAuth(Arc<HttpError>),
+
+    /// An error occurred interacting with the OpenID Connect API.
+    #[cfg(feature = "experimental-oidc")]
+    #[error(transparent)]
+    Oidc(#[from] Arc<crate::oidc::OidcError>),
 }
 
 /// Errors that can occur when manipulating push notification settings.
@@ -462,5 +473,18 @@ impl From<RemovePushRuleError> for NotificationSettingsError {
 impl From<RuleNotFoundError> for NotificationSettingsError {
     fn from(_: RuleNotFoundError) -> Self {
         Self::RuleNotFound
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("expected: {expected}, got: {got:?}")]
+pub struct WrongRoomState {
+    expected: &'static str,
+    got: RoomState,
+}
+
+impl WrongRoomState {
+    pub(crate) fn new(expected: &'static str, got: RoomState) -> Self {
+        Self { expected, got }
     }
 }

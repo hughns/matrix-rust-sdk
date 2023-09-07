@@ -14,16 +14,16 @@
 
 use std::{fmt::Debug, sync::Arc};
 
-use futures_util::{pin_mut, StreamExt as _};
+use futures_util::pin_mut;
 use matrix_sdk::Client;
 use matrix_sdk_ui::sync_service::{
-    SyncService as MatrixSyncService, SyncServiceBuilder as MatrixSyncServiceBuilder,
-    SyncServiceState as MatrixSyncServiceState,
+    State as MatrixSyncServiceState, SyncService as MatrixSyncService,
+    SyncServiceBuilder as MatrixSyncServiceBuilder,
 };
 
 use crate::{
-    error::ClientError, helpers::unwrap_or_clone_arc, room_list::RoomListService,
-    task_handle::TaskHandle, RUNTIME,
+    error::ClientError, helpers::unwrap_or_clone_arc, room_list::RoomListService, TaskHandle,
+    RUNTIME,
 };
 
 #[derive(uniffi::Enum)]
@@ -52,13 +52,21 @@ pub trait SyncServiceStateObserver: Send + Sync + Debug {
 
 #[derive(uniffi::Object)]
 pub struct SyncService {
-    inner: MatrixSyncService,
+    pub(crate) inner: Arc<MatrixSyncService>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
 impl SyncService {
     pub fn room_list_service(&self) -> Arc<RoomListService> {
         Arc::new(RoomListService { inner: self.inner.room_list_service() })
+    }
+
+    pub async fn start(&self) {
+        self.inner.start().await;
+    }
+
+    pub async fn stop(&self) -> Result<(), ClientError> {
+        Ok(self.inner.stop().await?)
     }
 
     pub fn state(&self, listener: Box<dyn SyncServiceStateObserver>) -> Arc<TaskHandle> {
@@ -71,19 +79,6 @@ impl SyncService {
                 listener.on_update(state.into());
             }
         })))
-    }
-
-    pub fn current_state(&self) -> SyncServiceState {
-        self.inner.state().get().into()
-    }
-
-    pub async fn start(&self) -> Result<(), ClientError> {
-        let start = self.inner.start();
-        Ok(start.await?)
-    }
-
-    pub fn pause(&self) -> Result<(), ClientError> {
-        Ok(self.inner.pause()?)
     }
 }
 
@@ -100,18 +95,14 @@ impl SyncServiceBuilder {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl SyncServiceBuilder {
-    pub fn with_encryption_sync(
-        self: Arc<Self>,
-        with_cross_process_lock: bool,
-        app_identifier: Option<String>,
-    ) -> Arc<Self> {
+    pub fn with_cross_process_lock(self: Arc<Self>, app_identifier: Option<String>) -> Arc<Self> {
         let this = unwrap_or_clone_arc(self);
-        let builder = this.builder.with_encryption_sync(with_cross_process_lock, app_identifier);
+        let builder = this.builder.with_cross_process_lock(app_identifier);
         Arc::new(Self { builder })
     }
 
     pub async fn finish(self: Arc<Self>) -> Result<Arc<SyncService>, ClientError> {
         let this = unwrap_or_clone_arc(self);
-        Ok(Arc::new(SyncService { inner: this.builder.build().await? }))
+        Ok(Arc::new(SyncService { inner: Arc::new(this.builder.build().await?) }))
     }
 }

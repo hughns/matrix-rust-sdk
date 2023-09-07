@@ -24,6 +24,7 @@ use std::{
 };
 
 use eyeball::SharedObservable;
+use futures_core::Stream;
 use futures_util::{
     future::try_join,
     stream::{self, StreamExt},
@@ -64,7 +65,7 @@ use crate::{
         verification::{SasVerification, Verification, VerificationRequest},
     },
     error::HttpResult,
-    room, Client, Error, Result, TransmissionProgress,
+    Client, Error, Result, Room, TransmissionProgress,
 };
 
 mod futures;
@@ -82,6 +83,7 @@ pub use matrix_sdk_base::crypto::{
 };
 
 pub use self::futures::PrepareEncryptedFile;
+use self::identities::{DeviceUpdates, IdentityUpdates};
 pub use crate::error::RoomKeyImportError;
 
 impl Client {
@@ -150,7 +152,7 @@ impl Client {
     /// # async {
     /// # let homeserver = Url::parse("http://example.com")?;
     /// # let client = Client::new(homeserver).await?;
-    /// # let room = client.get_joined_room(&room_id!("!test:example.com")).unwrap();
+    /// # let room = client.get_room(&room_id!("!test:example.com")).unwrap();
     /// let mut reader = std::io::Cursor::new(b"Hello, world!");
     /// let encrypted_file = client.prepare_encrypted_file(&mime::TEXT_PLAIN, &mut reader).await?;
     ///
@@ -276,7 +278,7 @@ impl Client {
             .olm_machine()
             .await
             .as_ref()
-            .ok_or(Error::AuthenticationRequired)?
+            .ok_or(Error::NoOlmMachine)?
             .get_missing_sessions(users)
             .await?
         {
@@ -322,7 +324,7 @@ impl Client {
         let txn_id = &request.txn_id;
         let room_id = &request.room_id;
 
-        self.get_joined_room(room_id)
+        self.get_room(room_id)
             .expect("Can't send a message to a room that isn't known to the store")
             .send(content, Some(txn_id))
             .await
@@ -358,7 +360,7 @@ impl Client {
     }
 
     /// Get the existing DM room with the given user, if any.
-    pub fn get_dm_room(&self, user_id: &UserId) -> Option<room::Joined> {
+    pub fn get_dm_room(&self, user_id: &UserId) -> Option<Room> {
         let rooms = self.joined_rooms();
 
         // Find the room we share with the `user_id` and only with `user_id`
@@ -431,7 +433,7 @@ impl Client {
             self.olm_machine()
                 .await
                 .as_ref()
-                .ok_or(Error::AuthenticationRequired)?
+                .ok_or(Error::NoOlmMachine)?
                 .outgoing_requests()
                 .await?,
         )
@@ -449,6 +451,14 @@ impl Client {
             .await;
 
         Ok(())
+    }
+}
+
+#[cfg(any(feature = "testing", test))]
+impl Client {
+    /// Get the olm machine, for testing purposes only.
+    pub async fn olm_machine_for_testing(&self) -> RwLockReadGuard<'_, Option<OlmMachine>> {
+        self.olm_machine().await
     }
 }
 
@@ -600,7 +610,7 @@ impl Encryption {
             .olm_machine()
             .await
             .as_ref()
-            .ok_or(Error::AuthenticationRequired)?
+            .ok_or(Error::NoOlmMachine)?
             .get_user_devices(user_id, None)
             .await?;
 
@@ -651,9 +661,88 @@ impl Encryption {
                 UserIdentity::new_own(self.client.clone(), i)
             }
             matrix_sdk_base::crypto::UserIdentities::Other(i) => {
-                UserIdentity::new(self.client.clone(), i, self.client.get_dm_room(user_id))
+                UserIdentity::new_other(self.client.clone(), i)
             }
         }))
+    }
+
+    /// Returns a stream of device updates, allowing users to listen for
+    /// notifications about new or changed devices.
+    ///
+    /// The stream produced by this method emits updates whenever a new device
+    /// is discovered or when an existing device's information is changed. Users
+    /// can subscribe to this stream and receive updates in real-time.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::Client;
+    /// # use ruma::{device_id, user_id};
+    /// # use futures_util::{pin_mut, StreamExt};
+    /// # let client: Client = unimplemented!();
+    /// # async {
+    /// let devices_stream = client.encryption().devices_stream().await?;
+    /// let user_id = client
+    ///     .user_id()
+    ///     .expect("We should know our user id afte we have logged in");
+    /// pin_mut!(devices_stream);
+    ///
+    /// for device_updates in devices_stream.next().await {
+    ///     if let Some(user_devices) = device_updates.new.get(user_id) {
+    ///         for device in user_devices.values() {
+    ///             println!("A new device has been added {}", device.device_id());
+    ///         }
+    ///     }
+    /// }
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn devices_stream(&self) -> Result<impl Stream<Item = DeviceUpdates>> {
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
+        let client = self.client.to_owned();
+
+        Ok(olm
+            .store()
+            .devices_stream()
+            .map(move |updates| DeviceUpdates::new(client.to_owned(), updates)))
+    }
+
+    /// Returns a stream of user identity updates, allowing users to listen for
+    /// notifications about new or changed user identities.
+    ///
+    /// The stream produced by this method emits updates whenever a new user
+    /// identity is discovered or when an existing identities information is
+    /// changed. Users can subscribe to this stream and receive updates in
+    /// real-time.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::Client;
+    /// # use ruma::{device_id, user_id};
+    /// # use futures_util::{pin_mut, StreamExt};
+    /// # let client: Client = unimplemented!();
+    /// # async {
+    /// let identities_stream =
+    ///     client.encryption().user_identities_stream().await?;
+    /// pin_mut!(identities_stream);
+    ///
+    /// for identity_updates in identities_stream.next().await {
+    ///     for (_, identity) in identity_updates.new {
+    ///         println!("A new identity has been added {}", identity.user_id());
+    ///     }
+    /// }
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn user_identities_stream(&self) -> Result<impl Stream<Item = IdentityUpdates>> {
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
+        let client = self.client.to_owned();
+
+        Ok(olm
+            .store()
+            .user_identities_stream()
+            .map(move |updates| IdentityUpdates::new(client.to_owned(), updates)))
     }
 
     /// Create and upload a new cross signing identity.
@@ -696,7 +785,7 @@ impl Encryption {
     /// # anyhow::Ok(()) };
     pub async fn bootstrap_cross_signing(&self, auth_data: Option<AuthData>) -> Result<()> {
         let olm = self.client.olm_machine().await;
-        let olm = olm.as_ref().ok_or(Error::AuthenticationRequired)?;
+        let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
 
         let (request, signature_request) = olm.bootstrap_cross_signing(false).await?;
 
@@ -773,7 +862,7 @@ impl Encryption {
         predicate: impl FnMut(&matrix_sdk_base::crypto::olm::InboundGroupSession) -> bool,
     ) -> Result<()> {
         let olm = self.client.olm_machine().await;
-        let olm = olm.as_ref().ok_or(Error::AuthenticationRequired)?;
+        let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
 
         let keys = olm.export_room_keys(predicate).await?;
         let passphrase = zeroize::Zeroizing::new(passphrase.to_owned());
@@ -868,7 +957,7 @@ impl Encryption {
         }
 
         let olm_machine = self.client.base_client().olm_machine().await;
-        let olm_machine = olm_machine.as_ref().ok_or(Error::AuthenticationRequired)?;
+        let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
 
         let lock =
             olm_machine.store().create_store_lock("cross_process_lock".to_owned(), lock_value);
@@ -880,7 +969,9 @@ impl Encryption {
         {
             let guard = lock.try_lock_once().await?;
             if guard.is_some() {
-                olm_machine.initialize_crypto_store_generation().await?;
+                olm_machine
+                    .initialize_crypto_store_generation(&self.client.inner.crypto_store_generation)
+                    .await?;
             }
         }
 
@@ -899,7 +990,10 @@ impl Encryption {
         let olm_machine_guard = self.client.olm_machine().await;
         if let Some(olm_machine) = olm_machine_guard.as_ref() {
             // If the crypto store generation has changed,
-            if olm_machine.maintain_crypto_store_generation().await? {
+            if olm_machine
+                .maintain_crypto_store_generation(&self.client.inner.crypto_store_generation)
+                .await?
+            {
                 // (get rid of the reference to the current crypto store first)
                 drop(olm_machine_guard);
                 // Recreate the OlmMachine.
@@ -945,6 +1039,14 @@ impl Encryption {
         } else {
             Ok(None)
         }
+    }
+
+    /// Testing purposes only.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn uploaded_key_count(&self) -> Result<u64> {
+        let olm_machine = self.client.olm_machine().await;
+        let olm_machine = olm_machine.as_ref().ok_or(Error::AuthenticationRequired)?;
+        Ok(olm_machine.uploaded_key_count())
     }
 }
 
@@ -1012,7 +1114,7 @@ mod tests {
 
         client.base_client().receive_sync_response(response).await.unwrap();
 
-        let room = client.get_joined_room(room_id).expect("Room should exist");
+        let room = client.get_room(room_id).expect("Room should exist");
         assert!(room.is_encrypted().await.expect("Getting encryption state"));
 
         let event_id = event_id!("$1:example.org");
@@ -1175,5 +1277,79 @@ mod tests {
         // But now its olm machine has been invalidated and thus regenerated!
         let olm_machine = client1.olm_machine().await.clone().expect("must have an olm machine");
         assert!(!initial_olm_machine.same_as(&olm_machine));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[async_test]
+    async fn test_generation_counter_no_spurious_invalidation() {
+        // Create two clients using the same sqlite database.
+        let sqlite_path =
+            std::env::temp_dir().join("generation_counter_no_spurious_invalidations.db");
+        let session = Session {
+            meta: SessionMeta {
+                user_id: user_id!("@example:localhost").to_owned(),
+                device_id: device_id!("DEVICEID").to_owned(),
+            },
+            tokens: SessionTokens { access_token: "1234".to_owned(), refresh_token: None },
+        };
+
+        let client = Client::builder()
+            .homeserver_url("http://localhost:1234")
+            .request_config(RequestConfig::new().disable_retry())
+            .sqlite_store(&sqlite_path, None)
+            .build()
+            .await
+            .unwrap();
+        client.matrix_auth().restore_session(session.clone()).await.unwrap();
+
+        let initial_olm_machine = client.olm_machine().await.as_ref().unwrap().clone();
+
+        client.encryption().enable_cross_process_store_lock("client1".to_owned()).await.unwrap();
+
+        // Enabling the lock doesn't update the olm machine.
+        let after_enabling_lock = client.olm_machine().await.as_ref().unwrap().clone();
+        assert!(initial_olm_machine.same_as(&after_enabling_lock));
+
+        {
+            // Simulate that another client hold the lock before.
+            let client2 = Client::builder()
+                .homeserver_url("http://localhost:1234")
+                .request_config(RequestConfig::new().disable_retry())
+                .sqlite_store(sqlite_path, None)
+                .build()
+                .await
+                .unwrap();
+            client2.matrix_auth().restore_session(session).await.unwrap();
+
+            client2
+                .encryption()
+                .enable_cross_process_store_lock("client2".to_owned())
+                .await
+                .unwrap();
+
+            let guard = client2.encryption().spin_lock_store(None).await.unwrap();
+            assert!(guard.is_some());
+
+            drop(guard);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        {
+            let acquired = client.encryption().try_lock_store_once().await.unwrap();
+            assert!(acquired.is_some());
+        }
+
+        // Taking the lock the first time will update the olm machine.
+        let after_taking_lock_first_time = client.olm_machine().await.as_ref().unwrap().clone();
+        assert!(!initial_olm_machine.same_as(&after_taking_lock_first_time));
+
+        {
+            let acquired = client.encryption().try_lock_store_once().await.unwrap();
+            assert!(acquired.is_some());
+        }
+
+        // Re-taking the lock doesn't update the olm machine.
+        let after_taking_lock_second_time = client.olm_machine().await.as_ref().unwrap().clone();
+        assert!(after_taking_lock_first_time.same_as(&after_taking_lock_second_time));
     }
 }

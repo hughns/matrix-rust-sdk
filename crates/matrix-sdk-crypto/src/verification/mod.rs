@@ -52,7 +52,7 @@ use crate::{
     error::SignatureError,
     gossiping::{GossipMachine, GossipRequest},
     olm::{PrivateCrossSigningIdentity, ReadOnlyAccount, Session},
-    store::{Changes, DynCryptoStore, NoisyArc},
+    store::{Changes, CryptoStoreWrapper, NoisyArc},
     types::Signatures,
     CryptoStoreError, LocalTrust, OutgoingVerificationRequest, ReadOnlyDevice,
     ReadOnlyOwnUserIdentity, ReadOnlyUserIdentities,
@@ -62,7 +62,7 @@ use crate::{
 pub(crate) struct VerificationStore {
     pub account: ReadOnlyAccount,
     pub private_identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
-    inner: NoisyArc<DynCryptoStore>,
+    inner: NoisyArc<CryptoStoreWrapper>,
 }
 
 /// An emoji that is used for interactive verification using a short auth
@@ -181,7 +181,7 @@ impl VerificationStore {
             .map(|d| d.signatures().to_owned()))
     }
 
-    pub fn inner(&self) -> &DynCryptoStore {
+    pub fn inner(&self) -> &CryptoStoreWrapper {
         self.inner.deref()
     }
 }
@@ -625,7 +625,7 @@ impl IdentitiesBeingVerified {
         let mut secrets = self.private_identity.get_missing_secrets().await;
 
         #[cfg(feature = "backups_v1")]
-        if self.store.inner.load_backup_keys().await?.recovery_key.is_none() {
+        if self.store.inner.load_backup_keys().await?.decryption_key.is_none() {
             secrets.push(ruma::events::secret::request::SecretName::RecoveryKey);
         }
 
@@ -743,17 +743,23 @@ impl IdentitiesBeingVerified {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::sync::Arc;
 
     use ruma::{
+        device_id,
         events::{AnyToDeviceEventContent, ToDeviceEvent},
-        UserId,
+        user_id, DeviceId, UserId,
     };
+    use tokio::sync::Mutex;
 
-    use super::event_enums::OutgoingContent;
+    use super::{event_enums::OutgoingContent, VerificationStore};
     use crate::{
+        olm::PrivateCrossSigningIdentity,
         requests::{OutgoingRequest, OutgoingRequests},
+        store::{Changes, CryptoStore, CryptoStoreWrapper, IdentityChanges, MemoryStore},
         types::events::ToDeviceEvents,
-        OutgoingVerificationRequest,
+        OutgoingVerificationRequest, ReadOnlyAccount, ReadOnlyDevice, ReadOnlyOwnUserIdentity,
+        ReadOnlyUserIdentity,
     };
 
     pub(crate) fn request_to_event(
@@ -808,19 +814,6 @@ pub(crate) mod tests {
             _ => unreachable!(),
         }
     }
-}
-
-#[cfg(test)]
-mod test {
-    use ruma::{device_id, user_id, DeviceId, UserId};
-    use tokio::sync::Mutex;
-
-    use super::VerificationStore;
-    use crate::{
-        olm::PrivateCrossSigningIdentity,
-        store::{Changes, CryptoStore, IdentityChanges, IntoCryptoStore, MemoryStore},
-        ReadOnlyAccount, ReadOnlyDevice, ReadOnlyOwnUserIdentity, ReadOnlyUserIdentity,
-    };
 
     pub fn alice_id() -> &'static UserId {
         user_id!("@alice:example.org")
@@ -839,13 +832,13 @@ mod test {
     }
 
     pub(crate) async fn setup_stores() -> (VerificationStore, VerificationStore) {
-        let alice = ReadOnlyAccount::new(alice_id(), alice_device_id());
+        let alice = ReadOnlyAccount::with_device_id(alice_id(), alice_device_id());
         let alice_store = MemoryStore::new();
         let (alice_private_identity, _, _) =
             PrivateCrossSigningIdentity::with_account(&alice).await;
         let alice_private_identity = Mutex::new(alice_private_identity);
 
-        let bob = ReadOnlyAccount::new(bob_id(), bob_device_id());
+        let bob = ReadOnlyAccount::with_device_id(bob_id(), bob_device_id());
         let bob_store = MemoryStore::new();
         let (bob_private_identity, _, _) = PrivateCrossSigningIdentity::with_account(&bob).await;
         let bob_private_identity = Mutex::new(bob_private_identity);
@@ -883,14 +876,14 @@ mod test {
         bob_store.save_devices(vec![alice_device]).await;
 
         let alice_store = VerificationStore {
+            inner: Arc::new(CryptoStoreWrapper::new(alice.user_id(), alice_store)),
             account: alice,
-            inner: alice_store.into_crypto_store(),
             private_identity: alice_private_identity.into(),
         };
 
         let bob_store = VerificationStore {
             account: bob.clone(),
-            inner: bob_store.into_crypto_store(),
+            inner: Arc::new(CryptoStoreWrapper::new(bob.user_id(), bob_store)),
             private_identity: bob_private_identity.into(),
         };
 

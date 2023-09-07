@@ -13,28 +13,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "e2e-encryption")]
-use std::ops::Deref;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, iter,
-    sync::Arc,
 };
+#[cfg(feature = "e2e-encryption")]
+use std::{ops::Deref, sync::Arc};
 
 use eyeball::{SharedObservable, Subscriber};
 use matrix_sdk_common::instant::Instant;
 use matrix_sdk_crypto::store::NoisyArc;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
-    store::DynCryptoStore, EncryptionSettings, OlmError, OlmMachine, ToDeviceRequest,
+    store::DynCryptoStore, EncryptionSettings, EncryptionSyncChanges, OlmError, OlmMachine,
+    ToDeviceRequest,
 };
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{
-    room::{
-        history_visibility::HistoryVisibility, message::MessageType,
-        redaction::SyncRoomRedactionEvent,
-    },
-    AnySyncMessageLikeEvent, SyncMessageLikeEvent,
+    room::{history_visibility::HistoryVisibility, message::MessageType},
+    SyncMessageLikeEvent,
 };
 use ruma::{
     api::client::{self as api, push::get_notifications::v3::Notification},
@@ -45,12 +42,12 @@ use ruma::{
             power_levels::{RoomPowerLevelsEvent, RoomPowerLevelsEventContent},
         },
         AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
-        AnySyncEphemeralRoomEvent, AnySyncStateEvent, AnySyncTimelineEvent,
-        GlobalAccountDataEventType, StateEventType,
+        AnySyncEphemeralRoomEvent, AnySyncMessageLikeEvent, AnySyncStateEvent,
+        AnySyncTimelineEvent, GlobalAccountDataEventType, StateEventType,
     },
     push::{Action, PushConditionRoomCtx, Ruleset},
     serde::Raw,
-    MilliSecondsSinceUnixEpoch, OwnedUserId, RoomId, UInt, UserId,
+    MilliSecondsSinceUnixEpoch, OwnedUserId, RoomId, RoomVersionId, UInt, UserId,
 };
 use tokio::sync::RwLock;
 #[cfg(feature = "e2e-encryption")]
@@ -64,8 +61,8 @@ use crate::{
     error::Result,
     rooms::{Room, RoomInfo, RoomState},
     store::{
-        ambiguity_map::AmbiguityCache, DynStateStore, Result as StoreResult, StateChanges,
-        StateStoreDataKey, StateStoreDataValue, StateStoreExt, Store, StoreConfig,
+        ambiguity_map::AmbiguityCache, DynStateStore, MemoryStore, Result as StoreResult,
+        StateChanges, StateStoreDataKey, StateStoreDataValue, StateStoreExt, Store, StoreConfig,
     },
     sync::{JoinedRoom, LeftRoom, Rooms, SyncResponse, Timeline},
     RoomStateFilter, SessionMeta,
@@ -92,7 +89,8 @@ pub struct BaseClient {
     /// [`BaseClient::set_session_meta`]
     #[cfg(feature = "e2e-encryption")]
     olm_machine: Arc<RwLock<Option<OlmMachine>>>,
-    pub(crate) ignore_user_list_changes_tx: Arc<SharedObservable<()>>,
+    /// Observable of when a user is ignored/unignored.
+    pub(crate) ignore_user_list_changes: SharedObservable<()>,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -124,8 +122,19 @@ impl BaseClient {
             crypto_store: config.crypto_store,
             #[cfg(feature = "e2e-encryption")]
             olm_machine: Default::default(),
-            ignore_user_list_changes_tx: Default::default(),
+            ignore_user_list_changes: Default::default(),
         }
+    }
+
+    /// Clones the current base client to use the same crypto store but a
+    /// different, in-memory store config, and resets transient state.
+    pub fn clone_with_in_memory_state_store(&self) -> Self {
+        let config = StoreConfig::new().state_store(MemoryStore::new());
+
+        #[cfg(feature = "e2e-encryption")]
+        let config = config.crypto_store(self.crypto_store.clone());
+
+        Self::with_store_config(config)
     }
 
     /// Get the session meta information.
@@ -179,6 +188,9 @@ impl BaseClient {
     ///
     /// * `session_meta` - The meta of a session that the user already has from
     ///   a previous login call.
+    /// * `regenerate_olm`: whether the `OlmMachine` should be regenerated or
+    ///   not. True for
+    /// restored sessions, false for inherited sessions.
     ///
     /// This method panics if it is called twice.
     pub async fn set_session_meta(&self, session_meta: SessionMeta) -> Result<()> {
@@ -327,19 +339,18 @@ impl BaseClient {
                             changes.add_state_event(room.room_id(), s.clone(), raw_event);
                         }
 
-                        #[cfg(feature = "e2e-encryption")]
                         AnySyncTimelineEvent::MessageLike(
-                            AnySyncMessageLikeEvent::RoomRedaction(
-                                // Redacted redactions don't have the `redacts` key, so we can't
-                                // know what they were meant to redact. A future room version might
-                                // move the redacts key, replace the current redaction event
-                                // altogether, or have the redacts key survive redaction.
-                                SyncRoomRedactionEvent::Original(r),
-                            ),
+                            AnySyncMessageLikeEvent::RoomRedaction(r),
                         ) => {
-                            room_info.handle_redaction(r, event.event.cast_ref());
-                            let raw_event = event.event.clone().cast();
-                            changes.add_redaction(room.room_id(), &r.redacts, raw_event);
+                            let room_version =
+                                room_info.room_version().unwrap_or(&RoomVersionId::V1);
+
+                            if let Some(redacts) = r.redacts(room_version) {
+                                room_info.handle_redaction(r, event.event.cast_ref());
+                                let raw_event = event.event.clone().cast();
+
+                                changes.add_redaction(room.room_id(), redacts, raw_event);
+                            }
                         }
 
                         #[cfg(feature = "e2e-encryption")]
@@ -371,7 +382,7 @@ impl BaseClient {
                         },
 
                         #[cfg(not(feature = "e2e-encryption"))]
-                        _ => (),
+                        AnySyncTimelineEvent::MessageLike(_) => (),
                     }
 
                     if let Some(context) = &mut push_context {
@@ -454,7 +465,7 @@ impl BaseClient {
     pub(crate) async fn handle_state(
         &self,
         raw_events: &[Raw<AnySyncStateEvent>],
-        events: &[Option<AnySyncStateEvent>],
+        events: &[AnySyncStateEvent],
         room_info: &mut RoomInfo,
         changes: &mut StateChanges,
         ambiguity_cache: &mut AmbiguityCache,
@@ -465,10 +476,6 @@ impl BaseClient {
 
         assert_eq!(raw_events.len(), events.len());
         for (raw_event, event) in iter::zip(raw_events, events) {
-            let Some(event) = event else {
-                continue;
-            };
-
             room_info.handle_state_event(event);
 
             if let AnySyncStateEvent::RoomMember(member) = &event {
@@ -565,10 +572,7 @@ impl BaseClient {
     #[instrument(skip_all)]
     pub(crate) async fn preprocess_to_device_events(
         &self,
-        to_device_events: Vec<Raw<ruma::events::AnyToDeviceEvent>>,
-        changed_devices: &api::sync::sync_events::DeviceLists,
-        one_time_keys_counts: &BTreeMap<ruma::DeviceKeyAlgorithm, UInt>,
-        unused_fallback_keys: Option<&[ruma::DeviceKeyAlgorithm]>,
+        encryption_sync_changes: EncryptionSyncChanges<'_>,
         #[cfg(feature = "experimental-sliding-sync")] changes: &mut StateChanges,
         #[cfg(not(feature = "experimental-sliding-sync"))] _changes: &mut StateChanges,
     ) -> Result<Vec<Raw<ruma::events::AnyToDeviceEvent>>> {
@@ -577,19 +581,13 @@ impl BaseClient {
             // decrypts to-device events, but leaves room events alone.
             // This makes sure that we have the decryption keys for the room
             // events at hand.
-            let (events, room_key_updates) = o
-                .receive_sync_changes(
-                    to_device_events,
-                    changed_devices,
-                    one_time_keys_counts,
-                    unused_fallback_keys,
-                )
-                .await?;
+            let (events, room_key_updates) =
+                o.receive_sync_changes(encryption_sync_changes).await?;
 
             #[cfg(feature = "experimental-sliding-sync")]
             for room_key_update in room_key_updates {
-                if let Some(mut room) = self.get_room(&room_key_update.room_id) {
-                    self.decrypt_latest_events(&mut room, changes).await;
+                if let Some(room) = self.get_room(&room_key_update.room_id) {
+                    self.decrypt_latest_events(&room, changes).await;
                 }
             }
             #[cfg(not(feature = "experimental-sliding-sync"))]
@@ -600,7 +598,7 @@ impl BaseClient {
             // If we have no OlmMachine, just return the events that were passed in.
             // This should not happen unless we forget to set things up by calling
             // set_session_meta().
-            Ok(to_device_events)
+            Ok(encryption_sync_changes.to_device_events)
         }
     }
 
@@ -609,7 +607,7 @@ impl BaseClient {
     /// found, and remove any older encrypted events from
     /// latest_encrypted_events.
     #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
-    async fn decrypt_latest_events(&self, room: &mut Room, changes: &mut StateChanges) {
+    async fn decrypt_latest_events(&self, room: &Room, changes: &mut StateChanges) {
         // Try to find a message we can decrypt and is suitable for using as the latest
         // event. If we found one, set it as the latest and delete any older
         // encrypted events
@@ -673,8 +671,8 @@ impl BaseClient {
 
     /// User has left a room.
     ///
-    /// Update the internal and cached state accordingly. Return the final Room.
-    pub async fn room_left(&self, room_id: &RoomId) -> Result<Room> {
+    /// Update the internal and cached state accordingly.
+    pub async fn room_left(&self, room_id: &RoomId) -> Result<()> {
         let room = self.store.get_or_create_room(room_id, RoomState::Left);
         if room.state() != RoomState::Left {
             let _sync_lock = self.sync_lock().read().await;
@@ -689,7 +687,7 @@ impl BaseClient {
             room.update_summary(room_info); // Update the cached room handle
         }
 
-        Ok(room)
+        Ok(())
     }
 
     /// Get access to the store's sync lock.
@@ -720,10 +718,13 @@ impl BaseClient {
         #[cfg(feature = "e2e-encryption")]
         let to_device = self
             .preprocess_to_device_events(
-                response.to_device.events,
-                &response.device_lists,
-                &response.device_one_time_keys_count,
-                response.device_unused_fallback_key_types.as_deref(),
+                EncryptionSyncChanges {
+                    to_device_events: response.to_device.events,
+                    changed_devices: &response.device_lists,
+                    one_time_keys_counts: &response.device_one_time_keys_count,
+                    unused_fallback_keys: response.device_unused_fallback_key_types.as_deref(),
+                    next_batch_token: Some(response.next_batch.clone()),
+                },
                 &mut changes,
             )
             .await?;
@@ -748,12 +749,14 @@ impl BaseClient {
             room_info.set_prev_batch(new_info.timeline.prev_batch.as_deref());
             room_info.mark_state_fully_synced();
 
-            let deserialized_events = Self::deserialize_events(&new_info.state.events);
+            let state_events = Self::deserialize_state_events(&new_info.state.events);
+            let (raw_state_events, state_events): (Vec<_>, Vec<_>) =
+                state_events.into_iter().unzip();
 
             let mut user_ids = self
                 .handle_state(
-                    &new_info.state.events,
-                    &deserialized_events,
+                    &raw_state_events,
+                    &state_events,
                     &mut room_info,
                     &mut changes,
                     &mut ambiguity_cache,
@@ -837,12 +840,14 @@ impl BaseClient {
             room_info.mark_as_left();
             room_info.mark_state_partially_synced();
 
-            let deserialized_events = Self::deserialize_events(&new_info.state.events);
+            let state_events = Self::deserialize_state_events(&new_info.state.events);
+            let (raw_state_events, state_events): (Vec<_>, Vec<_>) =
+                state_events.into_iter().unzip();
 
             let mut user_ids = self
                 .handle_state(
-                    &new_info.state.events,
-                    &deserialized_events,
+                    &raw_state_events,
+                    &state_events,
                     &mut room_info,
                     &mut changes,
                     &mut ambiguity_cache,
@@ -917,12 +922,6 @@ impl BaseClient {
             presence: response.presence.events,
             account_data: response.account_data.events,
             to_device,
-            device_lists: response.device_lists,
-            device_one_time_keys_count: response
-                .device_one_time_keys_count
-                .into_iter()
-                .map(|(k, v)| (k, v.into()))
-                .collect(),
             ambiguity_changes: AmbiguityChanges { changes: ambiguity_cache.changes },
             notifications: changes.notifications,
         };
@@ -932,8 +931,9 @@ impl BaseClient {
 
     pub(crate) async fn apply_changes(&self, changes: &StateChanges) {
         if changes.account_data.contains_key(&GlobalAccountDataEventType::IgnoredUserList) {
-            self.ignore_user_list_changes_tx.set(());
+            self.ignore_user_list_changes.set(());
         }
+
         for (room_id, room_info) in &changes.room_infos {
             if let Some(room) = self.store.get_room(room_id) {
                 room.update_summary(room_info.clone())
@@ -960,9 +960,6 @@ impl BaseClient {
         let mut ambiguity_cache = AmbiguityCache::new(self.store.inner.clone());
 
         if let Some(room) = self.store.get_room(room_id) {
-            let mut room_info = room.clone_info();
-            room_info.mark_members_synced();
-
             let mut changes = StateChanges::default();
 
             #[cfg(feature = "e2e-encryption")]
@@ -1019,13 +1016,17 @@ impl BaseClient {
             }
 
             #[cfg(feature = "e2e-encryption")]
-            if room_info.is_encrypted() {
+            if room.is_encrypted() {
                 if let Some(o) = self.olm_machine().await.as_ref() {
                     o.update_tracked_users(user_ids.iter().map(Deref::deref)).await?
                 }
             }
 
             changes.ambiguity_maps = ambiguity_cache.cache;
+
+            let _sync_lock = self.sync_lock().write().await;
+            let mut room_info = room.clone_info();
+            room_info.mark_members_synced();
             changes.add_room(room_info);
 
             self.store.save_changes(&changes).await?;
@@ -1269,16 +1270,16 @@ impl BaseClient {
     /// Returns a subscriber that publishes an event every time the ignore user
     /// list changes
     pub fn subscribe_to_ignore_user_list_changes(&self) -> Subscriber<()> {
-        self.ignore_user_list_changes_tx.subscribe()
+        self.ignore_user_list_changes.subscribe()
     }
 
-    pub(crate) fn deserialize_events(
+    pub(crate) fn deserialize_state_events(
         raw_events: &[Raw<AnySyncStateEvent>],
-    ) -> Vec<Option<AnySyncStateEvent>> {
+    ) -> Vec<(Raw<AnySyncStateEvent>, AnySyncStateEvent)> {
         raw_events
             .iter()
-            .map(|raw_event| match raw_event.deserialize() {
-                Ok(ev) => Some(ev),
+            .filter_map(|raw_event| match raw_event.deserialize() {
+                Ok(event) => Some((raw_event.clone(), event)),
                 Err(e) => {
                     warn!("Couldn't deserialize state event: {e}");
                     None
@@ -1450,7 +1451,7 @@ mod tests {
         let user_id = user_id!("@u:u.to");
         let room_id = room_id!("!r:u.to");
         let client = logged_in_client(user_id).await;
-        let mut room = process_room_join(&client, room_id, "$1", user_id).await;
+        let room = process_room_join(&client, room_id, "$1", user_id).await;
 
         // Sanity: it has no latest_encrypted_events or latest_event
         assert!(room.latest_encrypted_events().is_empty());
@@ -1458,7 +1459,7 @@ mod tests {
 
         // When I tell it to do some decryption
         let mut changes = StateChanges::default();
-        client.decrypt_latest_events(&mut room, &mut changes).await;
+        client.decrypt_latest_events(&room, &mut changes).await;
 
         // Then nothing changed
         assert!(room.latest_encrypted_events().is_empty());

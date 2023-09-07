@@ -56,7 +56,7 @@ use serde_json::value::RawValue as RawJsonValue;
 use tracing::{debug, error, field::debug, instrument, warn};
 
 use self::maps::EventHandlerMaps;
-use crate::{room, Client};
+use crate::{Client, Room};
 
 mod context;
 mod maps;
@@ -197,7 +197,7 @@ pub struct EventHandlerHandle {
 ///
 /// ¹ the only thing stopping such types from existing in stable Rust is that
 /// all manual implementations of the `Fn` traits require a Nightly feature
-pub trait EventHandler<Ev, Ctx>: SendOutsideWasm + SyncOutsideWasm + 'static {
+pub trait EventHandler<Ev, Ctx>: Clone + SendOutsideWasm + SyncOutsideWasm + 'static {
     /// The future returned by `handle_event`.
     #[doc(hidden)]
     type Future: EventHandlerFuture;
@@ -209,7 +209,7 @@ pub trait EventHandler<Ev, Ctx>: SendOutsideWasm + SyncOutsideWasm + 'static {
     ///
     /// Returns `None` if one of the context extractors failed.
     #[doc(hidden)]
-    fn handle_event(&self, ev: Ev, data: EventHandlerData<'_>) -> Option<Self::Future>;
+    fn handle_event(self, ev: Ev, data: EventHandlerData<'_>) -> Option<Self::Future>;
 }
 
 #[doc(hidden)]
@@ -231,7 +231,7 @@ where
 #[derive(Debug)]
 pub struct EventHandlerData<'a> {
     client: Client,
-    room: Option<room::Room>,
+    room: Option<Room>,
     raw: &'a RawJsonValue,
     encryption_info: Option<&'a EncryptionInfo>,
     push_actions: &'a [Action],
@@ -291,8 +291,8 @@ impl Client {
         H: EventHandler<Ev, Ctx>,
     {
         let handler_fn: Box<EventHandlerFn> = Box::new(move |data| {
-            let maybe_fut =
-                serde_json::from_str(data.raw.get()).map(|ev| handler.handle_event(ev, data));
+            let maybe_fut = serde_json::from_str(data.raw.get())
+                .map(|ev| handler.clone().handle_event(ev, data));
 
             Box::pin(async move {
                 match maybe_fut {
@@ -328,7 +328,7 @@ impl Client {
     pub(crate) async fn handle_sync_events<T>(
         &self,
         kind: HandlerKind,
-        room: Option<&room::Room>,
+        room: Option<&Room>,
         events: &[Raw<T>],
     ) -> serde_json::Result<()> {
         #[derive(Deserialize)]
@@ -347,7 +347,7 @@ impl Client {
 
     pub(crate) async fn handle_sync_state_events(
         &self,
-        room: Option<&room::Room>,
+        room: Option<&Room>,
         state_events: &[Raw<AnySyncStateEvent>],
     ) -> serde_json::Result<()> {
         #[derive(Deserialize)]
@@ -375,7 +375,7 @@ impl Client {
 
     pub(crate) async fn handle_sync_timeline_events(
         &self,
-        room: Option<&room::Room>,
+        room: Option<&Room>,
         timeline_events: &[SyncTimelineEvent],
     ) -> serde_json::Result<()> {
         #[derive(Deserialize)]
@@ -441,7 +441,7 @@ impl Client {
     #[instrument(skip_all, fields(?event_kind, ?event_type, room_id))]
     async fn call_event_handlers(
         &self,
-        room: Option<&room::Room>,
+        room: Option<&Room>,
         raw: &RawJsonValue,
         event_kind: HandlerKind,
         event_type: &str,
@@ -512,13 +512,13 @@ macro_rules! impl_event_handler {
         impl<Ev, Fun, Fut, $($ty),*> EventHandler<Ev, ($($ty,)*)> for Fun
         where
             Ev: SyncEvent,
-            Fun: Fn(Ev, $($ty),*) -> Fut + SendOutsideWasm + SyncOutsideWasm + 'static,
+            Fun: FnOnce(Ev, $($ty),*) -> Fut + Clone + SendOutsideWasm + SyncOutsideWasm + 'static,
             Fut: EventHandlerFuture,
             $($ty: EventHandlerContext),*
         {
             type Future = Fut;
 
-            fn handle_event(&self, ev: Ev, _d: EventHandlerData<'_>) -> Option<Self::Future> {
+            fn handle_event(self, ev: Ev, _d: EventHandlerData<'_>) -> Option<Self::Future> {
                 Some((self)(ev, $($ty::from_data(&_d)?),*))
             }
         }
@@ -571,9 +571,8 @@ mod tests {
 
     use crate::{
         event_handler::Ctx,
-        room::Room,
         test_utils::{logged_in_client, no_retry_test_client},
-        Client,
+        Client, Room,
     };
 
     #[async_test]
@@ -587,30 +586,26 @@ mod tests {
 
         client.add_event_handler({
             let member_count = member_count.clone();
-            move |_ev: OriginalSyncRoomMemberEvent, _room: Room| {
+            move |_ev: OriginalSyncRoomMemberEvent, _room: Room| async move {
                 member_count.fetch_add(1, SeqCst);
-                future::ready(())
             }
         });
         client.add_event_handler({
             let typing_count = typing_count.clone();
-            move |_ev: SyncTypingEvent| {
+            move |_ev: SyncTypingEvent| async move {
                 typing_count.fetch_add(1, SeqCst);
-                future::ready(())
             }
         });
         client.add_event_handler({
             let power_levels_count = power_levels_count.clone();
-            move |_ev: OriginalSyncRoomPowerLevelsEvent, _client: Client, _room: Room| {
+            move |_ev: OriginalSyncRoomPowerLevelsEvent, _client: Client, _room: Room| async move {
                 power_levels_count.fetch_add(1, SeqCst);
-                future::ready(())
             }
         });
         client.add_event_handler({
             let invited_member_count = invited_member_count.clone();
-            move |_ev: StrippedRoomMemberEvent| {
+            move |_ev: StrippedRoomMemberEvent| async move {
                 invited_member_count.fetch_add(1, SeqCst);
-                future::ready(())
             }
         });
 
@@ -739,9 +734,8 @@ mod tests {
 
         client.add_event_handler({
             let member_count = member_count.clone();
-            move |_ev: OriginalSyncRoomMemberEvent| {
+            move |_ev: OriginalSyncRoomMemberEvent| async move {
                 member_count.fetch_add(1, SeqCst);
-                future::ready(())
             }
         });
 
@@ -758,9 +752,8 @@ mod tests {
 
         client.add_event_handler({
             let member_count = member_count.clone();
-            move |_ev: OriginalSyncRoomMemberEvent| {
+            move |_ev: OriginalSyncRoomMemberEvent| async move {
                 member_count.fetch_add(1, SeqCst);
-                future::ready(())
             }
         });
 

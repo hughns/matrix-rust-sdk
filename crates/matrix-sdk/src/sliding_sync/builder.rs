@@ -1,5 +1,11 @@
-use std::{collections::BTreeMap, fmt::Debug, sync::RwLock as StdRwLock, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt::Debug,
+    sync::{Arc, RwLock as StdRwLock},
+    time::Duration,
+};
 
+use matrix_sdk_common::{ring_buffer::RingBuffer, timer};
 use ruma::{
     api::client::sync::sync_events::v4::{
         self, AccountDataConfig, E2EEConfig, ExtensionsConfig, ReceiptsConfig, ToDeviceConfig,
@@ -7,7 +13,7 @@ use ruma::{
     },
     OwnedRoomId,
 };
-use tokio::sync::{broadcast::channel, RwLock as AsyncRwLock};
+use tokio::sync::{broadcast::channel, Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use url::Url;
 
 use super::{
@@ -34,6 +40,8 @@ pub struct SlidingSyncBuilder {
     rooms: BTreeMap<OwnedRoomId, SlidingSyncRoom>,
     poll_timeout: Duration,
     network_timeout: Duration,
+    #[cfg(feature = "e2e-encryption")]
+    share_pos: bool,
 }
 
 impl SlidingSyncBuilder {
@@ -56,6 +64,8 @@ impl SlidingSyncBuilder {
                 rooms: BTreeMap::new(),
                 poll_timeout: Duration::from_secs(30),
                 network_timeout: Duration::from_secs(30),
+                #[cfg(feature = "e2e-encryption")]
+                share_pos: false,
             })
         }
     }
@@ -87,6 +97,8 @@ impl SlidingSyncBuilder {
     ///
     /// Replace any list with the same name.
     pub async fn add_cached_list(mut self, mut list: SlidingSyncListBuilder) -> Result<Self> {
+        let _timer = timer!(format!("restoring (loading+processing) list {}", list.name));
+
         let reloaded_rooms = list.set_cached_and_reload(&self.client, &self.storage_key).await?;
 
         for (key, frozen) in reloaded_rooms {
@@ -214,14 +226,26 @@ impl SlidingSyncBuilder {
         self
     }
 
+    /// Should the sliding sync instance share its sync position through
+    /// storage?
+    ///
+    /// In general, sliding sync instances will cache the sync position (`pos`
+    /// field in the request) in internal memory. It can be useful, in
+    /// multi-process scenarios, to save it into some shared storage so that one
+    /// sliding sync instance running across two different processes can
+    /// continue with the same sync position it had before being stopped.
+    #[cfg(feature = "e2e-encryption")]
+    pub fn share_pos(mut self) -> Self {
+        self.share_pos = true;
+        self
+    }
+
     /// Build the Sliding Sync.
     ///
     /// If `self.storage_key` is `Some(_)`, load the cached data from cold
     /// storage.
     pub async fn build(self) -> Result<SlidingSync> {
         let client = self.client;
-
-        let mut delta_token = None;
 
         let (internal_channel_sender, _internal_channel_receiver) = channel(8);
 
@@ -234,14 +258,24 @@ impl SlidingSyncBuilder {
         }
 
         // Reload existing state from the cache.
-        restore_sliding_sync_state(
-            &client,
-            &self.storage_key,
-            &lists,
-            &mut delta_token,
-            &mut None, // to_device_token is ignored here
-        )
-        .await?;
+        let restored_fields =
+            restore_sliding_sync_state(&client, &self.storage_key, &lists).await?;
+
+        let (delta_token, pos) = if let Some(fields) = restored_fields {
+            #[cfg(feature = "e2e-encryption")]
+            let pos = if self.share_pos { fields.pos } else { None };
+            #[cfg(not(feature = "e2e-encryption"))]
+            let pos = None;
+
+            (fields.delta_token, pos)
+        } else {
+            (None, None)
+        };
+
+        #[cfg(feature = "e2e-encryption")]
+        let share_pos = self.share_pos;
+        #[cfg(not(feature = "e2e-encryption"))]
+        let share_pos = false;
 
         let rooms = AsyncRwLock::new(self.rooms);
         let lists = AsyncRwLock::new(lists);
@@ -256,11 +290,13 @@ impl SlidingSyncBuilder {
 
             client,
             storage_key: self.storage_key,
+            share_pos,
 
             lists,
             rooms,
 
-            position: StdRwLock::new(SlidingSyncPositionMarkers { pos: None, delta_token }),
+            position: Arc::new(AsyncMutex::new(SlidingSyncPositionMarkers { pos, delta_token })),
+            past_positions: StdRwLock::new(RingBuffer::new(20)),
 
             sticky: StdRwLock::new(SlidingSyncStickyManager::new(
                 SlidingSyncStickyParameters::new(

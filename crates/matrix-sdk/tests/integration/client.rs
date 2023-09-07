@@ -7,6 +7,7 @@ use matrix_sdk::{
     media::{MediaFormat, MediaRequest, MediaThumbnailSize},
     sync::RoomUpdate,
 };
+use matrix_sdk_base::RoomState;
 use matrix_sdk_test::{async_test, test_json};
 use ruma::{
     api::client::{
@@ -143,26 +144,21 @@ async fn join_leave_room() {
 
     mock_sync(&server, &*test_json::SYNC, None).await;
 
-    let room = client.get_joined_room(room_id);
+    let room = client.get_room(room_id);
     assert!(room.is_none());
 
     let sync_token = client.sync_once(SyncSettings::default()).await.unwrap().next_batch;
 
-    let room = client.get_left_room(room_id);
-    assert!(room.is_none());
-
-    let room = client.get_joined_room(room_id);
-    assert!(room.is_some());
+    let room = client.get_room(room_id).unwrap();
+    assert_eq!(room.state(), RoomState::Joined);
 
     mock_sync(&server, &*test_json::LEAVE_SYNC_EVENT, Some(sync_token.clone())).await;
 
     client.sync_once(SyncSettings::default().token(sync_token)).await.unwrap();
 
-    let room = client.get_joined_room(room_id);
-    assert!(room.is_none());
-
-    let room = client.get_left_room(room_id);
-    assert!(room.is_some());
+    assert_eq!(room.state(), RoomState::Left);
+    let room = client.get_room(room_id).unwrap();
+    assert_eq!(room.state(), RoomState::Left);
 }
 
 #[async_test]
@@ -258,7 +254,8 @@ async fn invited_rooms() {
     assert!(client.left_rooms().is_empty());
     assert!(!client.invited_rooms().is_empty());
 
-    assert!(client.get_invited_room(room_id!("!696r7674:example.com")).is_some());
+    let room = client.get_room(room_id!("!696r7674:example.com")).unwrap();
+    assert_eq!(room.state(), RoomState::Invited);
 }
 
 #[async_test]
@@ -273,7 +270,8 @@ async fn left_rooms() {
     assert!(!client.left_rooms().is_empty());
     assert!(client.invited_rooms().is_empty());
 
-    assert!(client.get_left_room(&test_json::DEFAULT_SYNC_ROOM_ID).is_some())
+    let room = client.get_room(&test_json::DEFAULT_SYNC_ROOM_ID).unwrap();
+    assert_eq!(room.state(), RoomState::Left);
 }
 
 #[async_test]
@@ -378,4 +376,57 @@ async fn room_update_channel() {
 
     assert_eq!(updates.unread_notifications.highlight_count, 0);
     assert_eq!(updates.unread_notifications.notification_count, 11);
+}
+
+// Check that the `Room::is_encrypted()` is properly deduplicated, meaning we
+// only make a single request to the server, and that multiple calls do return
+// the same result.
+#[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+#[async_test]
+async fn request_encryption_event_before_sending() {
+    let room_id = &test_json::DEFAULT_SYNC_ROOM_ID;
+    let (client, server) = logged_in_client().await;
+
+    mock_sync(&server, &*test_json::SYNC, None).await;
+    client
+        .sync_once(SyncSettings::default())
+        .await
+        .expect("We should be able to performa an initial sync");
+
+    let room = client.get_room(room_id).expect("We should know about our default room");
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/state/m.room.encryption/"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "rotation_period_ms": 604800000,
+                    "rotation_period_msgs": 100
+                }))
+                // Introduce a delay so the first `is_encrypted()` doesn't finish before we make
+                // the second call.
+                .set_delay(Duration::from_millis(50)),
+        )
+        .mount(&server)
+        .await;
+
+    let first_handle = tokio::spawn({
+        let room = room.to_owned();
+        async move { room.to_owned().is_encrypted().await }
+    });
+
+    let second_handle = tokio::spawn(async move { room.is_encrypted().await });
+
+    let first_encrypted =
+        first_handle.await.unwrap().expect("We should be able to test if the room is encrypted.");
+    let second_encrypted =
+        second_handle.await.unwrap().expect("We should be able to test if the room is encrypted.");
+
+    assert!(first_encrypted, "We should have found out that the room is encrypted.");
+    assert_eq!(
+        first_encrypted, second_encrypted,
+        "Both attempts to find out if the room is encrypted should return the same result."
+    );
 }

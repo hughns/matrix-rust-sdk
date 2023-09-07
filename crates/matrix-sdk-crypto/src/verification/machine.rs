@@ -41,7 +41,7 @@ use super::{
 use crate::{
     olm::PrivateCrossSigningIdentity,
     requests::OutgoingRequest,
-    store::{CryptoStoreError, DynCryptoStore, NoisyArc},
+    store::{CryptoStoreError, CryptoStoreWrapper, NoisyArc},
     OutgoingVerificationRequest, ReadOnlyAccount, ReadOnlyDevice, ReadOnlyUserIdentity,
     RoomMessageRequest, ToDeviceRequest,
 };
@@ -57,7 +57,7 @@ impl VerificationMachine {
     pub(crate) fn new(
         account: ReadOnlyAccount,
         identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
-        store: NoisyArc<DynCryptoStore>,
+        store: NoisyArc<CryptoStoreWrapper>,
     ) -> Self {
         Self {
             store: VerificationStore { account, private_identity: identity, inner: store },
@@ -535,12 +535,11 @@ mod tests {
     use super::{Sas, VerificationMachine};
     use crate::{
         olm::PrivateCrossSigningIdentity,
-        store::{IntoCryptoStore, MemoryStore},
+        store::{CryptoStoreWrapper, MemoryStore},
         verification::{
             cache::VerificationCache,
             event_enums::{AcceptContent, KeyContent, MacContent, OutgoingContent},
-            test::{alice_device_id, alice_id, setup_stores},
-            tests::wrap_any_to_device_content,
+            tests::{alice_device_id, alice_id, setup_stores, wrap_any_to_device_content},
             FlowId, VerificationStore,
         },
         ReadOnlyAccount, VerificationRequest,
@@ -578,10 +577,13 @@ mod tests {
 
     #[async_test]
     async fn create() {
-        let alice = ReadOnlyAccount::new(alice_id(), alice_device_id());
+        let alice = ReadOnlyAccount::with_device_id(alice_id(), alice_device_id());
         let identity = Arc::new(Mutex::new(PrivateCrossSigningIdentity::empty(alice_id())));
-        let store = MemoryStore::new();
-        let _ = VerificationMachine::new(alice, identity, store.into_crypto_store());
+        let _ = VerificationMachine::new(
+            alice,
+            identity,
+            Arc::new(CryptoStoreWrapper::new(alice_id(), MemoryStore::new())),
+        );
     }
 
     #[async_test]

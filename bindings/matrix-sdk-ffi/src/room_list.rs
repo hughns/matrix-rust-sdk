@@ -12,9 +12,15 @@ use matrix_sdk::{
     },
     RoomListEntry as MatrixRoomListEntry,
 };
+use matrix_sdk_ui::room_list_service::filters::{
+    new_filter_all, new_filter_fuzzy_match_room_name, new_filter_normalized_match_room_name,
+};
 use tokio::sync::RwLock;
 
-use crate::{room::Room, timeline::EventTimelineItem, TaskHandle, RUNTIME};
+use crate::{
+    error::ClientError, room::Room, room_info::RoomInfo, timeline::EventTimelineItem, TaskHandle,
+    RUNTIME,
+};
 
 #[derive(uniffi::Error)]
 pub enum RoomListError {
@@ -109,6 +115,21 @@ impl RoomListService {
     async fn apply_input(&self, input: RoomListInput) -> Result<(), RoomListError> {
         self.inner.apply_input(input.into()).await.map(|_| ()).map_err(Into::into)
     }
+
+    fn sync_indicator(
+        &self,
+        listener: Box<dyn RoomListServiceSyncIndicatorListener>,
+    ) -> Arc<TaskHandle> {
+        let sync_indicator_stream = self.inner.sync_indicator();
+
+        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+            pin_mut!(sync_indicator_stream);
+
+            while let Some(sync_indicator) = sync_indicator_stream.next().await {
+                listener.on_update(sync_indicator.into());
+            }
+        })))
+    }
 }
 
 #[derive(uniffi::Object)]
@@ -137,22 +158,40 @@ impl RoomList {
         })
     }
 
-    fn entries(
-        &self,
-        listener: Box<dyn RoomListEntriesListener>,
-    ) -> Result<RoomListEntriesResult, RoomListError> {
+    fn entries(&self, listener: Box<dyn RoomListEntriesListener>) -> RoomListEntriesResult {
         let (entries, entries_stream) = self.inner.entries();
 
-        Ok(RoomListEntriesResult {
+        RoomListEntriesResult {
             entries: entries.into_iter().map(Into::into).collect(),
             entries_stream: Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
                 pin_mut!(entries_stream);
 
                 while let Some(diff) = entries_stream.next().await {
-                    listener.on_update(diff.into());
+                    listener.on_update(diff.into_iter().map(Into::into).collect());
                 }
             }))),
-        })
+        }
+    }
+
+    fn entries_with_dynamic_filter(
+        &self,
+        listener: Box<dyn RoomListEntriesListener>,
+    ) -> RoomListEntriesWithDynamicFilterResult {
+        let (entries_stream, dynamic_filter) = self.inner.entries_with_dynamic_filter();
+
+        RoomListEntriesWithDynamicFilterResult {
+            dynamic_filter: Arc::new(RoomListEntriesDynamicFilter::new(
+                dynamic_filter,
+                self.room_list_service.inner.client(),
+            )),
+            entries_stream: Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+                pin_mut!(entries_stream);
+
+                while let Some(diff) = entries_stream.next().await {
+                    listener.on_update(diff.into_iter().map(Into::into).collect());
+                }
+            }))),
+        }
     }
 
     fn room(&self, room_id: String) -> Result<Arc<RoomListItem>, RoomListError> {
@@ -167,6 +206,12 @@ pub struct RoomListEntriesResult {
 }
 
 #[derive(uniffi::Record)]
+pub struct RoomListEntriesWithDynamicFilterResult {
+    pub dynamic_filter: Arc<RoomListEntriesDynamicFilter>,
+    pub entries_stream: Arc<TaskHandle>,
+}
+
+#[derive(uniffi::Record)]
 pub struct RoomListLoadingStateResult {
     pub state: RoomListLoadingState,
     pub state_stream: Arc<TaskHandle>,
@@ -174,8 +219,11 @@ pub struct RoomListLoadingStateResult {
 
 #[derive(uniffi::Enum)]
 pub enum RoomListServiceState {
-    Init,
+    // Name it `Initial` instead of `Init`, otherwise it creates a keyword conflict in Swift
+    // as of 2023-08-21.
+    Initial,
     SettingUp,
+    Recovering,
     Running,
     Error,
     Terminated,
@@ -183,14 +231,32 @@ pub enum RoomListServiceState {
 
 impl From<matrix_sdk_ui::room_list_service::State> for RoomListServiceState {
     fn from(value: matrix_sdk_ui::room_list_service::State) -> Self {
-        use matrix_sdk_ui::room_list_service::State::*;
+        use matrix_sdk_ui::room_list_service::State as S;
 
         match value {
-            Init => Self::Init,
-            SettingUp => Self::SettingUp,
-            Running => Self::Running,
-            Error { .. } => Self::Error,
-            Terminated { .. } => Self::Terminated,
+            S::Init => Self::Initial,
+            S::SettingUp => Self::SettingUp,
+            S::Recovering => Self::Recovering,
+            S::Running => Self::Running,
+            S::Error { .. } => Self::Error,
+            S::Terminated { .. } => Self::Terminated,
+        }
+    }
+}
+
+#[derive(uniffi::Enum)]
+pub enum RoomListServiceSyncIndicator {
+    Show,
+    Hide,
+}
+
+impl From<matrix_sdk_ui::room_list_service::SyncIndicator> for RoomListServiceSyncIndicator {
+    fn from(value: matrix_sdk_ui::room_list_service::SyncIndicator) -> Self {
+        use matrix_sdk_ui::room_list_service::SyncIndicator as SI;
+
+        match value {
+            SI::Show => Self::Show,
+            SI::Hide => Self::Hide,
         }
     }
 }
@@ -203,11 +269,11 @@ pub enum RoomListLoadingState {
 
 impl From<matrix_sdk_ui::room_list_service::RoomListLoadingState> for RoomListLoadingState {
     fn from(value: matrix_sdk_ui::room_list_service::RoomListLoadingState) -> Self {
-        use matrix_sdk_ui::room_list_service::RoomListLoadingState::*;
+        use matrix_sdk_ui::room_list_service::RoomListLoadingState as LS;
 
         match value {
-            NotLoaded => Self::NotLoaded,
-            Loaded { maximum_number_of_rooms } => Self::Loaded { maximum_number_of_rooms },
+            LS::NotLoaded => Self::NotLoaded,
+            LS::Loaded { maximum_number_of_rooms } => Self::Loaded { maximum_number_of_rooms },
         }
     }
 }
@@ -220,6 +286,11 @@ pub trait RoomListServiceStateListener: Send + Sync + Debug {
 #[uniffi::export(callback_interface)]
 pub trait RoomListLoadingStateListener: Send + Sync + Debug {
     fn on_update(&self, state: RoomListLoadingState);
+}
+
+#[uniffi::export(callback_interface)]
+pub trait RoomListServiceSyncIndicatorListener: Send + Sync + Debug {
+    fn on_update(&self, sync_indicator: RoomListServiceSyncIndicator);
 }
 
 #[derive(uniffi::Enum)]
@@ -263,7 +334,46 @@ impl From<VectorDiff<matrix_sdk::RoomListEntry>> for RoomListEntriesUpdate {
 
 #[uniffi::export(callback_interface)]
 pub trait RoomListEntriesListener: Send + Sync + Debug {
-    fn on_update(&self, room_entries_update: RoomListEntriesUpdate);
+    fn on_update(&self, room_entries_update: Vec<RoomListEntriesUpdate>);
+}
+
+#[derive(uniffi::Object)]
+pub struct RoomListEntriesDynamicFilter {
+    inner: matrix_sdk_ui::room_list_service::DynamicRoomListFilter,
+    client: matrix_sdk::Client,
+}
+
+impl RoomListEntriesDynamicFilter {
+    fn new(
+        dynamic_filter: matrix_sdk_ui::room_list_service::DynamicRoomListFilter,
+        client: &matrix_sdk::Client,
+    ) -> Self {
+        Self { inner: dynamic_filter, client: client.clone() }
+    }
+}
+
+#[uniffi::export]
+impl RoomListEntriesDynamicFilter {
+    fn set(&self, kind: RoomListEntriesDynamicFilterKind) -> bool {
+        use RoomListEntriesDynamicFilterKind as Kind;
+
+        match kind {
+            Kind::All => self.inner.set(new_filter_all()),
+            Kind::NormalizedMatchRoomName { pattern } => {
+                self.inner.set(new_filter_normalized_match_room_name(&self.client, &pattern))
+            }
+            Kind::FuzzyMatchRoomName { pattern } => {
+                self.inner.set(new_filter_fuzzy_match_room_name(&self.client, &pattern))
+            }
+        }
+    }
+}
+
+#[derive(uniffi::Enum)]
+pub enum RoomListEntriesDynamicFilterKind {
+    All,
+    NormalizedMatchRoomName { pattern: String },
+    FuzzyMatchRoomName { pattern: String },
 }
 
 #[derive(uniffi::Object)]
@@ -281,16 +391,22 @@ impl RoomListItem {
         RUNTIME.block_on(async { self.inner.name().await })
     }
 
-    pub fn is_direct(&self) -> bool {
+    fn avatar_url(&self) -> Option<String> {
+        self.inner.avatar_url().map(|uri| uri.to_string())
+    }
+
+    fn is_direct(&self) -> bool {
         RUNTIME.block_on(async { self.inner.inner_room().is_direct().await.unwrap_or(false) })
     }
 
-    pub fn avatar_url(&self) -> Option<String> {
-        self.inner.inner_room().avatar_url().map(|uri| uri.to_string())
+    fn canonical_alias(&self) -> Option<String> {
+        self.inner.inner_room().canonical_alias().map(|alias| alias.to_string())
     }
 
-    pub fn canonical_alias(&self) -> Option<String> {
-        self.inner.inner_room().canonical_alias().map(|alias| alias.to_string())
+    pub async fn room_info(&self) -> Result<RoomInfo, ClientError> {
+        let avatar_url = self.inner.avatar_url();
+        let latest_event = self.inner.latest_event().await.map(EventTimelineItem).map(Arc::new);
+        Ok(RoomInfo::new(self.inner.inner_room(), avatar_url, latest_event).await?)
     }
 
     /// Building a `Room`.
@@ -315,10 +431,7 @@ impl RoomListItem {
     async fn latest_event(&self) -> Option<Arc<EventTimelineItem>> {
         self.inner.latest_event().await.map(EventTimelineItem).map(Arc::new)
     }
-}
 
-#[uniffi::export]
-impl RoomListItem {
     fn has_unread_notifications(&self) -> bool {
         self.inner.has_unread_notifications()
     }
@@ -384,13 +497,15 @@ pub struct UnreadNotificationsCount {
 
 #[uniffi::export]
 impl UnreadNotificationsCount {
-    pub fn highlight_count(&self) -> u32 {
+    fn highlight_count(&self) -> u32 {
         self.highlight_count
     }
-    pub fn notification_count(&self) -> u32 {
+
+    fn notification_count(&self) -> u32 {
         self.notification_count
     }
-    pub fn has_notifications(&self) -> bool {
+
+    fn has_notifications(&self) -> bool {
         self.notification_count != 0 || self.highlight_count != 0
     }
 }

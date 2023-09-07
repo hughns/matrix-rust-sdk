@@ -80,6 +80,14 @@ impl TimelineItem {
         })
     }
 
+    pub(crate) fn is_local_echo(&self) -> bool {
+        matches!(&self.kind, TimelineItemKind::Event(ev) if ev.is_local_echo())
+    }
+
+    pub(crate) fn is_remote_event(&self) -> bool {
+        matches!(&self.kind, TimelineItemKind::Event(ev) if ev.is_remote_event())
+    }
+
     pub(crate) fn is_virtual(&self) -> bool {
         matches!(self.kind, TimelineItemKind::Virtual(_))
     }
@@ -118,13 +126,4 @@ pub(crate) fn timeline_item(
     internal_id: u64,
 ) -> Arc<TimelineItem> {
     Arc::new(TimelineItem { kind: kind.into(), internal_id })
-}
-
-pub(crate) fn new_timeline_item(
-    kind: impl Into<TimelineItemKind>,
-    next_internal_id: &mut u64,
-) -> Arc<TimelineItem> {
-    let internal_id = *next_internal_id;
-    *next_internal_id += 1;
-    timeline_item(kind, internal_id)
 }
