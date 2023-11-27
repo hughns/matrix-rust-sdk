@@ -10,17 +10,11 @@ use std::{
 use tracing::{error, info};
 
 #[derive(Debug)]
-pub struct NoisyArc<T: ?Sized> {
+pub struct NoisyArc<T: ?Sized + Debug> {
     ptr: Arc<NoisyArcInner<T>>,
 
     /// unique id for this ref to the inner
     id: u64,
-}
-
-impl<T> NoisyArc<T> {
-    pub fn as_ref(&self) -> &T {
-        self.ptr.inner.as_ref()
-    }
 }
 
 impl<T: ?Sized + Debug> Clone for NoisyArc<T> {
@@ -36,13 +30,18 @@ impl<T: ?Sized + Debug> Clone for NoisyArc<T> {
     }
 }
 
-impl<T: ?Sized> Drop for NoisyArc<T> {
+impl<T: ?Sized + Debug> Drop for NoisyArc<T> {
     fn drop(&mut self) {
-        info!("NoisyArc::drop({}). Refcount before drop {}", self.id, Arc::strong_count(&self.ptr));
+        info!(
+            "NoisyArc::drop({}) {:?}. Refcount before drop {}",
+            self.id,
+            self.ptr.inner,
+            Arc::strong_count(&self.ptr)
+        );
     }
 }
 
-impl<T: ?Sized> Deref for NoisyArc<T> {
+impl<T: ?Sized + Debug> Deref for NoisyArc<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -90,6 +89,10 @@ impl<T: Debug + ?Sized> NoisyArc<T> {
             Arc::strong_count(&res.ptr)
         );
         res
+    }
+
+    pub fn as_ref(&self) -> &T {
+        self.ptr.inner.as_ref()
     }
 }
 
