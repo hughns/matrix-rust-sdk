@@ -16,6 +16,7 @@
 
 use std::{io::Error as IoError, sync::Arc};
 
+use as_variant::as_variant;
 #[cfg(feature = "qrcode")]
 use matrix_sdk_base::crypto::ScanError;
 #[cfg(feature = "e2e-encryption")]
@@ -26,16 +27,21 @@ use matrix_sdk_base::{Error as SdkBaseError, RoomState, StoreError};
 use reqwest::Error as ReqwestError;
 use ruma::{
     api::{
-        client::uiaa::{UiaaInfo, UiaaResponse},
+        client::{
+            error::{ErrorBody, ErrorKind},
+            uiaa::{UiaaInfo, UiaaResponse},
+        },
         error::{FromHttpResponseError, IntoHttpError},
     },
     events::tag::InvalidUserTagName,
-    push::{InsertPushRuleError, RemovePushRuleError, RuleNotFoundError},
+    push::{InsertPushRuleError, RemovePushRuleError},
     IdParseError,
 };
 use serde_json::Error as JsonError;
 use thiserror::Error;
 use url::ParseError as UrlParseError;
+
+use crate::store_locks::LockStoreError;
 
 /// Result type of the matrix-sdk.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -70,10 +76,7 @@ impl RumaApiError {
     ///
     /// Otherwise, returns `None`.
     pub fn as_client_api_error(&self) -> Option<&ruma::api::client::Error> {
-        match self {
-            Self::ClientApi(e) => Some(e),
-            _ => None,
-        }
+        as_variant!(self, Self::ClientApi)
     }
 }
 
@@ -119,10 +122,7 @@ impl HttpError {
     ///
     /// Otherwise, returns `None`.
     pub fn as_ruma_api_error(&self) -> Option<&RumaApiError> {
-        match self {
-            Self::Api(FromHttpResponseError::Server(e)) => Some(e),
-            _ => None,
-        }
+        as_variant!(self, Self::Api(FromHttpResponseError::Server(e)) => e)
     }
 
     /// Shorthand for
@@ -133,10 +133,9 @@ impl HttpError {
 
     /// If `self` is a server error in the `errcode` + `error` format expected
     /// for client-API endpoints, returns the error kind (`errcode`).
-    pub fn client_api_error_kind(&self) -> Option<&ruma::api::client::error::ErrorKind> {
-        self.as_client_api_error().and_then(|e| match &e.body {
-            ruma::api::client::error::ErrorBody::Standard { kind, .. } => Some(kind),
-            _ => None,
+    pub fn client_api_error_kind(&self) -> Option<&ErrorKind> {
+        self.as_client_api_error().and_then(|e| {
+            as_variant!(&e.body, ErrorBody::Standard { kind, .. } => kind)
         })
     }
 
@@ -152,10 +151,7 @@ impl HttpError {
     /// This method is an convenience method to get to the info the server
     /// returned on the first, failed request.
     pub fn as_uiaa_response(&self) -> Option<&UiaaInfo> {
-        match self.as_ruma_api_error() {
-            Some(RumaApiError::Uiaa(i)) => Some(i),
-            _ => None,
-        }
+        self.as_ruma_api_error().and_then(as_variant!(RumaApiError::Uiaa))
     }
 }
 
@@ -199,6 +195,10 @@ pub enum Error {
     #[cfg(feature = "e2e-encryption")]
     #[error(transparent)]
     CryptoStoreError(#[from] CryptoStoreError),
+
+    /// An error occurred with a cross-process store lock.
+    #[error(transparent)]
+    CrossProcessLockError(#[from] LockStoreError),
 
     /// An error occurred during a E2EE operation.
     #[cfg(feature = "e2e-encryption")]
@@ -257,10 +257,18 @@ pub enum Error {
     #[error("The internal client state is inconsistent.")]
     InconsistentState,
 
+    /// Session callbacks have been set multiple times.
+    #[error("session callbacks have been set multiple times")]
+    MultipleSessionCallbacks,
+
     /// An error occurred interacting with the OpenID Connect API.
     #[cfg(feature = "experimental-oidc")]
     #[error(transparent)]
     Oidc(#[from] crate::oidc::OidcError),
+
+    /// A concurrent request to a deduplicated request has failed.
+    #[error("a concurrent request failed; see logs for details")]
+    ConcurrentRequestFailed,
 
     /// An other error was raised
     /// this might happen because encryption was enabled on the base-crate
@@ -277,10 +285,7 @@ impl Error {
     ///
     /// Otherwise, returns `None`.
     pub fn as_ruma_api_error(&self) -> Option<&RumaApiError> {
-        match self {
-            Error::Http(e) => e.as_ruma_api_error(),
-            _ => None,
-        }
+        as_variant!(self, Self::Http).and_then(|e| e.as_ruma_api_error())
     }
 
     /// Shorthand for
@@ -291,10 +296,9 @@ impl Error {
 
     /// If `self` is a server error in the `errcode` + `error` format expected
     /// for client-API endpoints, returns the error kind (`errcode`).
-    pub fn client_api_error_kind(&self) -> Option<&ruma::api::client::error::ErrorKind> {
-        self.as_client_api_error().and_then(|e| match &e.body {
-            ruma::api::client::error::ErrorBody::Standard { kind, .. } => Some(kind),
-            _ => None,
+    pub fn client_api_error_kind(&self) -> Option<&ErrorKind> {
+        self.as_client_api_error().and_then(|e| {
+            as_variant!(&e.body, ErrorBody::Standard { kind, .. } => kind)
         })
     }
 
@@ -310,10 +314,7 @@ impl Error {
     /// This method is an convenience method to get to the info the server
     /// returned on the first, failed request.
     pub fn as_uiaa_response(&self) -> Option<&UiaaInfo> {
-        match self.as_ruma_api_error() {
-            Some(RumaApiError::Uiaa(i)) => Some(i),
-            _ => None,
-        }
+        self.as_ruma_api_error().and_then(as_variant!(RumaApiError::Uiaa))
     }
 }
 
@@ -452,7 +453,7 @@ pub enum NotificationSettingsError {
     UnableToUpdatePushRule,
     /// Rule not found
     #[error("Rule not found")]
-    RuleNotFound,
+    RuleNotFound(String),
     /// Unable to save the push rules
     #[error("Unable to save push rules")]
     UnableToSavePushRules,
@@ -467,12 +468,6 @@ impl From<InsertPushRuleError> for NotificationSettingsError {
 impl From<RemovePushRuleError> for NotificationSettingsError {
     fn from(_: RemovePushRuleError) -> Self {
         Self::UnableToRemovePushRule
-    }
-}
-
-impl From<RuleNotFoundError> for NotificationSettingsError {
-    fn from(_: RuleNotFoundError) -> Self {
-        Self::RuleNotFound
     }
 }
 

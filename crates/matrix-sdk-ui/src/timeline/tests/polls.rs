@@ -1,23 +1,21 @@
-use matrix_sdk_test::async_test;
+use matrix_sdk_test::{async_test, ALICE, BOB};
 use ruma::{
     events::{
         poll::{
             unstable_end::UnstablePollEndEventContent,
             unstable_response::UnstablePollResponseEventContent,
-            unstable_start::{UnstablePollStartContentBlock, UnstablePollStartEventContent},
+            unstable_start::{
+                NewUnstablePollStartEventContent, ReplacementUnstablePollStartEventContent,
+                UnstablePollStartContentBlock,
+            },
         },
-        relation::Replacement,
-        room::message::Relation,
         AnyMessageLikeEventContent,
     },
-    serde::Raw,
     server_name, EventId, OwnedEventId, UserId,
 };
 
 use crate::timeline::{
-    polls::PollState,
-    tests::{TestTimeline, ALICE, BOB},
-    EventTimelineItem, TimelineItemContent,
+    polls::PollState, tests::TestTimeline, EventTimelineItem, TimelineItemContent,
 };
 
 #[async_test]
@@ -39,10 +37,13 @@ async fn edited_poll_is_displayed() {
     let event = timeline.poll_event().await;
     let event_id = event.event_id().unwrap();
     timeline.send_poll_edit(&ALICE, event_id, fakes::poll_b()).await;
+    let poll_state = event.poll_state();
     let edited_poll_state = timeline.poll_state().await;
 
-    assert_poll_start_eq(&event.poll_state().start_event_content.poll_start, &fakes::poll_a());
+    assert_poll_start_eq(&poll_state.start_event_content.poll_start, &fakes::poll_a());
     assert_poll_start_eq(&edited_poll_state.start_event_content.poll_start, &fakes::poll_b());
+    assert!(!poll_state.has_been_edited);
+    assert!(edited_poll_state.has_been_edited);
 }
 
 #[async_test]
@@ -192,16 +193,16 @@ impl TestTimeline {
     }
 
     async fn poll_event(&self) -> EventTimelineItem {
-        self.event_items().await.first().unwrap().clone()
+        self.event_items().await[0].clone()
     }
 
     async fn poll_state(&self) -> PollState {
-        self.event_items().await.first().unwrap().clone().poll_state()
+        self.event_items().await[0].clone().poll_state()
     }
 
     async fn send_poll_start(&self, sender: &UserId, content: UnstablePollStartContentBlock) {
         let event_content = AnyMessageLikeEventContent::UnstablePollStart(
-            UnstablePollStartEventContent::new(content),
+            NewUnstablePollStartEventContent::new(content).into(),
         );
         self.handle_live_message_event(sender, event_content).await;
     }
@@ -213,11 +214,11 @@ impl TestTimeline {
         content: UnstablePollStartContentBlock,
     ) {
         let event_content = AnyMessageLikeEventContent::UnstablePollStart(
-            UnstablePollStartEventContent::new(content),
+            NewUnstablePollStartEventContent::new(content).into(),
         );
-        let event = self.make_message_event_with_id(sender, event_content, event_id.to_owned());
-        let raw = Raw::new(&event).unwrap().cast();
-        self.handle_live_event(raw).await;
+        let event =
+            self.event_builder.make_sync_message_event_with_id(sender, event_id, event_content);
+        self.handle_live_event(event).await;
     }
 
     async fn send_poll_response(&self, sender: &UserId, answers: Vec<&str>, poll_id: &EventId) {
@@ -243,12 +244,9 @@ impl TestTimeline {
         original_id: &EventId,
         content: UnstablePollStartContentBlock,
     ) {
-        let mut content = UnstablePollStartEventContent::new(content);
-        content.relates_to = Some(Relation::Replacement(Replacement::new(
-            original_id.to_owned(),
-            content.clone().into(),
-        )));
-        let event_content = AnyMessageLikeEventContent::UnstablePollStart(content);
+        let content =
+            ReplacementUnstablePollStartEventContent::new(content, original_id.to_owned());
+        let event_content = AnyMessageLikeEventContent::UnstablePollStart(content.into());
         self.handle_live_message_event(sender, event_content).await
     }
 }

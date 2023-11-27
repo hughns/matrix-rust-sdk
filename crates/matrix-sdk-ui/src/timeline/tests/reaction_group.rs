@@ -12,15 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use itertools::Itertools;
+use matrix_sdk_test::{ALICE, BOB};
 use ruma::{server_name, uint, user_id, EventId, MilliSecondsSinceUnixEpoch, OwnedUserId, UserId};
 
-use crate::timeline::{
-    event_item::EventItemIdentifier,
-    tests::{ALICE, BOB},
-    ReactionGroup, ReactionSenderData,
-};
+use crate::timeline::{event_item::EventItemIdentifier, ReactionGroup, ReactionSenderData};
 
 #[test]
 fn by_sender() {
@@ -36,12 +33,10 @@ fn by_sender() {
 
     let alice_reactions = reaction_group.by_sender(&alice).collect::<Vec<_>>();
 
-    let reaction = *alice_reactions.get(0).unwrap();
+    let reaction = alice_reactions[0];
 
-    assert_matches!(
-        reaction_1,
-        EventItemIdentifier::EventId(event_id) => { assert_eq!(reaction.1.unwrap(), &event_id) }
-    )
+    assert_let!(EventItemIdentifier::EventId(event_id) = reaction_1);
+    assert_eq!(reaction.1.unwrap(), &event_id);
 }
 
 #[test]

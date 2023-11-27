@@ -113,14 +113,15 @@ pub struct OlmMachine {
 
 impl Drop for OlmMachine {
     fn drop(&mut self) {
-        // SAFETY: self.inner is never used again, which is the only requirement
-        //         for ManuallyDrop::take to be used safely.
-        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
-        let _guard = self.runtime.enter();
         // Dropping the inner OlmMachine must happen within a tokio context
         // because deadpool drops sqlite connections in the DB pool on tokio's
         // blocking threadpool to avoid blocking async worker threads.
-        drop(inner);
+        let _guard = self.runtime.enter();
+        // SAFETY: self.inner is never used again, which is the only requirement
+        //         for ManuallyDrop::drop to be used safely.
+        unsafe {
+            ManuallyDrop::drop(&mut self.inner);
+        }
     }
 }
 
@@ -566,7 +567,7 @@ impl OlmMachine {
     ///
     /// *Note*: Only users that aren't already tracked will be considered for an
     /// update. It's safe to call this with already tracked users, it won't
-    /// result in excessive keys query requests.
+    /// result in excessive `/keys/query` requests.
     ///
     /// # Arguments
     ///
@@ -789,11 +790,11 @@ impl OlmMachine {
         content: String,
     ) -> Result<String, CryptoStoreError> {
         let room_id = RoomId::parse(room_id)?;
-        let content: Value = serde_json::from_str(&content)?;
+        let content = serde_json::from_str(&content)?;
 
         let encrypted_content = self
             .runtime
-            .block_on(self.inner.encrypt_room_event_raw(&room_id, content, &event_type))
+            .block_on(self.inner.encrypt_room_event_raw(&room_id, &event_type, &content))
             .expect("Encrypting an event produced an error");
 
         Ok(serde_json::to_string(&encrypted_content)?)
@@ -1295,6 +1296,16 @@ impl OlmMachine {
         Ok(())
     }
 
+    /// Request missing local secrets from our devices (cross signing private
+    /// keys, megolm backup). This will ask the sdk to create outgoing
+    /// request to get the missing secrets.
+    ///
+    /// The requests will be processed as soon as `outgoing_requests()` is
+    /// called to process them.
+    pub fn query_missing_secrets_from_other_sessions(&self) -> Result<bool, CryptoStoreError> {
+        Ok(self.runtime.block_on(self.inner.query_missing_secrets_from_other_sessions())?)
+    }
+
     /// Activate the given backup key to be used with the given backup version.
     ///
     /// **Warning**: The caller needs to make sure that the given `BackupKey` is
@@ -1379,9 +1390,13 @@ impl OlmMachine {
 
     /// Sign the given message using our device key and if available cross
     /// signing master key.
-    pub fn sign(&self, message: String) -> HashMap<String, HashMap<String, String>> {
-        self.runtime
-            .block_on(self.inner.sign(&message))
+    pub fn sign(
+        &self,
+        message: String,
+    ) -> Result<HashMap<String, HashMap<String, String>>, CryptoStoreError> {
+        Ok(self
+            .runtime
+            .block_on(self.inner.sign(&message))?
             .into_iter()
             .map(|(k, v)| {
                 (
@@ -1399,7 +1414,7 @@ impl OlmMachine {
                         .collect(),
                 )
             })
-            .collect()
+            .collect())
     }
 
     /// Check if the given backup has been verified by us or by another of our
@@ -1450,6 +1465,7 @@ impl OlmMachine {
             progress_listener.on_progress(progress as i32, total as i32)
         };
 
+        #[allow(deprecated)]
         let result =
             self.runtime.block_on(self.inner.import_room_keys(keys, from_backup, listener))?;
 

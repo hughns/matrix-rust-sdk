@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
-use matrix_sdk_test::async_test;
+use matrix_sdk_test::{async_test, sync_timeline_event, ALICE, BOB};
 use ruma::{
     assign,
     events::{
@@ -24,10 +24,9 @@ use ruma::{
     },
     uint, MilliSecondsSinceUnixEpoch,
 };
-use serde_json::json;
 use stream_assert::assert_next_matches;
 
-use super::{TestTimeline, ALICE, BOB};
+use super::TestTimeline;
 use crate::timeline::TimelineItemContent;
 
 #[async_test]
@@ -64,7 +63,7 @@ async fn invalid_event_content() {
     // m.room.message events must have a msgtype and body in content, so this
     // event with an empty content object should fail to deserialize.
     timeline
-        .handle_live_custom_event(json!({
+        .handle_live_custom_event(sync_timeline_event!({
             "content": {},
             "event_id": "$eeG0HA0FAZ37wP8kXlNkxx3I",
             "origin_server_ts": 10,
@@ -77,16 +76,13 @@ async fn invalid_event_content() {
     assert_eq!(item.sender(), "@alice:example.org");
     assert_eq!(item.event_id().unwrap(), "$eeG0HA0FAZ37wP8kXlNkxx3I");
     assert_eq!(item.timestamp(), MilliSecondsSinceUnixEpoch(uint!(10)));
-    let event_type = assert_matches!(
-        item.content(),
-        TimelineItemContent::FailedToParseMessageLike { event_type, .. } => event_type
-    );
+    assert_let!(TimelineItemContent::FailedToParseMessageLike { event_type, .. } = item.content());
     assert_eq!(*event_type, MessageLikeEventType::RoomMessage);
 
     // Similar to above, the m.room.member state event must also not have an
     // empty content object.
     timeline
-        .handle_live_custom_event(json!({
+        .handle_live_custom_event(sync_timeline_event!({
             "content": {},
             "event_id": "$d5G0HA0FAZ37wP8kXlNkxx3I",
             "origin_server_ts": 2179,
@@ -100,13 +96,8 @@ async fn invalid_event_content() {
     assert_eq!(item.sender(), "@alice:example.org");
     assert_eq!(item.event_id().unwrap(), "$d5G0HA0FAZ37wP8kXlNkxx3I");
     assert_eq!(item.timestamp(), MilliSecondsSinceUnixEpoch(uint!(2179)));
-    let (event_type, state_key) = assert_matches!(
-        item.content(),
-        TimelineItemContent::FailedToParseState {
-            event_type,
-            state_key,
-            ..
-        } => (event_type, state_key)
+    assert_let!(
+        TimelineItemContent::FailedToParseState { event_type, state_key, .. } = item.content()
     );
     assert_eq!(*event_type, StateEventType::RoomMember);
     assert_eq!(state_key, "@alice:example.org");
@@ -119,7 +110,7 @@ async fn invalid_event() {
     // This event is missing the sender field which the homeserver must add to
     // all timeline events. Because the event is malformed, it will be ignored.
     timeline
-        .handle_live_custom_event(json!({
+        .handle_live_custom_event(sync_timeline_event!({
             "content": {
                 "body": "hello world",
                 "msgtype": "m.text"

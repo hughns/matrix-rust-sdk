@@ -1,15 +1,19 @@
 use anyhow::Result;
+use assert_matches::assert_matches;
 use assign::assign;
 use matrix_sdk::{
     config::SyncSettings,
     ruma::{
         api::client::room::create_room::v3::Request as CreateRoomRequest,
-        events::{room::name::RoomNameEventContent, StateEventType},
+        events::{
+            room::name::{RoomNameEventContent, SyncRoomNameEvent},
+            AnySyncStateEvent, StateEventType,
+        },
     },
     Client,
 };
 
-use crate::helpers::get_client_for_user;
+use crate::helpers::TestClientBuilder;
 
 async fn sync_once(client: &Client, sync_token: Option<String>) -> Result<String> {
     let settings = match sync_token {
@@ -23,7 +27,7 @@ async fn sync_once(client: &Client, sync_token: Option<String>) -> Result<String
 #[ignore = "Broken since synapse update, see #1069"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_redacting_name() -> Result<()> {
-    let tamatoa = get_client_for_user("tamatoa".to_owned(), true).await?;
+    let tamatoa = TestClientBuilder::new("tamatoa".to_owned()).use_sqlite().build().await?;
     // create a room
     let request = assign!(CreateRoomRequest::new(), {
         is_direct: true,
@@ -42,7 +46,7 @@ async fn test_redacting_name() -> Result<()> {
     let room = tamatoa.get_room(&room_id).unwrap();
     // let's send a specific state event
 
-    let content = RoomNameEventContent::new(Some("Inappropriate text".to_owned()));
+    let content = RoomNameEventContent::new("Inappropriate text".to_owned());
 
     room.send_state_event(content).await?;
     // sync up.
@@ -63,9 +67,9 @@ async fn test_redacting_name() -> Result<()> {
         room.get_state_event(StateEventType::RoomName, "").await?.expect("Room Name not found");
     let room_name_event = raw_event.cast::<RoomNameEventContent>().deserialize()?;
     let sync_room_name_event = room_name_event.as_sync().expect("event is sync event");
-    assert!(
-        sync_room_name_event.as_original().expect("event exists").content.name.is_some(),
-        "Event not found"
+    assert_eq!(
+        sync_room_name_event.as_original().expect("event exists").content.name,
+        "Inappropriate text"
     );
 
     room.redact(sync_room_name_event.event_id(), None, None).await?;
@@ -82,18 +86,11 @@ async fn test_redacting_name() -> Result<()> {
 
     let raw_event =
         room.get_state_event(StateEventType::RoomName, "").await?.expect("Room Name not found");
-    let room_name_event = raw_event.cast::<RoomNameEventContent>().deserialize()?;
+    let event = raw_event.deserialize()?;
     // Name content has been redacted
-    assert!(
-        room_name_event
-            .as_sync()
-            .expect("event is sync event")
-            .as_original()
-            .expect("event exists")
-            .content
-            .name
-            .is_none(),
-        "Event hasn't been redacted"
+    assert_matches!(
+        event.as_sync().expect("event is sync event"),
+        AnySyncStateEvent::RoomName(SyncRoomNameEvent::Redacted(_))
     );
 
     Ok(())
@@ -102,7 +99,7 @@ async fn test_redacting_name() -> Result<()> {
 #[ignore = "Broken since synapse update, see #1069"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_redacting_name_static() -> Result<()> {
-    let tamatoa = get_client_for_user("tamatoa".to_owned(), true).await?;
+    let tamatoa = TestClientBuilder::new("tamatoa".to_owned()).use_sqlite().build().await?;
     // create a room
     let request = assign!(CreateRoomRequest::new(), {
         is_direct: true,
@@ -121,7 +118,7 @@ async fn test_redacting_name_static() -> Result<()> {
     let room = tamatoa.get_room(&room_id).unwrap();
 
     // let's send a specific state event
-    let content = RoomNameEventContent::new(Some("Inappropriate text".to_owned()));
+    let content = RoomNameEventContent::new("Inappropriate text".to_owned());
 
     room.send_state_event(content).await?;
     // sync up.
@@ -143,9 +140,9 @@ async fn test_redacting_name_static() -> Result<()> {
         .expect("Room Name not found")
         .deserialize()?;
     let sync_room_name_event = room_name_event.as_sync().expect("event is sync event");
-    assert!(
-        sync_room_name_event.as_original().expect("event exists").content.name.is_some(),
-        "Event not found"
+    assert_eq!(
+        sync_room_name_event.as_original().expect("event exists").content.name,
+        "Inappropriate text"
     );
 
     room.redact(sync_room_name_event.event_id(), None, None).await?;
@@ -160,23 +157,13 @@ async fn test_redacting_name_static() -> Result<()> {
         }
     }
 
-    let room_name_event = room
+    let event = room
         .get_state_event_static::<RoomNameEventContent>()
         .await?
         .expect("Room Name not found")
         .deserialize()?;
     // Name content has been redacted
-    assert!(
-        room_name_event
-            .as_sync()
-            .expect("event is sync event")
-            .as_original()
-            .expect("event exists")
-            .content
-            .name
-            .is_none(),
-        "Event hasn't been redacted"
-    );
+    assert_matches!(event.as_sync().expect("event is sync event"), SyncRoomNameEvent::Redacted(_));
 
     Ok(())
 }

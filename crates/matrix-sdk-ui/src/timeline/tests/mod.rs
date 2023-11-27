@@ -15,28 +15,27 @@
 //! Unit tests (based on private methods) for the timeline API.
 
 use std::{
-    collections::BTreeMap,
-    sync::{
-        atomic::{AtomicU64, Ordering::SeqCst},
-        Arc,
-    },
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
 };
 
-use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use async_trait::async_trait;
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
 use indexmap::IndexMap;
 use matrix_sdk::deserialized_responses::{SyncTimelineEvent, TimelineEvent};
-use once_cell::sync::Lazy;
+use matrix_sdk_base::latest_event::LatestEvent;
+use matrix_sdk_test::{EventBuilder, ALICE, BOB};
 use ruma::{
+    event_id,
     events::{
-        receipt::{Receipt, ReceiptEventContent, ReceiptThread, ReceiptType},
+        receipt::{Receipt, ReceiptThread, ReceiptType},
         relation::Annotation,
         room::redaction::RoomRedactionEventContent,
-        AnyMessageLikeEventContent, AnySyncTimelineEvent, EmptyStateKey, MessageLikeEventContent,
-        RedactedMessageLikeEventContent, RedactedStateEventContent, StateEventContent,
+        AnyMessageLikeEventContent, AnySyncTimelineEvent, AnyTimelineEvent, EmptyStateKey,
+        MessageLikeEventContent, RedactedMessageLikeEventContent, RedactedStateEventContent,
         StaticStateEventContent,
     },
     int,
@@ -44,10 +43,9 @@ use ruma::{
     push::{PushConditionRoomCtx, Ruleset},
     room_id,
     serde::Raw,
-    server_name, uint, user_id, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId,
-    OwnedTransactionId, OwnedUserId, RoomVersionId, TransactionId, UserId,
+    server_name, uint, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId,
+    OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
 };
-use serde_json::{json, Value as JsonValue};
 
 use super::{
     event_item::EventItemIdentifier,
@@ -64,6 +62,7 @@ mod edit;
 mod encryption;
 mod event_filter;
 mod invalid;
+mod pagination;
 mod polls;
 mod reaction_group;
 mod reactions;
@@ -71,23 +70,18 @@ mod read_receipts;
 mod redaction;
 mod virt;
 
-static ALICE: Lazy<&UserId> = Lazy::new(|| user_id!("@alice:server.name"));
-static BOB: Lazy<&UserId> = Lazy::new(|| user_id!("@bob:other.server"));
-static CAROL: Lazy<&UserId> = Lazy::new(|| user_id!("@carol:other.server"));
-
-fn sync_timeline_event(event: JsonValue) -> SyncTimelineEvent {
-    let event = serde_json::from_value(event).unwrap();
-    SyncTimelineEvent { event, encryption_info: None, push_actions: Vec::default() }
-}
-
 struct TestTimeline {
     inner: TimelineInner<TestRoomDataProvider>,
-    next_ts: AtomicU64,
+    event_builder: EventBuilder,
 }
 
 impl TestTimeline {
     fn new() -> Self {
-        Self { inner: TimelineInner::new(TestRoomDataProvider), next_ts: AtomicU64::new(0) }
+        Self::with_room_data_provider(TestRoomDataProvider::default())
+    }
+
+    fn with_room_data_provider(room_data_provider: TestRoomDataProvider) -> Self {
+        Self { inner: TimelineInner::new(room_data_provider), event_builder: EventBuilder::new() }
     }
 
     fn with_settings(mut self, settings: TimelineInnerSettings) -> Self {
@@ -116,7 +110,19 @@ impl TestTimeline {
     where
         C: MessageLikeEventContent,
     {
-        let ev = self.make_message_event(sender, content);
+        let ev = self.event_builder.make_sync_message_event(sender, content);
+        self.handle_live_event(Raw::new(&ev).unwrap().cast()).await;
+    }
+
+    async fn handle_live_message_event_with_id<C>(
+        &self,
+        sender: &UserId,
+        event_id: &EventId,
+        content: C,
+    ) where
+        C: MessageLikeEventContent,
+    {
+        let ev = self.event_builder.make_sync_message_event_with_id(sender, event_id, content);
         self.handle_live_event(Raw::new(&ev).unwrap().cast()).await;
     }
 
@@ -124,7 +130,7 @@ impl TestTimeline {
     where
         C: RedactedMessageLikeEventContent,
     {
-        let ev = self.make_redacted_message_event(sender, content);
+        let ev = self.event_builder.make_sync_redacted_message_event(sender, content);
         self.handle_live_event(Raw::new(&ev).unwrap().cast()).await;
     }
 
@@ -132,8 +138,8 @@ impl TestTimeline {
     where
         C: StaticStateEventContent<StateKey = EmptyStateKey>,
     {
-        let ev = self.make_state_event(sender, "", content, prev_content);
-        self.handle_live_event(Raw::new(&ev).unwrap().cast()).await;
+        let ev = self.event_builder.make_sync_state_event(sender, "", content, prev_content);
+        self.handle_live_event(ev).await;
     }
 
     async fn handle_live_state_event_with_state_key<C>(
@@ -145,7 +151,12 @@ impl TestTimeline {
     ) where
         C: StaticStateEventContent,
     {
-        let ev = self.make_state_event(sender, state_key.as_ref(), content, prev_content);
+        let ev = self.event_builder.make_sync_state_event(
+            sender,
+            state_key.as_ref(),
+            content,
+            prev_content,
+        );
         self.handle_live_event(Raw::new(&ev).unwrap().cast()).await;
     }
 
@@ -153,7 +164,7 @@ impl TestTimeline {
     where
         C: RedactedStateEventContent<StateKey = EmptyStateKey>,
     {
-        let ev = self.make_redacted_state_event(sender, "", content);
+        let ev = self.event_builder.make_sync_redacted_state_event(sender, "", content);
         self.handle_live_event(Raw::new(&ev).unwrap().cast()).await;
     }
 
@@ -165,45 +176,24 @@ impl TestTimeline {
     ) where
         C: RedactedStateEventContent,
     {
-        let ev = self.make_redacted_state_event(sender, state_key.as_ref(), content);
+        let ev =
+            self.event_builder.make_sync_redacted_state_event(sender, state_key.as_ref(), content);
         self.handle_live_event(Raw::new(&ev).unwrap().cast()).await;
     }
 
-    async fn handle_live_custom_event(&self, event: JsonValue) {
-        let raw = Raw::new(&event).unwrap().cast();
-        self.handle_live_event(raw).await;
+    async fn handle_live_custom_event(&self, event: Raw<AnySyncTimelineEvent>) {
+        self.handle_live_event(event).await;
     }
 
     async fn handle_live_redaction(&self, sender: &UserId, redacts: &EventId) {
-        let ev = json!({
-            "type": "m.room.redaction",
-            "content": {},
-            "redacts": redacts,
-            "event_id": EventId::new(server_name!("dummy.server")),
-            "sender": sender,
-            "origin_server_ts": self.next_server_ts(),
-        });
-        let raw = Raw::new(&ev).unwrap().cast();
-        self.handle_live_event(raw).await;
+        let ev = self.event_builder.make_redaction_event(sender, redacts);
+        self.handle_live_event(ev).await;
     }
 
     async fn handle_live_reaction(&self, sender: &UserId, annotation: &Annotation) -> OwnedEventId {
         let event_id = EventId::new(server_name!("dummy.server"));
-        let ev = json!({
-            "type": "m.reaction",
-            "content": {
-                "m.relates_to": {
-                    "rel_type": "m.annotation",
-                    "event_id": annotation.event_id,
-                    "key": annotation.key,
-                },
-            },
-            "event_id": event_id,
-            "sender": sender,
-            "origin_server_ts": self.next_server_ts(),
-        });
-        let raw = Raw::new(&ev).unwrap().cast();
-        self.handle_live_event(raw).await;
+        let ev = self.event_builder.make_reaction_event(sender, &event_id, annotation);
+        self.handle_live_event(ev).await;
         event_id
     }
 
@@ -228,16 +218,32 @@ impl TestTimeline {
         txn_id
     }
 
-    async fn handle_back_paginated_custom_event(&self, event: JsonValue) {
-        let timeline_event = TimelineEvent::new(Raw::new(&event).unwrap().cast());
-        self.inner.handle_back_paginated_events(vec![timeline_event]).await;
+    async fn handle_back_paginated_message_event_with_id<C>(
+        &self,
+        sender: &UserId,
+        room_id: &RoomId,
+        event_id: &EventId,
+        content: C,
+    ) where
+        C: MessageLikeEventContent,
+    {
+        let ev = self.event_builder.make_message_event_with_id(sender, room_id, event_id, content);
+        self.handle_back_paginated_custom_event(ev).await;
+    }
+
+    async fn handle_back_paginated_custom_event(&self, event: Raw<AnyTimelineEvent>) {
+        let timeline_event = TimelineEvent::new(event.cast());
+        self.inner
+            .handle_back_paginated_events(vec![timeline_event], Default::default())
+            .await
+            .unwrap();
     }
 
     async fn handle_read_receipts(
         &self,
         receipts: impl IntoIterator<Item = (OwnedEventId, ReceiptType, OwnedUserId, ReceiptThread)>,
     ) {
-        let ev_content = self.make_receipt_event_content(receipts);
+        let ev_content = self.event_builder.make_receipt_event_content(receipts);
         self.inner.handle_read_receipts(ev_content).await;
     }
 
@@ -255,156 +261,21 @@ impl TestTimeline {
     ) -> Result<ReactionAction, super::Error> {
         self.inner.resolve_reaction_response(annotation, result).await
     }
-
-    /// Set the next server timestamp.
-    ///
-    /// Timestamps will continue to increase by 1 (millisecond) from that value.
-    fn set_next_ts(&self, value: u64) {
-        self.next_ts.store(value, SeqCst);
-    }
-
-    fn make_message_event<C: MessageLikeEventContent>(
-        &self,
-        sender: &UserId,
-        content: C,
-    ) -> JsonValue {
-        self.make_message_event_with_id(sender, content, EventId::new(server_name!("dummy.server")))
-    }
-
-    fn make_message_event_with_id<C: MessageLikeEventContent>(
-        &self,
-        sender: &UserId,
-        content: C,
-        event_id: OwnedEventId,
-    ) -> JsonValue {
-        json!({
-            "type": content.event_type(),
-            "content": content,
-            "event_id": event_id,
-            "sender": sender,
-            "origin_server_ts": self.next_server_ts(),
-        })
-    }
-
-    fn make_redacted_message_event<C: RedactedMessageLikeEventContent>(
-        &self,
-        sender: &UserId,
-        content: C,
-    ) -> JsonValue {
-        json!({
-            "type": content.event_type(),
-            "content": content,
-            "event_id": EventId::new(server_name!("dummy.server")),
-            "sender": sender,
-            "origin_server_ts": self.next_server_ts(),
-            "unsigned": self.make_redacted_unsigned(sender),
-        })
-    }
-
-    fn make_state_event<C: StateEventContent>(
-        &self,
-        sender: &UserId,
-        state_key: &str,
-        content: C,
-        prev_content: Option<C>,
-    ) -> JsonValue {
-        let unsigned = if let Some(prev_content) = prev_content {
-            json!({ "prev_content": prev_content })
-        } else {
-            json!({})
-        };
-
-        json!({
-            "type": content.event_type(),
-            "state_key": state_key,
-            "content": content,
-            "event_id": EventId::new(server_name!("dummy.server")),
-            "sender": sender,
-            "origin_server_ts": self.next_server_ts(),
-            "unsigned": unsigned,
-        })
-    }
-
-    fn make_redacted_state_event<C: RedactedStateEventContent>(
-        &self,
-        sender: &UserId,
-        state_key: &str,
-        content: C,
-    ) -> JsonValue {
-        json!({
-            "type": content.event_type(),
-            "state_key": state_key,
-            "content": content,
-            "event_id": EventId::new(server_name!("dummy.server")),
-            "sender": sender,
-            "origin_server_ts": self.next_server_ts(),
-            "unsigned": self.make_redacted_unsigned(sender),
-        })
-    }
-
-    fn make_redacted_unsigned(&self, sender: &UserId) -> JsonValue {
-        json!({
-            "redacted_because": {
-                "content": {},
-                "event_id": EventId::new(server_name!("dummy.server")),
-                "sender": sender,
-                "origin_server_ts": self.next_server_ts(),
-                "type": "m.room.redaction",
-            },
-        })
-    }
-
-    fn make_reaction(
-        &self,
-        sender: &UserId,
-        annotation: &Annotation,
-        timestamp: MilliSecondsSinceUnixEpoch,
-    ) -> JsonValue {
-        json!({
-            "event_id": EventId::new(server_name!("dummy.server")),
-            "content": {
-                "m.relates_to": {
-                    "event_id": annotation.event_id,
-                    "key": annotation.key,
-                    "rel_type": "m.annotation"
-                }
-            },
-            "sender": sender,
-            "type": "m.reaction",
-            "origin_server_ts": timestamp
-        })
-    }
-
-    fn make_receipt_event_content(
-        &self,
-        receipts: impl IntoIterator<Item = (OwnedEventId, ReceiptType, OwnedUserId, ReceiptThread)>,
-    ) -> ReceiptEventContent {
-        let mut ev_content = ReceiptEventContent(BTreeMap::new());
-        for (event_id, receipt_type, user_id, thread) in receipts {
-            let event_map = ev_content.entry(event_id).or_default();
-            let receipt_map = event_map.entry(receipt_type).or_default();
-
-            let mut receipt = Receipt::new(self.next_server_ts());
-            receipt.thread = thread;
-
-            receipt_map.insert(user_id, receipt);
-        }
-
-        ev_content
-    }
-
-    fn next_server_ts(&self) -> MilliSecondsSinceUnixEpoch {
-        MilliSecondsSinceUnixEpoch(
-            self.next_ts
-                .fetch_add(1, SeqCst)
-                .try_into()
-                .expect("server timestamp should fit in js_int::UInt"),
-        )
-    }
 }
 
-#[derive(Clone)]
-struct TestRoomDataProvider;
+type ReadReceiptMap =
+    HashMap<ReceiptType, HashMap<ReceiptThread, HashMap<OwnedUserId, (OwnedEventId, Receipt)>>>;
+
+#[derive(Clone, Default)]
+struct TestRoomDataProvider {
+    initial_user_receipts: ReadReceiptMap,
+}
+
+impl TestRoomDataProvider {
+    fn with_initial_user_receipts(initial_user_receipts: ReadReceiptMap) -> Self {
+        Self { initial_user_receipts }
+    }
+}
 
 #[async_trait]
 impl RoomDataProvider for TestRoomDataProvider {
@@ -416,12 +287,33 @@ impl RoomDataProvider for TestRoomDataProvider {
         RoomVersionId::V10
     }
 
-    async fn profile(&self, _user_id: &UserId) -> Option<Profile> {
+    async fn profile_from_user_id(&self, _user_id: &UserId) -> Option<Profile> {
         None
     }
 
-    async fn read_receipts_for_event(&self, _event_id: &EventId) -> IndexMap<OwnedUserId, Receipt> {
-        IndexMap::new()
+    async fn profile_from_latest_event(&self, _latest_event: &LatestEvent) -> Option<Profile> {
+        None
+    }
+
+    async fn user_receipt(
+        &self,
+        receipt_type: ReceiptType,
+        thread: ReceiptThread,
+        user_id: &UserId,
+    ) -> Option<(OwnedEventId, Receipt)> {
+        self.initial_user_receipts
+            .get(&receipt_type)
+            .and_then(|thread_map| thread_map.get(&thread))
+            .and_then(|user_map| user_map.get(user_id))
+            .cloned()
+    }
+
+    async fn read_receipts_for_event(&self, event_id: &EventId) -> IndexMap<OwnedUserId, Receipt> {
+        if event_id == event_id!("$event_with_bob_receipt") {
+            [(BOB.to_owned(), Receipt::new(MilliSecondsSinceUnixEpoch(uint!(10))))].into()
+        } else {
+            IndexMap::new()
+        }
     }
 
     async fn push_rules_and_context(&self) -> Option<(Ruleset, PushConditionRoomCtx)> {
@@ -445,10 +337,7 @@ pub(super) async fn assert_event_is_updated(
     event_id: &EventId,
     index: usize,
 ) -> EventTimelineItem {
-    let (i, event) = assert_matches!(
-        stream.next().await,
-        Some(VectorDiff::Set { index, value }) => (index, value)
-    );
+    assert_let!(Some(VectorDiff::Set { index: i, value: event }) = stream.next().await);
     assert_eq!(i, index);
     let event = event.as_event().unwrap();
     assert_eq!(event.event_id().unwrap(), event_id);

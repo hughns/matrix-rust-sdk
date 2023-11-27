@@ -15,15 +15,23 @@
 use std::time::Duration;
 
 use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk_test::{
-    async_test, GlobalAccountDataTestEvent, JoinedRoomBuilder, SyncResponseBuilder,
-    TimelineTestEvent,
+    async_test, sync_timeline_event, EventBuilder, GlobalAccountDataTestEvent, JoinedRoomBuilder,
+    SyncResponseBuilder, ALICE, BOB,
 };
 use matrix_sdk_ui::timeline::{RoomExt, TimelineItemContent, VirtualTimelineItem};
-use ruma::{event_id, events::room::message::MessageType, room_id};
+use ruma::{
+    event_id,
+    events::room::{
+        member::{MembershipState, RoomMemberEventContent},
+        message::{MessageType, RoomMessageEventContent},
+    },
+    room_id,
+};
 use serde_json::json;
 use stream_assert::{assert_next_matches, assert_pending};
 
@@ -35,10 +43,11 @@ async fn batched() {
     let (client, server) = logged_in_client().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
-    let mut ev_builder = SyncResponseBuilder::new();
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    let event_builder = EventBuilder::new();
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -48,18 +57,30 @@ async fn batched() {
 
     let hdl = tokio::spawn(async move {
         let next_batch = timeline_stream.next().await.unwrap();
-        // One day divider, three event items
-        assert_eq!(next_batch.len(), 4);
+        // There can be more than three updates because we add things like
+        // day dividers and implicit read receipts
+        assert!(next_batch.len() >= 3);
     });
 
-    ev_builder.add_joined_room(
+    sync_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id)
-            .add_timeline_event(TimelineTestEvent::MessageText)
-            .add_timeline_event(TimelineTestEvent::Member)
-            .add_timeline_event(TimelineTestEvent::MessageNotice),
+            .add_timeline_event(event_builder.make_sync_message_event(
+                &ALICE,
+                RoomMessageEventContent::text_plain("text message event"),
+            ))
+            .add_timeline_event(event_builder.make_sync_state_event(
+                &BOB,
+                BOB.as_str(),
+                RoomMemberEventContent::new(MembershipState::Join),
+                Some(RoomMemberEventContent::new(MembershipState::Invite)),
+            ))
+            .add_timeline_event(event_builder.make_sync_message_event(
+                &BOB,
+                RoomMessageEventContent::notice_plain("notice message event"),
+            )),
     );
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
 
     tokio::time::timeout(Duration::from_millis(500), hdl).await.unwrap().unwrap();
@@ -84,7 +105,7 @@ async fn event_filter() {
 
     let first_event_id = event_id!("$YTQwYl2ply");
     ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
-        TimelineTestEvent::Custom(json!({
+        sync_timeline_event!({
             "content": {
                 "body": "hello",
                 "msgtype": "m.text",
@@ -93,27 +114,19 @@ async fn event_filter() {
             "origin_server_ts": 152037280,
             "sender": "@alice:example.org",
             "type": "m.room.message",
-        })),
+        }),
     ));
 
     mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
-    let _day_divider = assert_matches!(
-        timeline_stream.next().await,
-        Some(VectorDiff::PushBack { value }) => value
-    );
-    let first = assert_matches!(
-        timeline_stream.next().await,
-        Some(VectorDiff::PushBack { value }) => value
-    );
+    assert_let!(Some(VectorDiff::PushBack { value: day_divider }) = timeline_stream.next().await);
+    assert!(day_divider.is_day_divider());
+    assert_let!(Some(VectorDiff::PushBack { value: first }) = timeline_stream.next().await);
     let first_event = first.as_event().unwrap();
     assert_eq!(first_event.event_id(), Some(first_event_id));
-    let msg = assert_matches!(
-        first_event.content(),
-        TimelineItemContent::Message(msg) => msg
-    );
+    assert_let!(TimelineItemContent::Message(msg) = first_event.content());
     assert_matches!(msg.msgtype(), MessageType::Text(_));
     assert!(!msg.is_edited());
 
@@ -121,7 +134,7 @@ async fn event_filter() {
     let edit_event_id = event_id!("$7i9In0gEmB");
     ev_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id)
-            .add_timeline_event(TimelineTestEvent::Custom(json!({
+            .add_timeline_event(sync_timeline_event!({
                 "content": {
                     "body": "Test",
                     "formatted_body": "<em>Test</em>",
@@ -132,8 +145,8 @@ async fn event_filter() {
                 "origin_server_ts": 152038280,
                 "sender": "@bob:example.org",
                 "type": "m.room.message",
-            })))
-            .add_timeline_event(TimelineTestEvent::Custom(json!({
+            }))
+            .add_timeline_event(sync_timeline_event!({
                 "content": {
                     "body": " * hi",
                     "m.new_content": {
@@ -150,29 +163,26 @@ async fn event_filter() {
                 "origin_server_ts": 159056300,
                 "sender": "@alice:example.org",
                 "type": "m.room.message",
-            }))),
+            })),
     );
 
     mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
-    let second = assert_matches!(timeline_stream.next().await, Some(VectorDiff::PushBack { value }) => value);
+    assert_let!(Some(VectorDiff::PushBack { value: second }) = timeline_stream.next().await);
     let second_event = second.as_event().unwrap();
     assert_eq!(second_event.event_id(), Some(second_event_id));
 
+    // The implicit read receipt of Alice is updated.
+    assert_matches!(timeline_stream.next().await, Some(VectorDiff::Set { index: 1, .. }));
+
     // The edit is applied to the first event.
-    let first = assert_matches!(
-        timeline_stream.next().await,
-        Some(VectorDiff::Set { index: 1, value }) => value
-    );
+    assert_let!(Some(VectorDiff::Set { index: 1, value: first }) = timeline_stream.next().await);
     let first_event = first.as_event().unwrap();
-    assert!(!first_event.read_receipts().is_empty());
-    let msg = assert_matches!(
-        first_event.content(),
-        TimelineItemContent::Message(msg) => msg
-    );
-    let text = assert_matches!(msg.msgtype(), MessageType::Text(text) => text);
+    assert!(first_event.read_receipts().is_empty());
+    assert_let!(TimelineItemContent::Message(msg) = first_event.content());
+    assert_let!(MessageType::Text(text) = msg.msgtype());
     assert_eq!(text.body, "hi");
     assert!(msg.is_edited());
 }
@@ -204,7 +214,7 @@ async fn timeline_is_reset_when_a_user_is_ignored_or_unignored() {
 
     ev_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id)
-            .add_timeline_event(TimelineTestEvent::Custom(json!({
+            .add_timeline_event(sync_timeline_event!({
                 "content": {
                     "body": "hello",
                     "msgtype": "m.text",
@@ -213,8 +223,8 @@ async fn timeline_is_reset_when_a_user_is_ignored_or_unignored() {
                 "origin_server_ts": 152037280,
                 "sender": alice,
                 "type": "m.room.message",
-            })))
-            .add_timeline_event(TimelineTestEvent::Custom(json!({
+            }))
+            .add_timeline_event(sync_timeline_event!({
                 "content": {
                     "body": "hello",
                     "msgtype": "m.text",
@@ -223,8 +233,8 @@ async fn timeline_is_reset_when_a_user_is_ignored_or_unignored() {
                 "origin_server_ts": 152037281,
                 "sender": bob,
                 "type": "m.room.message",
-            })))
-            .add_timeline_event(TimelineTestEvent::Custom(json!({
+            }))
+            .add_timeline_event(sync_timeline_event!({
                 "content": {
                     "body": "hello",
                     "msgtype": "m.text",
@@ -233,7 +243,7 @@ async fn timeline_is_reset_when_a_user_is_ignored_or_unignored() {
                 "origin_server_ts": 152037282,
                 "sender": alice,
                 "type": "m.room.message",
-            }))),
+            })),
     );
 
     mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
@@ -279,7 +289,7 @@ async fn timeline_is_reset_when_a_user_is_ignored_or_unignored() {
 
     ev_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id)
-            .add_timeline_event(TimelineTestEvent::Custom(json!({
+            .add_timeline_event(sync_timeline_event!({
                 "content": {
                     "body": "hello",
                     "msgtype": "m.text",
@@ -288,8 +298,8 @@ async fn timeline_is_reset_when_a_user_is_ignored_or_unignored() {
                 "origin_server_ts": 152037283,
                 "sender": alice,
                 "type": "m.room.message",
-            })))
-            .add_timeline_event(TimelineTestEvent::Custom(json!({
+            }))
+            .add_timeline_event(sync_timeline_event!({
                 "content": {
                     "body": "hello",
                     "msgtype": "m.text",
@@ -298,7 +308,7 @@ async fn timeline_is_reset_when_a_user_is_ignored_or_unignored() {
                 "origin_server_ts": 152037284,
                 "sender": alice,
                 "type": "m.room.message",
-            }))),
+            })),
     );
 
     mock_sync(&server, ev_builder.build_json_sync_response(), None).await;

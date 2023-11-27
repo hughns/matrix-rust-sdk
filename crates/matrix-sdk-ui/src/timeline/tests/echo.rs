@@ -17,15 +17,14 @@ use std::{io, sync::Arc};
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
 use matrix_sdk::Error;
-use matrix_sdk_test::async_test;
+use matrix_sdk_test::{async_test, sync_timeline_event, ALICE, BOB};
 use ruma::{
     event_id,
     events::{room::message::RoomMessageEventContent, AnyMessageLikeEventContent},
 };
-use serde_json::json;
 use stream_assert::assert_next_matches;
 
-use super::{TestTimeline, ALICE, BOB};
+use super::TestTimeline;
 use crate::timeline::event_item::EventSendState;
 
 #[async_test]
@@ -48,6 +47,7 @@ async fn remote_echo_full_trip() {
         let event_item = item.as_event().unwrap();
         assert!(event_item.is_local_echo());
         assert_matches!(event_item.send_state(), Some(EventSendState::NotSentYet));
+        assert!(!event_item.can_be_replied_to());
         item.unique_id()
     };
 
@@ -94,7 +94,7 @@ async fn remote_echo_full_trip() {
     // Now, a sync has been run against the server, and an event with the same ID
     // comes in.
     timeline
-        .handle_live_custom_event(json!({
+        .handle_live_custom_event(sync_timeline_event!({
             "content": {
                 "body": "echo",
                 "msgtype": "m.text",
@@ -140,7 +140,7 @@ async fn remote_echo_new_position() {
 
     // When the remote echo comes in…
     timeline
-        .handle_live_custom_event(json!({
+        .handle_live_custom_event(sync_timeline_event!({
             "content": {
                 "body": "echo",
                 "msgtype": "m.text",
@@ -164,4 +164,50 @@ async fn remote_echo_new_position() {
     // alice's message are from the same day according to server timestamps)
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     assert!(!item.as_event().unwrap().is_local_echo());
+}
+
+#[async_test]
+async fn day_divider_duplication() {
+    let timeline = TestTimeline::new();
+
+    // Given two remote events from one day, and a local event from another day…
+    timeline.handle_live_message_event(&BOB, RoomMessageEventContent::text_plain("A")).await;
+    timeline.handle_live_message_event(&BOB, RoomMessageEventContent::text_plain("B")).await;
+    timeline
+        .handle_local_event(AnyMessageLikeEventContent::RoomMessage(
+            RoomMessageEventContent::text_plain("C"),
+        ))
+        .await;
+
+    let items = timeline.inner.items().await;
+    assert_eq!(items.len(), 5);
+    assert!(items[0].is_day_divider());
+    assert!(items[1].is_remote_event());
+    assert!(items[2].is_remote_event());
+    assert!(items[3].is_day_divider());
+    assert!(items[4].is_local_echo());
+
+    // … when the second remote event is re-received (day still the same)
+    let event_id = items[2].as_event().unwrap().event_id().unwrap();
+    timeline
+        .handle_live_custom_event(sync_timeline_event!({
+            "content": {
+                "body": "B",
+                "msgtype": "m.text",
+            },
+            "sender": &*BOB,
+            "event_id": event_id,
+            "origin_server_ts": 1,
+            "type": "m.room.message",
+        }))
+        .await;
+
+    // … it should not impact the day dividers.
+    let items = timeline.inner.items().await;
+    assert_eq!(items.len(), 5);
+    assert!(items[0].is_day_divider());
+    assert!(items[1].is_remote_event());
+    assert!(items[2].is_remote_event());
+    assert!(items[3].is_day_divider());
+    assert!(items[4].is_local_echo());
 }

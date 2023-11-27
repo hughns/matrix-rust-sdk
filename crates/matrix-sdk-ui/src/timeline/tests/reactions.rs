@@ -15,10 +15,12 @@
 use std::{ops::RangeInclusive, sync::Arc};
 
 use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
 use imbl::vector;
-use matrix_sdk_test::async_test;
+use matrix_sdk_base::deserialized_responses::SyncTimelineEvent;
+use matrix_sdk_test::{async_test, ALICE, BOB};
 use ruma::{
     events::{relation::Annotation, room::message::RoomMessageEventContent},
     server_name, uint, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, TransactionId,
@@ -29,10 +31,7 @@ use crate::timeline::{
     event_item::EventItemIdentifier,
     inner::ReactionAction,
     reactions::ReactionToggleResult,
-    tests::{
-        assert_event_is_updated, assert_no_more_updates, sync_timeline_event, TestTimeline, ALICE,
-        BOB,
-    },
+    tests::{assert_event_is_updated, assert_no_more_updates, TestTimeline},
     TimelineItem,
 };
 
@@ -46,7 +45,7 @@ async fn add_reaction_failed() {
     let reaction = create_reaction(&msg_id);
 
     let action = timeline.toggle_reaction_local(&reaction).await.unwrap();
-    let txn_id = assert_matches!(action, ReactionAction::SendRemote(txn_id) => txn_id);
+    assert_let!(ReactionAction::SendRemote(txn_id) = action);
     assert_reaction_is_updated(&mut stream, &msg_id, msg_pos, None, Some(&txn_id)).await;
 
     timeline
@@ -78,7 +77,7 @@ async fn add_reaction_success() {
     let reaction = create_reaction(&msg_id);
 
     let action = timeline.toggle_reaction_local(&reaction).await.unwrap();
-    let txn_id = assert_matches!(action, ReactionAction::SendRemote(txn_id) => txn_id);
+    assert_let!(ReactionAction::SendRemote(txn_id) = action);
     assert_reaction_is_updated(&mut stream, &msg_id, msg_pos, None, Some(&txn_id)).await;
 
     let event_id = EventId::new(server_name!("example.org"));
@@ -164,7 +163,7 @@ async fn toggle_during_request_resolves_new_action() {
 
     // Add a reaction
     let action = timeline.toggle_reaction_local(&reaction).await.unwrap();
-    let txn_id = assert_matches!(action, ReactionAction::SendRemote(txn_id) => txn_id);
+    assert_let!(ReactionAction::SendRemote(txn_id) = action);
     assert_reaction_is_added(&mut stream, &msg_id, msg_pos).await;
 
     // Toggle before response is received
@@ -191,7 +190,7 @@ async fn toggle_during_request_resolves_new_action() {
         .handle_reaction_response(&reaction, &ReactionToggleResult::RedactSuccess)
         .await
         .unwrap();
-    let txn_id = assert_matches!(action, ReactionAction::SendRemote(txn_id) => txn_id);
+    assert_let!(ReactionAction::SendRemote(txn_id) = action);
     assert_no_more_updates(&mut stream).await;
 
     // Receive response and resolve to no new action
@@ -248,18 +247,21 @@ async fn initial_reaction_timestamp_is_stored() {
 
     timeline
         .inner
-        .add_initial_events(vector![
-            sync_timeline_event(timeline.make_reaction(
-                *ALICE,
-                &Annotation::new(message_event_id.clone(), REACTION_KEY.to_owned()),
-                reaction_timestamp
-            )),
-            sync_timeline_event(timeline.make_message_event_with_id(
-                *ALICE,
-                RoomMessageEventContent::text_plain("A"),
-                message_event_id
-            ))
-        ])
+        .add_initial_events(
+            vector![
+                SyncTimelineEvent::new(timeline.event_builder.make_sync_reaction(
+                    *ALICE,
+                    &Annotation::new(message_event_id.clone(), REACTION_KEY.to_owned()),
+                    reaction_timestamp,
+                )),
+                SyncTimelineEvent::new(timeline.event_builder.make_sync_message_event_with_id(
+                    *ALICE,
+                    &message_event_id,
+                    RoomMessageEventContent::text_plain("A"),
+                ))
+            ],
+            None,
+        )
         .await;
 
     let items = timeline.inner.items().await;

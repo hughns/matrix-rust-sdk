@@ -111,7 +111,7 @@ pub struct InboundGroupSession {
     inner: Arc<Mutex<InnerSession>>,
 
     /// A copy of [`InnerSession::session_id`] to avoid having to acquire a lock
-    /// to get to the sesison ID.
+    /// to get to the session ID.
     session_id: Arc<str>,
 
     /// A copy of [`InnerSession::first_known_index`] to avoid having to acquire
@@ -398,7 +398,6 @@ impl InboundGroupSession {
 
     /// Export the inbound group session into a format that can be uploaded to
     /// the server as a backup.
-    #[cfg(feature = "backups_v1")]
     pub async fn to_backup(&self) -> BackedUpRoomKey {
         self.export().await.into()
     }
@@ -610,7 +609,7 @@ mod tests {
     use ruma::{device_id, room_id, user_id, DeviceId, UserId};
     use vodozemac::{megolm::SessionOrdering, Curve25519PublicKey};
 
-    use crate::{olm::InboundGroupSession, ReadOnlyAccount};
+    use crate::{olm::InboundGroupSession, Account};
 
     fn alice_id() -> &'static UserId {
         user_id!("@alice:example.org")
@@ -667,7 +666,7 @@ mod tests {
 
     #[async_test]
     async fn session_comparison() {
-        let alice = ReadOnlyAccount::with_device_id(alice_id(), alice_device_id());
+        let alice = Account::with_device_id(alice_id(), alice_device_id());
         let room_id = room_id!("!test:localhost");
 
         let (_, inbound) = alice.create_group_session_pair_with_defaults(room_id).await;

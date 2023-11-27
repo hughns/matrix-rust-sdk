@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
-use matrix_sdk_test::async_test;
+use matrix_sdk_test::{async_test, sync_timeline_event, ALICE};
 use ruma::{
     assign,
     events::{
@@ -23,13 +23,11 @@ use ruma::{
             self, MessageType, RedactedRoomMessageEventContent, RoomMessageEventContent,
         },
     },
-    serde::Raw,
     server_name, EventId,
 };
-use serde_json::json;
 use stream_assert::assert_next_matches;
 
-use super::{TestTimeline, ALICE};
+use super::TestTimeline;
 use crate::timeline::TimelineItemContent;
 
 #[async_test]
@@ -75,8 +73,8 @@ async fn live_sanitized() {
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let first_event = item.as_event().unwrap();
-    let message = assert_matches!(first_event.content(), TimelineItemContent::Message(msg) => msg);
-    let text = assert_matches!(message.msgtype(), MessageType::Text(text) => text);
+    assert_let!(TimelineItemContent::Message(message) = first_event.content());
+    assert_let!(MessageType::Text(text) = message.msgtype());
     assert_eq!(text.body, "**original** message");
     assert_eq!(text.formatted.as_ref().unwrap().body, "<strong>original</strong> message");
 
@@ -100,8 +98,8 @@ async fn live_sanitized() {
 
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
     let first_event = item.as_event().unwrap();
-    let message = assert_matches!(first_event.content(), TimelineItemContent::Message(msg) => msg);
-    let text = assert_matches!(message.msgtype(), MessageType::Text(text) => text);
+    assert_let!(TimelineItemContent::Message(message) = first_event.content());
+    assert_let!(MessageType::Text(text) = message.msgtype());
     assert_eq!(text.body, new_plain_content);
     assert_eq!(text.formatted.as_ref().unwrap().body, " <strong>better</strong> message");
 }
@@ -112,7 +110,7 @@ async fn aggregated_sanitized() {
     let mut stream = timeline.subscribe().await;
 
     let original_event_id = EventId::new(server_name!("dummy.server"));
-    let ev = json!({
+    let ev = sync_timeline_event!({
         "content": {
             "formatted_body": "<strong>original</strong> message",
             "format": "org.matrix.custom.html",
@@ -120,7 +118,7 @@ async fn aggregated_sanitized() {
             "msgtype": "m.text"
         },
         "event_id": &original_event_id,
-        "origin_server_ts": timeline.next_server_ts(),
+        "origin_server_ts": timeline.event_builder.next_server_ts(),
         "sender": *ALICE,
         "type": "m.room.message",
         "unsigned": {
@@ -143,20 +141,20 @@ async fn aggregated_sanitized() {
                         "msgtype": "m.text"
                     },
                     "event_id": EventId::new(server_name!("dummy.server")),
-                    "origin_server_ts": timeline.next_server_ts(),
+                    "origin_server_ts": timeline.event_builder.next_server_ts(),
                     "sender": *ALICE,
                     "type": "m.room.message",
                 }
             }
         }
     });
-    timeline.handle_live_event(Raw::new(&ev).unwrap().cast()).await;
+    timeline.handle_live_event(ev).await;
 
     let _day_divider = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let first_event = item.as_event().unwrap();
-    let message = assert_matches!(first_event.content(), TimelineItemContent::Message(msg) => msg);
-    let text = assert_matches!(message.msgtype(), MessageType::Text(text) => text);
+    assert_let!(TimelineItemContent::Message(message) = first_event.content());
+    assert_let!(MessageType::Text(text) = message.msgtype());
     assert_eq!(text.body, "!!edited!! **better** message");
     assert_eq!(text.formatted.as_ref().unwrap().body, " <strong>better</strong> message");
 }

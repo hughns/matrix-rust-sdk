@@ -15,10 +15,9 @@
 use std::{
     collections::HashMap,
     convert::{TryFrom, TryInto},
-    sync::Arc,
+    sync::{Arc, RwLock as StdRwLock},
 };
 
-use dashmap::DashMap;
 use matrix_sdk_common::NoisyArc;
 use ruma::{
     events::{
@@ -40,23 +39,23 @@ use super::{
     FlowId, Verification, VerificationResult, VerificationStore,
 };
 use crate::{
-    olm::PrivateCrossSigningIdentity,
+    olm::{PrivateCrossSigningIdentity, StaticAccountData},
     requests::OutgoingRequest,
     store::{CryptoStoreError, CryptoStoreWrapper},
-    OutgoingVerificationRequest, ReadOnlyAccount, ReadOnlyDevice, ReadOnlyUserIdentity,
-    RoomMessageRequest, ToDeviceRequest,
+    OutgoingVerificationRequest, ReadOnlyDevice, ReadOnlyUserIdentity, RoomMessageRequest,
+    ToDeviceRequest,
 };
 
 #[derive(Clone, Debug)]
 pub struct VerificationMachine {
     pub(crate) store: VerificationStore,
     verifications: VerificationCache,
-    requests: Arc<DashMap<OwnedUserId, HashMap<String, VerificationRequest>>>,
+    requests: Arc<StdRwLock<HashMap<OwnedUserId, HashMap<String, VerificationRequest>>>>,
 }
 
 impl VerificationMachine {
     pub(crate) fn new(
-        account: ReadOnlyAccount,
+        account: StaticAccountData,
         identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
         store: NoisyArc<CryptoStoreWrapper>,
     ) -> Self {
@@ -68,11 +67,11 @@ impl VerificationMachine {
     }
 
     pub(crate) fn own_user_id(&self) -> &UserId {
-        self.store.account.user_id()
+        &self.store.account.user_id
     }
 
     pub(crate) fn own_device_id(&self) -> &DeviceId {
-        self.store.account.device_id()
+        &self.store.account.device_id
     }
 
     pub(crate) async fn request_to_device_verification(
@@ -155,11 +154,13 @@ impl VerificationMachine {
         user_id: &UserId,
         flow_id: impl AsRef<str>,
     ) -> Option<VerificationRequest> {
-        self.requests.get(user_id)?.get(flow_id.as_ref()).cloned()
+        self.requests.read().unwrap().get(user_id)?.get(flow_id.as_ref()).cloned()
     }
 
     pub fn get_requests(&self, user_id: &UserId) -> Vec<VerificationRequest> {
         self.requests
+            .read()
+            .unwrap()
             .get(user_id)
             .map(|v| v.iter().map(|(_, value)| value.clone()).collect())
             .unwrap_or_default()
@@ -174,8 +175,8 @@ impl VerificationMachine {
             return;
         }
 
-        let mut entry = self.requests.entry(request.other_user().to_owned()).or_default();
-        let user_requests = entry.value_mut();
+        let mut requests = self.requests.write().unwrap();
+        let user_requests = requests.entry(request.other_user().to_owned()).or_default();
 
         // Cancel all the old verifications requests as well as the new one we
         // have for this user if someone tries to have two verifications going
@@ -246,20 +247,16 @@ impl VerificationMachine {
     pub fn garbage_collect(&self) -> Vec<Raw<AnyToDeviceEvent>> {
         let mut events = vec![];
 
-        for mut user_verification in self.requests.iter_mut() {
-            user_verification.retain(|_, v| !(v.is_done() || v.is_cancelled()));
-        }
-        self.requests.retain(|_, v| !v.is_empty());
+        let mut requests: Vec<OutgoingVerificationRequest> = {
+            let mut requests = self.requests.write().unwrap();
 
-        let mut requests: Vec<OutgoingVerificationRequest> = self
-            .requests
-            .iter()
-            .flat_map(|v| {
-                let requests: Vec<OutgoingVerificationRequest> =
-                    v.value().iter().filter_map(|(_, v)| v.cancel_if_timed_out()).collect();
-                requests
-            })
-            .collect();
+            for user_verification in requests.values_mut() {
+                user_verification.retain(|_, v| !(v.is_done() || v.is_cancelled()));
+            }
+            requests.retain(|_, v| !v.is_empty());
+
+            requests.values().flatten().filter_map(|(_, v)| v.cancel_if_timed_out()).collect()
+        };
 
         requests.extend(self.verifications.garbage_collect());
 
@@ -328,14 +325,14 @@ impl VerificationMachine {
                 flow_id = flow_id.as_str(),
                 "Received a verification event with a mismatched flow id, \
                  the verification object was created for a in-room \
-                 verification but a event was received over to-device \
+                 verification but an event was received over to-device \
                  messaging or vice versa"
             );
         };
 
         let event_sent_from_us = |event: &AnyEvent<'_>, from_device: &DeviceId| {
-            if event.sender() == self.store.account.user_id() {
-                from_device == self.store.account.device_id() || event.is_room_event()
+            if event.sender() == self.store.account.user_id {
+                from_device == self.store.account.device_id || event.is_room_event()
             } else {
                 false
             }
@@ -415,7 +412,7 @@ impl VerificationMachine {
             AnyVerificationContent::Start(c) => {
                 if let Some(request) = self.get_request(event.sender(), flow_id.as_str()) {
                     if request.flow_id() == &flow_id {
-                        request.receive_start(event.sender(), c).await?
+                        Box::pin(request.receive_start(event.sender(), c)).await?
                     } else {
                         flow_id_mismatch();
                     }
@@ -474,7 +471,7 @@ impl VerificationMachine {
                 let content = s.receive_any_event(event.sender(), &content);
 
                 if s.is_done() {
-                    self.mark_sas_as_done(&s, content.map(|(c, _)| c)).await?;
+                    Box::pin(self.mark_sas_as_done(&s, content.map(|(c, _)| c))).await?;
                 } else {
                     // Even if we are not done (yet), there might be content to
                     // send out, e.g. in the case where we are done with our
@@ -501,12 +498,12 @@ impl VerificationMachine {
                         let content = sas.receive_any_event(event.sender(), &content);
 
                         if sas.is_done() {
-                            self.mark_sas_as_done(&sas, content.map(|(c, _)| c)).await?;
+                            Box::pin(self.mark_sas_as_done(&sas, content.map(|(c, _)| c))).await?;
                         }
                     }
                     #[cfg(feature = "qrcode")]
                     Some(Verification::QrV1(qr)) => {
-                        let (cancellation, request) = qr.receive_done(c).await?;
+                        let (cancellation, request) = Box::pin(qr.receive_done(c)).await?;
 
                         if let Some(c) = cancellation {
                             self.verifications.add_request(c.into())
@@ -529,6 +526,7 @@ impl VerificationMachine {
 mod tests {
     use std::sync::Arc;
 
+    use matrix_sdk_common::NoisyArc;
     use matrix_sdk_test::async_test;
     use ruma::TransactionId;
     use tokio::sync::Mutex;
@@ -543,11 +541,11 @@ mod tests {
             tests::{alice_device_id, alice_id, setup_stores, wrap_any_to_device_content},
             FlowId, VerificationStore,
         },
-        ReadOnlyAccount, VerificationRequest,
+        Account, VerificationRequest,
     };
 
     async fn verification_machine() -> (VerificationMachine, VerificationStore) {
-        let (store, bob_store) = setup_stores().await;
+        let (_account, store, _bob, bob_store) = setup_stores().await;
 
         let machine = VerificationMachine {
             store,
@@ -578,12 +576,12 @@ mod tests {
 
     #[async_test]
     async fn create() {
-        let alice = ReadOnlyAccount::with_device_id(alice_id(), alice_device_id());
+        let alice = Account::with_device_id(alice_id(), alice_device_id());
         let identity = Arc::new(Mutex::new(PrivateCrossSigningIdentity::empty(alice_id())));
         let _ = VerificationMachine::new(
-            alice,
+            alice.static_data,
             identity,
-            Arc::new(CryptoStoreWrapper::new(alice_id(), MemoryStore::new())),
+            NoisyArc::new(CryptoStoreWrapper::new(alice_id(), MemoryStore::new())),
         );
     }
 
@@ -606,7 +604,7 @@ mod tests {
         alice_machine.receive_any_event(&event).await.unwrap();
         assert!(!alice_machine.verifications.outgoing_requests().is_empty());
 
-        let request = alice_machine.verifications.outgoing_requests().get(0).cloned().unwrap();
+        let request = alice_machine.verifications.outgoing_requests().first().cloned().unwrap();
         let txn_id = request.request_id().to_owned();
         let content = OutgoingContent::try_from(request).unwrap();
         let content = KeyContent::try_from(&content).unwrap().into();

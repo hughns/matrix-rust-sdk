@@ -22,6 +22,7 @@ mod sas;
 
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
+use as_variant::as_variant;
 use event_enums::OutgoingContent;
 pub use machine::VerificationMachine;
 use matrix_sdk_common::NoisyArc;
@@ -52,7 +53,7 @@ use tracing::{error, info, trace, warn};
 use crate::{
     error::SignatureError,
     gossiping::{GossipMachine, GossipRequest},
-    olm::{PrivateCrossSigningIdentity, ReadOnlyAccount, Session},
+    olm::{PrivateCrossSigningIdentity, Session, StaticAccountData},
     store::{Changes, CryptoStoreWrapper},
     types::Signatures,
     CryptoStoreError, LocalTrust, OutgoingVerificationRequest, ReadOnlyDevice,
@@ -61,7 +62,7 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub(crate) struct VerificationStore {
-    pub account: ReadOnlyAccount,
+    pub account: StaticAccountData,
     pub private_identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
     inner: NoisyArc<CryptoStoreWrapper>,
 }
@@ -125,7 +126,7 @@ impl VerificationStore {
         device_id: &DeviceId,
     ) -> Result<Option<ReadOnlyDevice>, CryptoStoreError> {
         Ok(self.inner.get_device(user_id, device_id).await?.filter(|d| {
-            !(d.user_id() == self.account.user_id() && d.device_id() == self.account.device_id())
+            !(d.user_id() == self.account.user_id && d.device_id() == self.account.device_id)
         }))
     }
 
@@ -148,7 +149,7 @@ impl VerificationStore {
             store: self.clone(),
             device_being_verified,
             own_identity: self
-                .get_user_identity(self.account.user_id())
+                .get_user_identity(&self.account.user_id)
                 .await?
                 .and_then(|i| i.into_own()),
             identity_being_verified,
@@ -177,7 +178,7 @@ impl VerificationStore {
     pub async fn device_signatures(&self) -> Result<Option<Signatures>, CryptoStoreError> {
         Ok(self
             .inner
-            .get_device(self.account.user_id(), self.account.device_id())
+            .get_device(&self.account.user_id, &self.account.device_id)
             .await?
             .map(|d| d.signatures().to_owned()))
     }
@@ -201,22 +202,13 @@ pub enum Verification {
 impl Verification {
     /// Try to deconstruct this verification enum into a SAS verification.
     pub fn sas_v1(self) -> Option<Sas> {
-        #[allow(irrefutable_let_patterns)]
-        if let Verification::SasV1(sas) = self {
-            Some(sas)
-        } else {
-            None
-        }
+        as_variant!(self, Verification::SasV1)
     }
 
     /// Try to deconstruct this verification enum into a QR code verification.
     #[cfg(feature = "qrcode")]
     pub fn qr_v1(self) -> Option<QrVerification> {
-        if let Verification::QrV1(qr) = self {
-            Some(qr)
-        } else {
-            None
-        }
+        as_variant!(self, Verification::QrV1)
     }
 
     /// Has this verification finished.
@@ -430,11 +422,7 @@ pub enum FlowId {
 impl FlowId {
     /// Get the room ID if the flow ID comes from a room event.
     pub fn room_id(&self) -> Option<&RoomId> {
-        if let Self::InRoom(room_id, _) = &self {
-            Some(room_id)
-        } else {
-            None
-        }
+        as_variant!(self, Self::InRoom(room_id, _) => room_id)
     }
 
     /// Get the ID a string.
@@ -622,10 +610,8 @@ impl IdentitiesBeingVerified {
     }
 
     async fn request_missing_secrets(&self) -> Result<Vec<GossipRequest>, CryptoStoreError> {
-        #[allow(unused_mut)]
         let mut secrets = self.private_identity.get_missing_secrets().await;
 
-        #[cfg(feature = "backups_v1")]
         if self.store.inner.load_backup_keys().await?.decryption_key.is_none() {
             secrets.push(ruma::events::secret::request::SecretName::RecoveryKey);
         }
@@ -651,9 +637,11 @@ impl IdentitiesBeingVerified {
                 .as_ref()
                 .is_some_and(|i| i.master_key() == identity.master_key())
             {
-                if verified_identities.is_some_and(|i| i.contains(&identity)) {
+                if verified_identities.is_some_and(|i| {
+                    i.iter().any(|verified| verified.user_id() == identity.user_id())
+                }) {
                     trace!(
-                        user_id = self.other_user_id().as_str(),
+                        user_id = ?self.other_user_id(),
                         "Marking the user identity of as verified."
                     );
 
@@ -667,7 +655,7 @@ impl IdentitiesBeingVerified {
                     (Some(identity), should_request_secrets)
                 } else {
                     info!(
-                        user_id = self.other_user_id().as_str(),
+                        user_id = ?self.other_user_id(),
                         "The interactive verification process didn't verify \
                          the user identity of the user that participated in \
                          the interactive verification",
@@ -677,7 +665,7 @@ impl IdentitiesBeingVerified {
                 }
             } else {
                 warn!(
-                    user_id = self.other_user_id().as_str(),
+                    user_id = ?self.other_user_id(),
                     "The master keys of the user have changed while an interactive \
                       verification was going on, not marking the identity as verified.",
                 );
@@ -686,7 +674,7 @@ impl IdentitiesBeingVerified {
             }
         } else {
             info!(
-                user_id = self.other_user_id().as_str(),
+                user_id = ?self.other_user_id(),
                 "The identity of the user was deleted while an interactive \
                  verification was going on.",
             );
@@ -703,8 +691,8 @@ impl IdentitiesBeingVerified {
         let Some(device) = device else {
             let device = &self.device_being_verified;
             info!(
-                user_id = device.user_id().as_str(),
-                device_id = device.device_id().as_str(),
+                user_id = ?device.user_id(),
+                device_id = ?device.device_id(),
                 "The device was deleted while an interactive verification was going on.",
             );
             return Ok(None);
@@ -712,8 +700,8 @@ impl IdentitiesBeingVerified {
 
         if device.keys() != self.device_being_verified.keys() {
             warn!(
-                user_id = device.user_id().as_str(),
-                device_id = device.device_id().as_str(),
+                user_id = ?device.user_id(),
+                device_id = ?device.device_id(),
                 "The device keys have changed while an interactive verification \
                  was going on, not marking the device as verified.",
             );
@@ -722,8 +710,8 @@ impl IdentitiesBeingVerified {
 
         if verified_devices.is_some_and(|v| v.contains(&device)) {
             trace!(
-                user_id = device.user_id().as_str(),
-                device_id = device.device_id().as_str(),
+                user_id = ?device.user_id(),
+                device_id = ?device.device_id(),
                 "Marking device as verified.",
             );
 
@@ -732,8 +720,8 @@ impl IdentitiesBeingVerified {
             Ok(Some(device))
         } else {
             info!(
-                user_id = device.user_id().as_str(),
-                device_id = device.device_id().as_str(),
+                user_id = ?device.user_id(),
+                device_id = ?device.device_id(),
                 "The interactive verification process didn't verify the device",
             );
 
@@ -759,7 +747,7 @@ pub(crate) mod tests {
         requests::{OutgoingRequest, OutgoingRequests},
         store::{Changes, CryptoStore, CryptoStoreWrapper, IdentityChanges, MemoryStore},
         types::events::ToDeviceEvents,
-        OutgoingVerificationRequest, ReadOnlyAccount, ReadOnlyDevice, ReadOnlyOwnUserIdentity,
+        Account, OutgoingVerificationRequest, ReadOnlyDevice, ReadOnlyOwnUserIdentity,
         ReadOnlyUserIdentity,
     };
 
@@ -832,14 +820,14 @@ pub(crate) mod tests {
         device_id!("BOBDEVCIE")
     }
 
-    pub(crate) async fn setup_stores() -> (VerificationStore, VerificationStore) {
-        let alice = ReadOnlyAccount::with_device_id(alice_id(), alice_device_id());
+    pub(crate) async fn setup_stores() -> (Account, VerificationStore, Account, VerificationStore) {
+        let alice = Account::with_device_id(alice_id(), alice_device_id());
         let alice_store = MemoryStore::new();
         let (alice_private_identity, _, _) =
             PrivateCrossSigningIdentity::with_account(&alice).await;
         let alice_private_identity = Mutex::new(alice_private_identity);
 
-        let bob = ReadOnlyAccount::with_device_id(bob_id(), bob_device_id());
+        let bob = Account::with_device_id(bob_id(), bob_device_id());
         let bob_store = MemoryStore::new();
         let (bob_private_identity, _, _) = PrivateCrossSigningIdentity::with_account(&bob).await;
         let bob_private_identity = Mutex::new(bob_private_identity);
@@ -853,41 +841,43 @@ pub(crate) mod tests {
         let bob_readonly_identity =
             ReadOnlyOwnUserIdentity::from_private(&*bob_private_identity.lock().await).await;
 
-        let alice_device = ReadOnlyDevice::from_account(&alice).await;
-        let bob_device = ReadOnlyDevice::from_account(&bob).await;
+        let alice_device = ReadOnlyDevice::from_account(&alice);
+        let bob_device = ReadOnlyDevice::from_account(&bob);
 
         let alice_changes = Changes {
             identities: IdentityChanges {
                 new: vec![alice_readonly_identity.into(), bob_public_identity.into()],
                 changed: vec![],
+                unchanged: vec![],
             },
             ..Default::default()
         };
         alice_store.save_changes(alice_changes).await.unwrap();
-        alice_store.save_devices(vec![bob_device]).await;
+        alice_store.save_devices(vec![bob_device]);
 
         let bob_changes = Changes {
             identities: IdentityChanges {
                 new: vec![bob_readonly_identity.into(), alice_public_identity.into()],
                 changed: vec![],
+                unchanged: vec![],
             },
             ..Default::default()
         };
         bob_store.save_changes(bob_changes).await.unwrap();
-        bob_store.save_devices(vec![alice_device]).await;
+        bob_store.save_devices(vec![alice_device]);
 
         let alice_store = VerificationStore {
             inner: Arc::new(CryptoStoreWrapper::new(alice.user_id(), alice_store)),
-            account: alice,
+            account: alice.static_data.clone(),
             private_identity: alice_private_identity.into(),
         };
 
         let bob_store = VerificationStore {
-            account: bob.clone(),
+            account: bob.static_data.clone(),
             inner: Arc::new(CryptoStoreWrapper::new(bob.user_id(), bob_store)),
             private_identity: bob_private_identity.into(),
         };
 
-        (alice_store, bob_store)
+        (alice, alice_store, bob, bob_store)
     }
 }

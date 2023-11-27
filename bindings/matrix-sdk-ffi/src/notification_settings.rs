@@ -145,7 +145,7 @@ impl NotificationSettings {
     ) -> Result<RoomNotificationSettings, NotificationSettingsError> {
         let notification_settings = self.sdk_notification_settings.read().await;
         let parsed_room_id = RoomId::parse(&room_id)
-            .map_err(|_e| NotificationSettingsError::InvalidRoomId(room_id))?;
+            .map_err(|_e| NotificationSettingsError::InvalidRoomId { room_id })?;
         // Get the current user defined mode for this room
         if let Some(mode) =
             notification_settings.get_user_defined_room_notification_mode(&parsed_room_id).await
@@ -169,7 +169,7 @@ impl NotificationSettings {
     ) -> Result<(), NotificationSettingsError> {
         let notification_settings = self.sdk_notification_settings.read().await;
         let parsed_room_id = RoomId::parse(&room_id)
-            .map_err(|_e| NotificationSettingsError::InvalidRoomId(room_id))?;
+            .map_err(|_e| NotificationSettingsError::InvalidRoomId { room_id })?;
         notification_settings.set_room_notification_mode(&parsed_room_id, mode.into()).await?;
         Ok(())
     }
@@ -181,7 +181,7 @@ impl NotificationSettings {
     ) -> Result<Option<RoomNotificationMode>, NotificationSettingsError> {
         let notification_settings = self.sdk_notification_settings.read().await;
         let parsed_room_id = RoomId::parse(&room_id)
-            .map_err(|_e| NotificationSettingsError::InvalidRoomId(room_id))?;
+            .map_err(|_e| NotificationSettingsError::InvalidRoomId { room_id })?;
         // Get the current user defined mode for this room
         if let Some(mode) =
             notification_settings.get_user_defined_room_notification_mode(&parsed_room_id).await
@@ -246,7 +246,7 @@ impl NotificationSettings {
     ) -> Result<(), NotificationSettingsError> {
         let notification_settings = self.sdk_notification_settings.read().await;
         let parsed_room_id = RoomId::parse(&room_id)
-            .map_err(|_e| NotificationSettingsError::InvalidRoomId(room_id))?;
+            .map_err(|_e| NotificationSettingsError::InvalidRoomId { room_id })?;
         notification_settings.delete_user_defined_room_rules(&parsed_room_id).await?;
         Ok(())
     }
@@ -303,6 +303,28 @@ impl NotificationSettings {
         Ok(enabled)
     }
 
+    /// Check if [MSC 4028 push rule][rule] is enabled.
+    ///
+    /// [rule]: https://github.com/matrix-org/matrix-spec-proposals/blob/giomfo/push_encrypted_events/proposals/4028-push-all-encrypted-events-except-for-muted-rooms.md
+    pub async fn can_homeserver_push_encrypted_event_to_device(&self) -> bool {
+        let notification_settings = self.sdk_notification_settings.read().await;
+        // Check stable identifier
+        if let Ok(enabled) = notification_settings
+            .is_push_rule_enabled(RuleKind::Override, ".m.rule.encrypted_event")
+            .await
+        {
+            enabled
+        // Check unstable identifier
+        } else if let Ok(enabled) = notification_settings
+            .is_push_rule_enabled(RuleKind::Override, ".org.matrix.msc4028.encrypted_event")
+            .await
+        {
+            enabled
+        } else {
+            false
+        }
+    }
+
     /// Set whether user mentions are enabled.
     pub async fn set_user_mention_enabled(
         &self,
@@ -357,7 +379,7 @@ impl NotificationSettings {
     ) -> Result<(), NotificationSettingsError> {
         let notification_settings = self.sdk_notification_settings.read().await;
         let parsed_room_id = RoomId::parse(&room_id)
-            .map_err(|_e| NotificationSettingsError::InvalidRoomId(room_id))?;
+            .map_err(|_e| NotificationSettingsError::InvalidRoomId { room_id })?;
         notification_settings
             .unmute_room(&parsed_room_id, is_encrypted.into(), is_one_to_one.into())
             .await?;

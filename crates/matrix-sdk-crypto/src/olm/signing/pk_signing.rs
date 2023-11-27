@@ -16,7 +16,7 @@ use ruma::{encryption::KeyUsage, DeviceKeyAlgorithm, DeviceKeyId, OwnedUserId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Error as JsonError, Value};
 use thiserror::Error;
-use vodozemac::{Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, KeyError};
+use vodozemac::{DecodeError, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature, KeyError};
 use zeroize::Zeroize;
 
 use crate::{
@@ -26,7 +26,6 @@ use crate::{
         CrossSigningKey, DeviceKeys, MasterPubkey, SelfSigningPubkey, Signatures, SigningKeys,
         UserSigningPubkey,
     },
-    utilities::DecodeError,
     ReadOnlyUserIdentity,
 };
 
@@ -52,6 +51,7 @@ pub struct Signing {
     public_key: Ed25519PublicKey,
 }
 
+#[cfg(not(tarpaulin_include))]
 impl std::fmt::Debug for Signing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Signing").field("public_key", &self.public_key.to_base64()).finish()

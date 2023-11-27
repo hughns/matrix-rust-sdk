@@ -7,7 +7,7 @@ use ruma::{
         delete_pushrule, set_pushrule, set_pushrule_actions, set_pushrule_enabled,
     },
     events::push_rules::PushRulesEvent,
-    push::{Action, RuleKind, Ruleset, Tweak},
+    push::{Action, PredefinedUnderrideRuleId, RuleKind, Ruleset, Tweak},
     RoomId,
 };
 use tokio::sync::RwLock;
@@ -54,7 +54,7 @@ impl From<bool> for IsEncrypted {
 }
 
 /// Whether or not a room is a `one-to-one`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum IsOneToOne {
     /// A room is a `one-to-one` room if it has exactly two members.
     Yes,
@@ -186,9 +186,10 @@ impl NotificationSettings {
         is_one_to_one: IsOneToOne,
         mode: RoomNotificationMode,
     ) -> Result<(), NotificationSettingsError> {
-        let rules = self.rules.read().await.clone();
-        let rule_id = rules::get_predefined_underride_room_rule_id(is_encrypted, is_one_to_one);
-        let mut rule_commands = RuleCommands::new(rules.ruleset);
+        let rule_ids = vec![
+            rules::get_predefined_underride_room_rule_id(is_encrypted, is_one_to_one.clone()),
+            is_one_to_one.into(),
+        ];
 
         let actions = match mode {
             RoomNotificationMode::AllMessages => {
@@ -199,7 +200,37 @@ impl NotificationSettings {
             }
         };
 
-        rule_commands.set_rule_actions(RuleKind::Underride, rule_id.as_str(), actions)?;
+        for rule_id in rule_ids {
+            self.set_underride_push_rule_actions(rule_id, actions.clone()).await?
+        }
+
+        Ok(())
+    }
+
+    /// Sets the push rule actions for a given underride push rule. It also
+    /// enables the push rule if it is disabled. [Underride rules] are the
+    /// lowest priority push rules
+    ///
+    /// # Arguments
+    ///
+    /// * `rule_id` - the identifier of the push rule
+    /// * `actions` - the actions to set for the push rule
+    ///
+    /// [Underride rules]: https://spec.matrix.org/v1.8/client-server-api/#push-rules
+    pub async fn set_underride_push_rule_actions(
+        &self,
+        rule_id: PredefinedUnderrideRuleId,
+        actions: Vec<Action>,
+    ) -> Result<(), NotificationSettingsError> {
+        let rules = self.rules.read().await.clone();
+        let rule_kind = RuleKind::Underride;
+        let mut rule_commands = RuleCommands::new(rules.clone().ruleset);
+
+        rule_commands.set_rule_actions(rule_kind.clone(), rule_id.as_str(), actions)?;
+
+        if !rules.is_enabled(rule_kind.clone(), rule_id.as_str())? {
+            rule_commands.set_rule_enabled(rule_kind, rule_id.as_str(), true)?
+        }
 
         self.run_server_commands(&rule_commands).await?;
 
@@ -389,6 +420,11 @@ impl NotificationSettings {
 // The http mocking library is not supported for wasm32
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
     use assert_matches::assert_matches;
     use matrix_sdk_test::{
         async_test,
@@ -401,7 +437,10 @@ mod tests {
         },
         OwnedRoomId, RoomId,
     };
-    use wiremock::{http::Method, matchers::method, Mock, MockServer, ResponseTemplate};
+    use wiremock::{
+        matchers::{method, path, path_regex},
+        Mock, MockServer, ResponseTemplate,
+    };
 
     use crate::{
         error::NotificationSettingsError,
@@ -625,7 +664,12 @@ mod tests {
 
         let settings = NotificationSettings::new(client, ruleset);
 
-        Mock::given(method("PUT")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+        Mock::given(method("PUT"))
+            .and(path("/_matrix/client/r0/pushrules/global/override/.m.rule.reaction/enabled"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         settings
             .set_push_rule_enabled(
@@ -636,20 +680,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Test the request sent
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].method, Method::Put);
-        assert_eq!(
-            requests[0].url.path(),
-            "/_matrix/client/r0/pushrules/global/override/.m.rule.reaction/enabled"
-        );
-
         // The ruleset must have been updated
         let rules = settings.rules.read().await;
         let rule =
             rules.ruleset.get(RuleKind::Override, PredefinedOverrideRuleId::Reaction).unwrap();
         assert!(rule.enabled());
+
+        server.verify().await
     }
 
     #[async_test]
@@ -720,8 +757,45 @@ mod tests {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
-        Mock::given(method("PUT")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
-        Mock::given(method("DELETE")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+        let put_was_called = Arc::new(AtomicBool::default());
+
+        Mock::given(method("PUT"))
+            .and(path_regex(r"_matrix/client/r0/pushrules/global/override/.*"))
+            .and({
+                let put_was_called = put_was_called.clone();
+                move |_: &wiremock::Request| {
+                    put_was_called.store(true, Ordering::SeqCst);
+
+                    true
+                }
+            })
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"_matrix/client/r0/pushrules/global/room/.*"))
+            .and(move |_: &wiremock::Request| {
+                // Make sure that the PUT is executed before the DELETE, so that the following
+                // sync results will give the following transitions:
+                // `AllMessages` -> `AllMessages` -> `Mute` by sending the
+                // DELETE before the PUT, we would have `AllMessages` ->
+                // `Default` -> `Mute`
+
+                let put_was_called = put_was_called.load(Ordering::SeqCst);
+                assert!(
+                    put_was_called,
+                    "The PUT /pushrules/global/override/ method should have been called before the \
+                     DELETE method"
+                );
+
+                true
+            })
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let room_id = get_test_room_id();
 
@@ -737,14 +811,7 @@ mod tests {
             settings.get_user_defined_room_notification_mode(&room_id).await.unwrap()
         );
 
-        // Test that the PUT is executed before the DELETE, so that the following sync
-        // results will give the following transitions: `AllMessages` ->
-        // `AllMessages` -> `Mute` by sending the DELETE before the PUT, we
-        // would have `AllMessages` -> `Default` -> `Mute`
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].method, Method::Put);
-        assert_eq!(requests[1].method, Method::Delete);
+        server.verify().await
     }
 
     #[async_test]
@@ -931,7 +998,76 @@ mod tests {
         ruleset
             .set_actions(
                 RuleKind::Underride,
+                PredefinedUnderrideRuleId::Message,
+                vec![Action::Notify],
+            )
+            .unwrap();
+
+        ruleset
+            .set_actions(
+                RuleKind::Underride,
+                PredefinedUnderrideRuleId::PollStart,
+                vec![Action::Notify],
+            )
+            .unwrap();
+
+        let settings = NotificationSettings::new(client, ruleset);
+        assert_eq!(
+            settings.get_default_room_notification_mode(IsEncrypted::No, IsOneToOne::No).await,
+            RoomNotificationMode::AllMessages
+        );
+
+        // After setting the default mode to `MentionsAndKeywordsOnly`
+        settings
+            .set_default_room_notification_mode(
+                IsEncrypted::No,
+                IsOneToOne::No,
+                RoomNotificationMode::MentionsAndKeywordsOnly,
+            )
+            .await
+            .unwrap();
+
+        // The list of actions for this rule must be empty
+        assert_matches!(settings.rules.read().await.ruleset.get(RuleKind::Underride, PredefinedUnderrideRuleId::Message),
+            Some(AnyPushRuleRef::Underride(rule)) => {
+                assert!(rule.actions.is_empty());
+            }
+        );
+
+        assert_matches!(settings.rules.read().await.ruleset.get(RuleKind::Underride, PredefinedUnderrideRuleId::PollStart),
+            Some(AnyPushRuleRef::Underride(rule)) => {
+                assert!(rule.actions.is_empty());
+            }
+        );
+
+        // and the new mode returned by `get_default_room_notification_mode()` should
+        // reflect the change.
+        assert_matches!(
+            settings.get_default_room_notification_mode(IsEncrypted::No, IsOneToOne::No).await,
+            RoomNotificationMode::MentionsAndKeywordsOnly
+        );
+    }
+
+    #[async_test]
+    async fn test_set_default_room_notification_mode_one_to_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+        let client = logged_in_client(Some(server.uri())).await;
+
+        // If the initial mode is `AllMessages`
+        let mut ruleset = get_server_default_ruleset();
+        ruleset
+            .set_actions(
+                RuleKind::Underride,
                 PredefinedUnderrideRuleId::RoomOneToOne,
+                vec![Action::Notify],
+            )
+            .unwrap();
+
+        ruleset
+            .set_actions(
+                RuleKind::Underride,
+                PredefinedUnderrideRuleId::PollStartOneToOne,
                 vec![Action::Notify],
             )
             .unwrap();
@@ -959,11 +1095,58 @@ mod tests {
             }
         );
 
+        assert_matches!(settings.rules.read().await.ruleset.get(RuleKind::Underride, PredefinedUnderrideRuleId::PollStartOneToOne),
+            Some(AnyPushRuleRef::Underride(rule)) => {
+                assert!(rule.actions.is_empty());
+            }
+        );
+
         // and the new mode returned by `get_default_room_notification_mode()` should
         // reflect the change.
         assert_matches!(
             settings.get_default_room_notification_mode(IsEncrypted::No, IsOneToOne::Yes).await,
             RoomNotificationMode::MentionsAndKeywordsOnly
+        );
+    }
+
+    #[async_test]
+    async fn test_set_default_room_notification_mode_enables_rules() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
+        let client = logged_in_client(Some(server.uri())).await;
+
+        // If the initial mode is `MentionsAndKeywordsOnly`
+        let mut ruleset = get_server_default_ruleset();
+        ruleset
+            .set_actions(RuleKind::Underride, PredefinedUnderrideRuleId::RoomOneToOne, vec![])
+            .unwrap();
+
+        ruleset
+            .set_actions(RuleKind::Underride, PredefinedUnderrideRuleId::PollStartOneToOne, vec![])
+            .unwrap();
+
+        // Disable one of the rules that will be updated
+        ruleset
+            .set_enabled(RuleKind::Underride, PredefinedUnderrideRuleId::RoomOneToOne, false)
+            .unwrap();
+
+        let settings = NotificationSettings::new(client, ruleset);
+
+        // After setting the default mode to `AllMessages`
+        settings
+            .set_default_room_notification_mode(
+                IsEncrypted::No,
+                IsOneToOne::Yes,
+                RoomNotificationMode::AllMessages,
+            )
+            .await
+            .unwrap();
+
+        // The new mode returned should be `AllMessages` which means that the disabled
+        // rule (`RoomOneToOne`) has been enabled.
+        assert_matches!(
+            settings.get_default_room_notification_mode(IsEncrypted::No, IsOneToOne::Yes).await,
+            RoomNotificationMode::AllMessages
         );
     }
 }

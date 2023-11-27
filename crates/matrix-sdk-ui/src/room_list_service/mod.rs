@@ -15,12 +15,11 @@
 //! `RoomListService` API.
 //!
 //! The `RoomListService` is a UI API dedicated to present a list of Matrix
-//! rooms to the user. The syncing is handled by
-//! [`SlidingSync`][matrix_sdk::SlidingSync]. The idea is to expose a simple API
-//! to handle most of the client app use cases, like: Showing and updating a
-//! list of rooms, filtering a list of rooms, handling particular updates of a
-//! range of rooms (the ones the client app is showing to the view, i.e. the
-//! rooms present in the viewport) etc.
+//! rooms to the user. The syncing is handled by [`SlidingSync`]. The idea is to
+//! expose a simple API to handle most of the client app use cases, like:
+//! Showing and updating a list of rooms, filtering a list of rooms, handling
+//! particular updates of a range of rooms (the ones the client app is showing
+//! to the view, i.e. the rooms present in the viewport) etc.
 //!
 //! As such, the `RoomListService` works as an opinionated state machine. The
 //! states are defined by [`State`]. Actions are attached to the each state
@@ -95,18 +94,6 @@ use tokio::{
     sync::{Mutex, RwLock},
     time::timeout,
 };
-
-/// Delay time before actually sending a [`SyncIndicator::Show`].
-///
-/// It's not because a `SyncIndicator` should be shown that it must be done
-/// immediately. In case of a normal network conditions, without any delay, it
-/// can lead to a “blinking” visual effect. This constant configures how long it
-/// takes to consider that a request is “slow”, and that the `SyncIndicator` is
-/// necessary to be shown.
-pub const SYNC_INDICATOR_DELAY_BEFORE_SHOWING: Duration = Duration::from_millis(200);
-
-/// Delay time before actually sending a [`SyncIndicator::Hide`].
-pub const SYNC_INDICATOR_DELAY_BEFORE_HIDING: Duration = Duration::from_millis(0);
 
 /// The [`RoomListService`] type. See the module's documentation to learn more.
 #[derive(Debug)]
@@ -190,12 +177,13 @@ impl RoomListService {
                     .required_state(vec![
                         (StateEventType::RoomAvatar, "".to_owned()),
                         (StateEventType::RoomEncryption, "".to_owned()),
+                        (StateEventType::RoomMember, "$LAZY".to_owned()),
                         (StateEventType::RoomPowerLevels, "".to_owned()),
                     ]),
             ))
             .await
             .map_err(Error::SlidingSync)?
-            .add_cached_list(
+            .add_list(
                 SlidingSyncList::builder(INVITES_LIST_NAME)
                     .sync_mode(
                         SlidingSyncMode::new_selective().add_range(INVITES_DEFAULT_SELECTIVE_RANGE),
@@ -214,8 +202,6 @@ impl RoomListService {
 
                     }))),
             )
-            .await
-            .map_err(Error::SlidingSync)?
             .build()
             .await
             .map(Arc::new)
@@ -341,7 +327,11 @@ impl RoomListService {
     /// Get a [`Stream`] of [`SyncIndicator`].
     ///
     /// Read the documentation of [`SyncIndicator`] to learn more about it.
-    pub fn sync_indicator(&self) -> impl Stream<Item = SyncIndicator> {
+    pub fn sync_indicator(
+        &self,
+        delay_before_showing: Duration,
+        delay_before_hiding: Duration,
+    ) -> impl Stream<Item = SyncIndicator> {
         let mut state = self.state();
 
         stream! {
@@ -355,11 +345,11 @@ impl RoomListService {
             loop {
                 let (sync_indicator, yield_delay) = match current_state {
                     State::Init | State::Recovering | State::Error { .. } => {
-                        (SyncIndicator::Show, SYNC_INDICATOR_DELAY_BEFORE_SHOWING)
+                        (SyncIndicator::Show, delay_before_showing)
                     }
 
                     State::SettingUp | State::Running | State::Terminated { .. } => {
-                        (SyncIndicator::Hide, SYNC_INDICATOR_DELAY_BEFORE_HIDING)
+                        (SyncIndicator::Hide, delay_before_hiding)
                     }
                 };
 
@@ -508,7 +498,7 @@ pub enum Error {
     UnknownList(String),
 
     /// An input was asked to be applied but it wasn't possible to apply it.
-    #[error("The input cannot be applied")]
+    #[error("The input cannot be applied: {0:?}")]
     InputCannotBeApplied(Input),
 
     /// The requested room doesn't exist.
@@ -571,7 +561,7 @@ mod tests {
     use futures_util::{pin_mut, StreamExt};
     use matrix_sdk::{
         config::RequestConfig,
-        matrix_auth::{Session, SessionTokens},
+        matrix_auth::{MatrixSession, MatrixSessionTokens},
         reqwest::Url,
         Client, SlidingSyncMode,
     };
@@ -584,12 +574,12 @@ mod tests {
     use super::{Error, RoomListService, State, ALL_ROOMS_LIST_NAME};
 
     async fn new_client() -> (Client, MockServer) {
-        let session = Session {
+        let session = MatrixSession {
             meta: SessionMeta {
                 user_id: user_id!("@example:localhost").to_owned(),
                 device_id: device_id!("DEVICEID").to_owned(),
             },
-            tokens: SessionTokens { access_token: "1234".to_owned(), refresh_token: None },
+            tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
         };
 
         let server = MockServer::start().await;

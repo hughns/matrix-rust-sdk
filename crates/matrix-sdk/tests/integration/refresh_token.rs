@@ -1,12 +1,17 @@
-use std::time::Duration;
+use std::{
+    future::ready,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use futures_util::StreamExt;
 use matrix_sdk::{
     config::RequestConfig,
     executor::spawn,
-    matrix_auth::{Session, SessionTokens},
-    HttpError, RefreshTokenError,
+    matrix_auth::{MatrixSession, MatrixSessionTokens},
+    HttpError, RefreshTokenError, SessionChange,
 };
 use matrix_sdk_base::SessionMeta;
 use matrix_sdk_test::{async_test, test_json};
@@ -18,7 +23,7 @@ use ruma::{
     assign, device_id, user_id,
 };
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast::error::TryRecvError, mpsc};
 use wiremock::{
     matchers::{body_partial_json, header, method, path},
     Mock, ResponseTemplate,
@@ -26,13 +31,13 @@ use wiremock::{
 
 use crate::{logged_in_client, no_retry_test_client, test_client_builder};
 
-fn session() -> Session {
-    Session {
+fn session() -> MatrixSession {
+    MatrixSession {
         meta: SessionMeta {
             user_id: user_id!("@example:localhost").to_owned(),
             device_id: device_id!("DEVICEID").to_owned(),
         },
-        tokens: SessionTokens {
+        tokens: MatrixSessionTokens {
             access_token: "1234".to_owned(),
             refresh_token: Some("abcd".to_owned()),
         },
@@ -40,7 +45,7 @@ fn session() -> Session {
 }
 
 #[async_test]
-async fn login_username_refresh_token() {
+async fn test_login_username_refresh_token() {
     let (client, server) = no_retry_test_client().await;
 
     Mock::given(method("POST"))
@@ -158,7 +163,7 @@ async fn no_refresh_token() {
 }
 
 #[async_test]
-async fn refresh_token() {
+async fn test_refresh_token() {
     let (builder, server) = test_client_builder().await;
     let client = builder
         .request_config(RequestConfig::new().disable_retry())
@@ -168,8 +173,24 @@ async fn refresh_token() {
         .unwrap();
     let auth = client.matrix_auth();
 
+    let num_save_session_callback_calls = Arc::new(Mutex::new(0));
+    client
+        .set_session_callbacks(Box::new(|_| panic!("reload session never called")), {
+            let num_save_session_callback_calls = num_save_session_callback_calls.clone();
+            Box::new(move |_client| {
+                *num_save_session_callback_calls.lock().unwrap() += 1;
+                Box::pin(ready(Ok(())))
+            })
+        })
+        .unwrap();
+
+    let mut session_changes = client.subscribe_to_session_changes();
+
     let session = session();
     auth.restore_session(session).await.unwrap();
+
+    assert_eq!(*num_save_session_callback_calls.lock().unwrap(), 0);
+    assert_eq!(session_changes.try_recv(), Err(TryRecvError::Empty));
 
     let tokens = auth.session_tokens().unwrap();
     assert_eq!(tokens.access_token, "1234");
@@ -190,6 +211,8 @@ async fn refresh_token() {
     let tokens = auth.session_tokens().unwrap();
     assert_eq!(tokens.access_token, "5678");
     assert_eq!(tokens.refresh_token.as_deref(), Some("abcd"));
+    assert_eq!(*num_save_session_callback_calls.lock().unwrap(), 1);
+    assert_eq!(session_changes.try_recv(), Ok(SessionChange::TokensRefreshed));
 
     // Refresh token changes.
     Mock::given(method("POST"))
@@ -207,6 +230,10 @@ async fn refresh_token() {
     let tokens = auth.session_tokens().unwrap();
     assert_eq!(tokens.access_token, "9012");
     assert_eq!(tokens.refresh_token.as_deref(), Some("wxyz"));
+    assert_eq!(*num_save_session_callback_calls.lock().unwrap(), 2);
+    assert_eq!(session_changes.try_recv(), Ok(SessionChange::TokensRefreshed));
+
+    assert_eq!(session_changes.try_recv(), Err(TryRecvError::Empty));
 }
 
 #[async_test]
@@ -349,7 +376,7 @@ async fn refresh_token_handled_failure() {
         .await;
 
     let res = client.whoami().await;
-    let http_err = assert_matches!(res, Err(HttpError::RefreshToken(RefreshTokenError::MatrixAuth(http_err))) => http_err);
+    assert_let!(Err(HttpError::RefreshToken(RefreshTokenError::MatrixAuth(http_err))) = res);
     assert_matches!(http_err.client_api_error_kind(), Some(ErrorKind::UnknownToken { .. }))
 }
 

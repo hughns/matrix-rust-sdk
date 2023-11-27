@@ -21,6 +21,7 @@ macro_rules! unwrap_or_clone_arc_into_variant {
 }
 
 mod authentication_service;
+mod chunk_iterator;
 mod client;
 mod client_builder;
 mod error;
@@ -33,11 +34,13 @@ mod room;
 mod room_info;
 mod room_list;
 mod room_member;
+mod ruma;
 mod session_verification;
 mod sync_service;
 mod task_handle;
 mod timeline;
 mod tracing;
+mod utils;
 mod widget;
 
 use async_compat::TOKIO1 as RUNTIME;
@@ -46,7 +49,11 @@ use matrix_sdk::ruma::events::room::{
 };
 use matrix_sdk_ui::timeline::{BackPaginationStatus, EventItemOrigin};
 
-use self::{error::ClientError, task_handle::TaskHandle, timeline::MediaSourceExt};
+use self::{
+    error::ClientError,
+    ruma::{MediaSourceExt, Mentions, RoomMessageEventContentWithoutRelationExt},
+    task_handle::TaskHandle,
+};
 
 uniffi::include_scaffolding!("api");
 

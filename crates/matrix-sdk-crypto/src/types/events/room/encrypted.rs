@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use ruma::{JsOption, OwnedDeviceId, RoomId};
+use ruma::{OwnedDeviceId, RoomId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use vodozemac::{megolm::MegolmMessage, olm::OlmMessage, Curve25519PublicKey};
@@ -126,7 +126,7 @@ pub struct OlmV1Curve25519AesSha2Content {
     pub sender_key: Curve25519PublicKey,
 
     /// The unique ID of this content.
-    pub message_id: JsOption<String>,
+    pub message_id: Option<String>,
 }
 
 /// The event content for events encrypted with the m.olm.v2.curve25519-aes-sha2
@@ -142,8 +142,8 @@ pub struct OlmV2Curve25519AesSha2Content {
     pub sender_key: Curve25519PublicKey,
 
     /// The unique ID of this content.
-    #[serde(default, skip_serializing_if = "JsOption::is_undefined", rename = "org.matrix.msgid")]
-    pub message_id: JsOption<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "org.matrix.msgid")]
+    pub message_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -151,8 +151,8 @@ struct OlmHelper {
     #[serde(deserialize_with = "deserialize_curve_key", serialize_with = "serialize_curve_key")]
     sender_key: Curve25519PublicKey,
     ciphertext: BTreeMap<String, OlmMessage>,
-    #[serde(default, skip_serializing_if = "JsOption::is_undefined", rename = "org.matrix.msgid")]
-    message_id: JsOption<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "org.matrix.msgid")]
+    message_id: Option<String>,
 }
 
 impl Serialize for OlmV1Curve25519AesSha2Content {
@@ -412,6 +412,7 @@ scheme_serialization!(
 #[cfg(test)]
 pub(crate) mod tests {
     use assert_matches::assert_matches;
+    use assert_matches2::assert_let;
     use serde_json::{json, Value};
     use vodozemac::Curve25519PublicKey;
 
@@ -499,11 +500,10 @@ pub(crate) mod tests {
         let json = to_device_json();
         let event: EncryptedToDeviceEvent = serde_json::from_value(json.clone())?;
 
-        let content = assert_matches!(
-            &event.content,
-            ToDeviceEncryptedEventContent::OlmV1Curve25519AesSha2(c) => c.to_owned()
+        assert_let!(
+            ToDeviceEncryptedEventContent::OlmV1Curve25519AesSha2(content) = &event.content
         );
-        assert!(content.message_id.is_undefined());
+        assert!(content.message_id.is_none());
 
         let serialized = serde_json::to_value(event)?;
         assert_eq!(json, serialized);

@@ -18,6 +18,7 @@ mod sas_state;
 
 use std::sync::Arc;
 
+use as_variant::as_variant;
 use eyeball::{ObservableWriteGuard, SharedObservable};
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -41,16 +42,17 @@ use super::{
 };
 use crate::{
     identities::{ReadOnlyDevice, ReadOnlyUserIdentities},
+    olm::StaticAccountData,
     requests::{OutgoingVerificationRequest, RoomMessageRequest},
     store::CryptoStoreError,
-    Emoji, ReadOnlyAccount, ToDeviceRequest,
+    Emoji, ToDeviceRequest,
 };
 
 /// Short authentication string object.
 #[derive(Clone, Debug)]
 pub struct Sas {
     inner: SharedObservable<InnerSas>,
-    account: ReadOnlyAccount,
+    account: StaticAccountData,
     identities_being_verified: IdentitiesBeingVerified,
     flow_id: Arc<FlowId>,
     we_started: bool,
@@ -187,28 +189,24 @@ impl From<&InnerSas> for SasState {
                 Self::Accepted { accepted_protocols: s.state.accepted_protocols.to_owned() }
             }
             InnerSas::KeysExchanged(s) => {
-                let emojis = if value.supports_emoji() {
+                let emojis = value.supports_emoji().then(|| {
                     let emojis = s.get_emoji();
                     let indices = s.get_emoji_index();
 
-                    Some(EmojiShortAuthString { emojis, indices })
-                } else {
-                    None
-                };
+                    EmojiShortAuthString { emojis, indices }
+                });
 
                 let decimals = s.get_decimal();
 
                 Self::KeysExchanged { emojis, decimals }
             }
             InnerSas::MacReceived(s) => {
-                let emojis = if value.supports_emoji() {
+                let emojis = value.supports_emoji().then(|| {
                     let emojis = s.get_emoji();
                     let indices = s.get_emoji_index();
 
-                    Some(EmojiShortAuthString { emojis, indices })
-                } else {
-                    None
-                };
+                    EmojiShortAuthString { emojis, indices }
+                });
 
                 let decimals = s.get_decimal();
 
@@ -228,12 +226,12 @@ impl From<&InnerSas> for SasState {
 impl Sas {
     /// Get our own user id.
     pub fn user_id(&self) -> &UserId {
-        self.account.user_id()
+        &self.account.user_id
     }
 
     /// Get our own device ID.
     pub fn device_id(&self) -> &DeviceId {
-        self.account.device_id()
+        &self.account.device_id
     }
 
     /// Get the user id of the other side.
@@ -258,11 +256,7 @@ impl Sas {
 
     /// Get the room id if the verification is happening inside a room.
     pub fn room_id(&self) -> Option<&RoomId> {
-        if let FlowId::InRoom(r, _) = self.flow_id() {
-            Some(r)
-        } else {
-            None
-        }
+        as_variant!(self.flow_id(), FlowId::InRoom(r, _) => r)
     }
 
     /// Does this verification flow support displaying emoji for the short
@@ -276,7 +270,7 @@ impl Sas {
         self.inner.read().started_from_request()
     }
 
-    /// Is this a verification that is veryfying one of our own devices.
+    /// Is this a verification that is verifying one of our own devices.
     pub fn is_self_verification(&self) -> bool {
         self.identities_being_verified.is_self_verification()
     }
@@ -294,11 +288,9 @@ impl Sas {
     /// Get info about the cancellation if the verification flow has been
     /// cancelled.
     pub fn cancel_info(&self) -> Option<CancelInfo> {
-        if let InnerSas::Cancelled(c) = &*self.inner.read() {
-            Some(c.state.as_ref().clone().into())
-        } else {
-            None
-        }
+        as_variant!(&*self.inner.read(), InnerSas::Cancelled(c) => {
+            c.state.as_ref().clone().into()
+        })
     }
 
     /// Did we initiate the verification flow.
@@ -434,15 +426,9 @@ impl Sas {
     /// This does nothing if the verification was already accepted, otherwise it
     /// returns an `AcceptEventContent` that needs to be sent out.
     pub fn accept(&self) -> Option<OutgoingVerificationRequest> {
-        match self.state() {
-            SasState::Started { protocols } => {
-                let settings =
-                    AcceptSettings { allowed_methods: protocols.short_authentication_string };
-
-                self.accept_with_settings(settings)
-            }
-            _ => None,
-        }
+        let protocols = as_variant!(self.state(), SasState::Started { protocols } => protocols)?;
+        let settings = AcceptSettings { allowed_methods: protocols.short_authentication_string };
+        self.accept_with_settings(settings)
     }
 
     /// Accept the SAS verification customizing the accept method.
@@ -528,8 +514,8 @@ impl Sas {
 
         if !mac_requests.is_empty() {
             trace!(
-                user_id = self.other_user_id().as_str(),
-                device_id = self.other_device_id().as_str(),
+                user_id = ?self.other_user_id(),
+                device_id = ?self.other_device_id(),
                 "Confirming SAS verification"
             )
         }
@@ -867,6 +853,7 @@ mod tests {
     use std::sync::Arc;
 
     use assert_matches::assert_matches;
+    use assert_matches2::assert_let;
     use matrix_sdk_test::async_test;
     use ruma::{
         device_id,
@@ -883,7 +870,7 @@ mod tests {
             event_enums::{AcceptContent, KeyContent, MacContent, OutgoingContent, StartContent},
             VerificationStore,
         },
-        ReadOnlyAccount, ReadOnlyDevice, SasState,
+        Account, ReadOnlyDevice, SasState,
     };
 
     fn alice_id() -> &'static UserId {
@@ -902,25 +889,25 @@ mod tests {
         device_id!("BOBDEVCIE")
     }
 
-    async fn machine_pair() -> (VerificationStore, ReadOnlyDevice, VerificationStore, ReadOnlyDevice)
-    {
-        let alice = ReadOnlyAccount::with_device_id(alice_id(), alice_device_id());
-        let alice_device = ReadOnlyDevice::from_account(&alice).await;
+    fn machine_pair_test_helper(
+    ) -> (VerificationStore, ReadOnlyDevice, VerificationStore, ReadOnlyDevice) {
+        let alice = Account::with_device_id(alice_id(), alice_device_id());
+        let alice_device = ReadOnlyDevice::from_account(&alice);
 
-        let bob = ReadOnlyAccount::with_device_id(bob_id(), bob_device_id());
-        let bob_device = ReadOnlyDevice::from_account(&bob).await;
+        let bob = Account::with_device_id(bob_id(), bob_device_id());
+        let bob_device = ReadOnlyDevice::from_account(&bob);
 
         let alice_store = VerificationStore {
-            account: alice.clone(),
+            account: alice.static_data.clone(),
             inner: Arc::new(CryptoStoreWrapper::new(alice.user_id(), MemoryStore::new())),
             private_identity: Mutex::new(PrivateCrossSigningIdentity::empty(alice_id())).into(),
         };
 
         let bob_store = MemoryStore::new();
-        bob_store.save_devices(vec![alice_device.clone()]).await;
+        bob_store.save_devices(vec![alice_device.clone()]);
 
         let bob_store = VerificationStore {
-            account: bob.clone(),
+            account: bob.static_data.clone(),
             inner: Arc::new(CryptoStoreWrapper::new(bob.user_id(), bob_store)),
             private_identity: Mutex::new(PrivateCrossSigningIdentity::empty(bob_id())).into(),
         };
@@ -930,7 +917,7 @@ mod tests {
 
     #[async_test]
     async fn sas_wrapper_full() {
-        let (alice_store, alice_device, bob_store, bob_device) = machine_pair().await;
+        let (alice_store, alice_device, bob_store, bob_device) = machine_pair_test_helper();
 
         let identities = alice_store.get_identities(bob_device).await.unwrap();
 
@@ -1004,7 +991,7 @@ mod tests {
 
     #[async_test]
     async fn sas_with_restricted_methods() {
-        let (alice_store, alice_device, bob_store, bob_device) = machine_pair().await;
+        let (alice_store, alice_device, bob_store, bob_device) = machine_pair_test_helper();
         let identities = alice_store.get_identities(bob_device).await.unwrap();
 
         let short_auth_strings = vec![ShortAuthenticationString::Decimal];
@@ -1021,7 +1008,7 @@ mod tests {
 
         let content = OutgoingContent::try_from(request).unwrap();
         let content = AcceptContent::try_from(&content).unwrap();
-        let content = assert_matches!(content.method(), AcceptMethod::SasV1(content) => content);
+        assert_let!(AcceptMethod::SasV1(content) = content.method());
 
         assert!(content.short_authentication_string.contains(&ShortAuthenticationString::Decimal));
         assert!(!content.short_authentication_string.contains(&ShortAuthenticationString::Emoji));

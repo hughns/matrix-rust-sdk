@@ -165,65 +165,95 @@
 //! [`AuthenticateError::InsufficientScope`]: ruma::api::client::error::AuthenticateError
 //! [`examples/oidc-cli`]: https://github.com/matrix-org/matrix-rust-sdk/tree/main/examples/oidc-cli
 
-use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
-    fmt,
-    hash::{Hash, Hasher},
-};
+use std::{collections::HashMap, fmt, sync::Arc};
 
-use chrono::Utc;
+use as_variant::as_variant;
 use eyeball::SharedObservable;
 use futures_core::Stream;
 pub use mas_oidc_client::{error, types};
 use mas_oidc_client::{
-    http_service::HttpService,
-    jose::jwk::PublicJsonWebKeySet,
-    requests::{
-        authorization_code::{access_token_with_authorization_code, AuthorizationValidationData},
-        discovery::discover,
-        jose::{fetch_jwks, JwtVerificationData},
-        refresh_token::refresh_access_token,
-        registration::register_client,
-        revocation::revoke_token,
-    },
+    requests::authorization_code::AuthorizationValidationData,
     types::{
         client_credentials::ClientCredentials,
         errors::ClientError,
         iana::oauth::OAuthTokenTypeHint,
         oidc::VerifiedProviderMetadata,
         registration::{ClientRegistrationResponse, VerifiedClientMetadata},
-        requests::AccessTokenResponse,
         scope::{MatrixApiScopeToken, Scope, ScopeToken},
         IdToken,
     },
 };
 use matrix_sdk_base::{once_cell::sync::OnceCell, SessionMeta};
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use ruma::api::client::discovery::discover_homeserver::AuthenticationServerInfo;
+use ruma::{api::client::discovery::discover_homeserver::AuthenticationServerInfo, OwnedDeviceId};
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::{spawn, sync::Mutex};
+use tracing::{error, trace, warn};
 use url::Url;
 
 mod auth_code_builder;
+mod backend;
+mod cross_process;
 mod data_serde;
 mod end_session_builder;
+#[cfg(test)]
+mod tests;
 
 pub use self::{
     auth_code_builder::{OidcAuthCodeUrlBuilder, OidcAuthorizationData},
     end_session_builder::{OidcEndSessionData, OidcEndSessionUrlBuilder},
 };
+use self::{
+    backend::{server::OidcServer, OidcBackend},
+    cross_process::{
+        CrossProcessRefreshLockError, CrossProcessRefreshLockGuard, CrossProcessRefreshManager,
+    },
+};
 use crate::{authentication::AuthData, client::SessionChange, Client, RefreshTokenError, Result};
+
+pub(crate) struct OidcCtx {
+    /// The authentication server info discovered from the homeserver.
+    authentication_server_info: Option<AuthenticationServerInfo>,
+
+    /// Lock and state when multiple processes may refresh an OIDC session.
+    cross_process_token_refresh_manager: OnceCell<CrossProcessRefreshManager>,
+
+    /// Deferred cross-process lock initializer.
+    ///
+    /// Note: only required because we're using the crypto store that might not
+    /// be present before reloading a session.
+    deferred_cross_process_lock_init: Mutex<Option<String>>,
+
+    /// Whether to allow HTTP issuer URLs.
+    insecure_discover: bool,
+}
+
+impl OidcCtx {
+    pub(crate) fn new(
+        authentication_server_info: Option<AuthenticationServerInfo>,
+        insecure_discover: bool,
+    ) -> Self {
+        Self {
+            authentication_server_info,
+            insecure_discover,
+            cross_process_token_refresh_manager: Default::default(),
+            deferred_cross_process_lock_init: Default::default(),
+        }
+    }
+}
 
 pub(crate) struct OidcAuthData {
     pub(crate) issuer_info: AuthenticationServerInfo,
     pub(crate) credentials: ClientCredentials,
     pub(crate) metadata: VerifiedClientMetadata,
-    pub(crate) tokens: OnceCell<SharedObservable<SessionTokens>>,
+    pub(crate) tokens: OnceCell<SharedObservable<OidcSessionTokens>>,
     /// The data necessary to validate authorization responses.
     pub(crate) authorization_data: Mutex<HashMap<String, AuthorizationValidationData>>,
 }
 
+#[cfg(not(tarpaulin_include))]
 impl fmt::Debug for OidcAuthData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OidcAuthData")
@@ -237,26 +267,77 @@ impl fmt::Debug for OidcAuthData {
 pub struct Oidc {
     /// The underlying Matrix API client.
     client: Client,
+
+    /// The implementation of the OIDC backend.
+    backend: Arc<dyn OidcBackend>,
 }
 
 impl Oidc {
     pub(crate) fn new(client: Client) -> Self {
-        Self { client }
+        Self { client: client.clone(), backend: Arc::new(OidcServer::new(client)) }
     }
 
-    /// Get the `HttpService` to make requests with.
-    fn http_service(&self) -> HttpService {
-        HttpService::new(self.client.inner.http_client.clone())
+    fn ctx(&self) -> &OidcCtx {
+        &self.client.inner.auth_ctx.oidc
+    }
+
+    /// Enable a cross-process store lock on the state store, to coordinate
+    /// refreshes across different processes.
+    pub async fn enable_cross_process_refresh_lock(
+        &self,
+        lock_value: String,
+    ) -> Result<(), OidcError> {
+        // FIXME: it must be deferred only because we're using the crypto store and it's
+        // initialized only in `set_session_meta`, not if we use a dedicated
+        // store.
+        let mut lock = self.ctx().deferred_cross_process_lock_init.lock().await;
+        if lock.is_some() {
+            return Err(CrossProcessRefreshLockError::DuplicatedLock.into());
+        }
+        *lock = Some(lock_value);
+
+        Ok(())
+    }
+
+    /// Performs a deferred cross-process refresh-lock, if needs be, after an
+    /// olm machine has been initialized.
+    ///
+    /// Must be called after `set_session_meta`.
+    async fn deferred_enable_cross_process_refresh_lock(&self) -> Result<()> {
+        let deferred_init_lock = self.ctx().deferred_cross_process_lock_init.lock().await;
+
+        // Don't `take()` the value, so that subsequent calls to
+        // `enable_cross_process_refresh_lock` will keep on failing if we've enabled the
+        // lock at least once.
+        let Some(lock_value) = deferred_init_lock.as_ref() else {
+            return Ok(());
+        };
+
+        // FIXME We shouldn't be using the crypto store for that! see also https://github.com/matrix-org/matrix-rust-sdk/issues/2472
+        let olm_machine_lock = self.client.olm_machine().await;
+        let olm_machine =
+            olm_machine_lock.as_ref().expect("there has to be an olm machine, hopefully?");
+        let store = olm_machine.store();
+        let lock =
+            store.create_store_lock("oidc_session_refresh_lock".to_owned(), lock_value.clone());
+
+        let manager = CrossProcessRefreshManager::new(store.clone(), lock);
+
+        // This method is guarded with the `deferred_cross_process_lock_init` lock held,
+        // so this `set` can't be an error.
+        let _ = self.ctx().cross_process_token_refresh_manager.set(manager);
+
+        Ok(())
     }
 
     /// The OpenID Connect authentication data.
     ///
-    /// Returns `None` if the client's registration was not restored yet.
+    /// Returns `None` if the client registration was not restored with
+    /// [`Oidc::restore_registered_client()`] or
+    /// [`Oidc::restore_session()`].
     fn data(&self) -> Option<&OidcAuthData> {
-        match self.client.inner.auth_data.get()? {
-            AuthData::Oidc(data) => Some(data),
-            _ => None,
-        }
+        let data = self.client.inner.auth_ctx.auth_data.get()?;
+        as_variant!(data, AuthData::Oidc)
     }
 
     /// The authentication server info discovered from the homeserver.
@@ -269,7 +350,7 @@ impl Oidc {
     /// [MSC3861]: https://github.com/matrix-org/matrix-spec-proposals/pull/3861
     /// [`ClientBuilder::server_name()`]: crate::ClientBuilder::server_name()
     pub fn authentication_server_info(&self) -> Option<&AuthenticationServerInfo> {
-        self.client.inner.authentication_server_info.as_ref()
+        self.client.inner.auth_ctx.oidc.authentication_server_info.as_ref()
     }
 
     /// The OpenID Connect Provider used for authorization.
@@ -287,7 +368,10 @@ impl Oidc {
     /// [`Oidc::restore_registered_client()`] or
     /// [`Oidc::restore_session()`], or if the homeserver doesn't advertise this
     /// URL. Returns an error if the URL could not be parsed
-    pub fn account_management_url(&self) -> Result<Option<Url>, url::ParseError> {
+    pub fn account_management_url(
+        &self,
+        action: Option<OidcAccountManagementAction>,
+    ) -> Result<Option<Url>, url::ParseError> {
         let Some(data) = self.data() else {
             return Ok(None);
         };
@@ -301,6 +385,25 @@ impl Oidc {
             url.query_pairs_mut().append_pair("id_token_hint", id_token.as_str());
         }
 
+        if let Some(action) = action {
+            match action {
+                OidcAccountManagementAction::Profile => {
+                    url.query_pairs_mut().append_pair("action", "profile");
+                }
+                OidcAccountManagementAction::SessionsList => {
+                    url.query_pairs_mut().append_pair("action", "sessions_list");
+                }
+                OidcAccountManagementAction::SessionView { device_id } => {
+                    url.query_pairs_mut().append_pair("action", "session_view");
+                    url.query_pairs_mut().append_pair("device_id", device_id.as_str());
+                }
+                OidcAccountManagementAction::SessionEnd { device_id } => {
+                    url.query_pairs_mut().append_pair("action", "session_end");
+                    url.query_pairs_mut().append_pair("device_id", device_id.as_str());
+                }
+            }
+        }
+
         Ok(Some(url))
     }
 
@@ -311,7 +414,7 @@ impl Oidc {
         &self,
         issuer: &str,
     ) -> Result<VerifiedProviderMetadata, OidcError> {
-        discover(&self.http_service(), issuer).await.map_err(Into::into)
+        self.backend.discover(issuer, self.ctx().insecure_discover).await
     }
 
     /// Fetch the OpenID Connect metadata of the issuer.
@@ -322,14 +425,6 @@ impl Oidc {
         let issuer = self.issuer().ok_or(OidcError::MissingAuthenticationIssuer)?;
 
         self.given_provider_metadata(issuer).await
-    }
-
-    /// Fetch the OpenID Connect JSON Web Key Set at the given URI.
-    ///
-    /// Returns an error if the client registration was not restored, or if an
-    /// error occurred when fetching the data.
-    async fn fetch_jwks(&self, jwks_uri: &Url) -> Result<PublicJsonWebKeySet, OidcError> {
-        Ok(fetch_jwks(&self.http_service(), jwks_uri).await?)
     }
 
     /// The OpenID Connect metadata of this client used during registration.
@@ -352,20 +447,17 @@ impl Oidc {
     }
 
     /// Set the current session tokens.
-    fn set_session_tokens(&self, session_tokens: SessionTokens) {
-        if let Some(auth_data) = self.client.inner.auth_data.get() {
-            let Some(data) = auth_data.as_oidc() else {
-                panic!("Cannot call OpenID Connect API after logging in with another API");
-            };
-
-            if let Some(tokens) = data.tokens.get() {
-                tokens.set_if_not_eq(session_tokens);
-            } else {
-                let _ = data.tokens.set(SharedObservable::new(session_tokens));
-            }
+    ///
+    /// # Panics
+    ///
+    /// Will panic if no OIDC client has been configured yet.
+    fn set_session_tokens(&self, session_tokens: OidcSessionTokens) {
+        let data =
+            self.data().expect("Cannot call OpenID Connect API after logging in with another API");
+        if let Some(tokens) = data.tokens.get() {
+            tokens.set_if_not_eq(session_tokens);
         } else {
-            // Other OIDC auth data should have already been set before the session tokens.
-            unreachable!()
+            let _ = data.tokens.set(SharedObservable::new(session_tokens));
         }
     }
 
@@ -373,7 +465,7 @@ impl Oidc {
     ///
     /// Returns `None` if the client was not logged in with the OpenID Connect
     /// API.
-    pub fn session_tokens(&self) -> Option<SessionTokens> {
+    pub fn session_tokens(&self) -> Option<OidcSessionTokens> {
         Some(self.data()?.tokens.get()?.get())
     }
 
@@ -390,8 +482,8 @@ impl Oidc {
     /// ```no_run
     /// use futures_util::StreamExt;
     /// use matrix_sdk::Client;
-    /// # fn persist_session(_: &matrix_sdk::matrix_auth::Session) {};
-    /// # async {
+    /// # fn persist_session(_: &matrix_sdk::oidc::OidcSession) {}
+    /// # _ = async {
     /// let homeserver = "http://example.com";
     /// let client = Client::builder()
     ///     .homeserver_url(homeserver)
@@ -402,21 +494,22 @@ impl Oidc {
     /// // Login with the OpenID Connect API…
     ///
     /// let oidc = client.oidc();
-    /// let session = oidc.session().expect("Client should be logged in");
-    /// persist_session(session);
+    /// let session = oidc.full_session().expect("Client should be logged in");
+    /// persist_session(&session);
     ///
     /// // Handle when at least one of the tokens changed.
     /// let mut tokens_stream =
     ///     oidc.session_tokens_stream().expect("Client should be logged in");
     /// loop {
     ///     if tokens_stream.next().await.is_some() {
-    ///         let session = oidc.session().expect("Client should be logged in");
-    ///         persist_session(session);
+    ///         let session =
+    ///             oidc.full_session().expect("Client should be logged in");
+    ///         persist_session(&session);
     ///     }
     /// }
     /// # anyhow::Ok(()) };
     /// ```
-    pub fn session_tokens_stream(&self) -> Option<impl Stream<Item = SessionTokens>> {
+    pub fn session_tokens_stream(&self) -> Option<impl Stream<Item = OidcSessionTokens>> {
         Some(self.data()?.tokens.get()?.subscribe())
     }
 
@@ -460,14 +553,14 @@ impl Oidc {
     ///
     /// Returns `None` if the client was not logged in with the OpenID Connect
     /// API.
-    pub fn full_session(&self) -> Option<FullSession> {
+    pub fn full_session(&self) -> Option<OidcSession> {
         let user = self.user_session()?;
         let data = self.data()?;
-        let client = RegisteredClientData {
+        Some(OidcSession {
             credentials: data.credentials.clone(),
             metadata: data.metadata.clone(),
-        };
-        Some(FullSession { client, user })
+            user,
+        })
     }
 
     /// Register a client with an OpenID Connect Provider.
@@ -502,18 +595,20 @@ impl Oidc {
     /// # Example
     ///
     /// ```no_run
-    /// use matrix_sdk::Client;
+    /// use matrix_sdk::{Client, ServerName};
     /// use matrix_sdk::oidc::types::client_credentials::ClientCredentials;
-    /// # use matrix_sdk::oidc::types::registration::{ClientMetadata, VerifiedClientMetadata};
-    /// # let metadata = ClientMetadata::default().validate().unwrap();
-    /// # fn persist_client_registration (_: &str, _: &VerifiedClientMetadata, _: &ClientCredentials) {};
-    /// # async {
-    /// let client = Client::builder().server_name("my_homeserver.org").build().await?;
+    /// use matrix_sdk::oidc::types::registration::ClientMetadata;
+    /// # use matrix_sdk::oidc::types::registration::VerifiedClientMetadata;
+    /// # let client_metadata = ClientMetadata::default().validate().unwrap();
+    /// # fn persist_client_registration (_: &str, _: &ClientMetadata, _: &ClientCredentials) {}
+    /// # _ = async {
+    /// let server_name = ServerName::parse("my_homeserver.org").unwrap();
+    /// let client = Client::builder().server_name(&server_name).build().await?;
     /// let oidc = client.oidc();
     ///
     /// if let Some(info) = oidc.authentication_server_info() {
     ///     let response = oidc
-    ///         .register_client(&info.issuer, metadata.clone(), None)
+    ///         .register_client(&info.issuer, client_metadata.clone(), None)
     ///         .await?;
     ///
     ///     println!(
@@ -526,14 +621,9 @@ impl Oidc {
     ///         client_id: response.client_id,
     ///     };
     ///
-    ///     let client_data = RegisteredClientData {
-    ///         credentials,
-    ///         metadata,
-    ///     };
-    ///
-    ///     persist_client_registration(&info.issuer, &client_data);
+    ///     persist_client_registration(&info.issuer, &client_metadata, &credentials);
     /// }
-    /// # anyhow::Ok(()) }
+    /// # anyhow::Ok(()) };
     /// ```
     ///
     /// [software statement]: https://datatracker.ietf.org/doc/html/rfc7591#autoid-8
@@ -544,19 +634,15 @@ impl Oidc {
         software_statement: Option<String>,
     ) -> Result<ClientRegistrationResponse, OidcError> {
         let provider_metadata = self.given_provider_metadata(issuer).await?;
+
         let registration_endpoint = provider_metadata
             .registration_endpoint
             .as_ref()
             .ok_or(OidcError::NoRegistrationSupport)?;
 
-        register_client(
-            &self.http_service(),
-            registration_endpoint,
-            client_metadata,
-            software_statement,
-        )
-        .await
-        .map_err(Into::into)
+        self.backend
+            .register_client(registration_endpoint, client_metadata, software_statement)
+            .await
     }
 
     /// Set the data of a client that is registered with an OpenID Connect
@@ -567,7 +653,8 @@ impl Oidc {
     ///
     /// # Arguments
     ///
-    /// * `issuer` - The OpenID Connect Provider to interact with.
+    /// * `issuer_info` - The [`AuthenticationServerInfo`] for the OpenID
+    ///   Connect Provider we're interacting with.
     ///
     /// * `client_metadata` - The [`VerifiedClientMetadata`] that was
     ///   registered.
@@ -578,22 +665,23 @@ impl Oidc {
     /// # Panic
     ///
     /// Panics if authentication data was already set.
-    pub async fn restore_registered_client(
+    pub fn restore_registered_client(
         &self,
         issuer_info: AuthenticationServerInfo,
-        client_data: RegisteredClientData,
+        client_metadata: VerifiedClientMetadata,
+        client_credentials: ClientCredentials,
     ) {
-        let RegisteredClientData { credentials, metadata } = client_data;
         let data = OidcAuthData {
             issuer_info,
-            credentials,
-            metadata,
+            credentials: client_credentials,
+            metadata: client_metadata,
             tokens: Default::default(),
             authorization_data: Default::default(),
         };
 
         self.client
             .inner
+            .auth_ctx
             .auth_data
             .set(AuthData::Oidc(data))
             .expect("Client authentication data was already set");
@@ -612,26 +700,98 @@ impl Oidc {
     /// # Panic
     ///
     /// Panics if authentication data was already set.
-    pub async fn restore_session(&self, session: FullSession) -> Result<()> {
-        let FullSession {
-            client: RegisteredClientData { credentials, metadata },
-            user: UserSession { meta, tokens, issuer_info },
-        } = session;
+    pub async fn restore_session(&self, session: OidcSession) -> Result<()> {
+        let OidcSession { credentials, metadata, user: UserSession { meta, tokens, issuer_info } } =
+            session;
 
         let data = OidcAuthData {
             issuer_info,
             credentials,
             metadata,
-            tokens: SharedObservable::new(tokens).into(),
+            tokens: SharedObservable::new(tokens.clone()).into(),
             authorization_data: Default::default(),
         };
 
-        self.client.base_client().set_session_meta(meta).await?;
+        self.client.set_session_meta(meta).await?;
+        self.deferred_enable_cross_process_refresh_lock().await?;
+
         self.client
             .inner
+            .auth_ctx
             .auth_data
             .set(AuthData::Oidc(data))
             .expect("Client authentication data was already set");
+
+        // Initialize the cross-process locking by saving our tokens' hash into the
+        // database, if we've enabled the cross-process lock.
+
+        if let Some(cross_process_lock) = self.ctx().cross_process_token_refresh_manager.get() {
+            cross_process_lock.restore_session(&tokens).await;
+
+            let mut guard = cross_process_lock
+                .spin_lock()
+                .await
+                .map_err(|err| crate::Error::Oidc(err.into()))?;
+
+            // After we got the lock, it's possible that our session doesn't match the one
+            // read from the database, because of a race: another process has
+            // refreshed the tokens while we were waiting for the lock.
+            //
+            // In that case, if there's a mismatch, we reload the session and update the
+            // hash. Otherwise, we save our hash into the database.
+
+            if guard.hash_mismatch {
+                Box::pin(self.handle_session_hash_mismatch(&mut guard))
+                    .await
+                    .map_err(|err| crate::Error::Oidc(err.into()))?;
+            } else {
+                guard
+                    .save_in_memory_and_db(&tokens)
+                    .await
+                    .map_err(|err| crate::Error::Oidc(err.into()))?;
+                // No need to call the save_session_callback here; it was the
+                // source of the session, so it's already in
+                // sync with what we had.
+            }
+        }
+
+        #[cfg(feature = "e2e-encryption")]
+        self.client.encryption().run_initialization_tasks().await?;
+
+        Ok(())
+    }
+
+    async fn handle_session_hash_mismatch(
+        &self,
+        guard: &mut CrossProcessRefreshLockGuard,
+    ) -> Result<(), CrossProcessRefreshLockError> {
+        trace!("Handling hash mismatch.");
+
+        let callback = self
+            .client
+            .inner
+            .auth_ctx
+            .reload_session_callback
+            .get()
+            .ok_or(CrossProcessRefreshLockError::MissingReloadSession)?;
+
+        match callback(self.client.clone()) {
+            Ok(tokens) => {
+                let crate::authentication::SessionTokens::Oidc(tokens) = tokens else {
+                    return Err(CrossProcessRefreshLockError::InvalidSessionTokens);
+                };
+
+                guard.handle_mismatch(&tokens).await?;
+
+                self.set_session_tokens(tokens.clone());
+                // The app's callback acted as authoritative here, so we're not
+                // saving the data back into the app, as that would have no
+                // effect.
+            }
+            Err(err) => {
+                error!("when reloading OIDC session tokens from callback: {err}");
+            }
+        }
 
         Ok(())
     }
@@ -663,23 +823,27 @@ impl Oidc {
     /// # Example
     ///
     /// ```no_run
-    /// # use matrix_sdk::{Client};
+    /// # use anyhow::anyhow;
+    /// use matrix_sdk::{Client};
+    /// # use matrix_sdk::oidc::AuthorizationResponse;
     /// # use url::Url;
     /// # let homeserver = Url::parse("https://example.com").unwrap();
     /// # let redirect_uri = Url::parse("http://127.0.0.1/oidc").unwrap();
     /// # let redirected_to_uri = Url::parse("http://127.0.0.1/oidc").unwrap();
     /// # let issuer_info = unimplemented!();
-    /// # let client_data = unimplemented!();
-    /// # async {
+    /// # let client_metadata = unimplemented!();
+    /// # let client_credentials = unimplemented!();
+    /// # _ = async {
     /// # let client = Client::new(homeserver).await?;
     /// let oidc = client.oidc();
     ///
     /// oidc.restore_registered_client(
     ///     issuer_info,
-    ///     client_data,
-    /// ).await;
+    ///     client_metadata,
+    ///     client_credentials,
+    /// );
     ///
-    /// let auth_data = oidc.login(redirect_uri, None).build().await?;
+    /// let auth_data = oidc.login(redirect_uri, None)?.build().await?;
     ///
     /// // Open auth_data.url and wait for response at the redirect URI.
     /// // The full URL obtained is called here `redirected_to_uri`.
@@ -689,7 +853,7 @@ impl Oidc {
     /// let code = match auth_response {
     ///     AuthorizationResponse::Success(code) => code,
     ///     AuthorizationResponse::Error(error) => {
-    ///         return Err(format!("Authorization failed: {error}").into());
+    ///         return Err(anyhow!("Authorization failed: {:?}", error));
     ///     }
     /// };
     ///
@@ -749,7 +913,50 @@ impl Oidc {
             user_id: whoami_res.user_id,
             device_id: whoami_res.device_id.ok_or(OidcError::MissingDeviceId)?,
         };
-        self.client.base_client().set_session_meta(session).await.map_err(crate::Error::from)?;
+
+        self.client.set_session_meta(session).await.map_err(crate::Error::from)?;
+        // At this point the Olm machine has been set up.
+
+        // Enable the cross-process lock for refreshes, if needs be.
+        self.deferred_enable_cross_process_refresh_lock().await?;
+
+        // Bootstrap cross signing, if needs be.
+        // TODO: (#2763) put this into a background task.
+        if self.client.encryption().settings().auto_enable_cross_signing {
+            // According to MSC3967, OIDC doesn't require User-Interactive Authentication to
+            // call this API. Let's find out!
+            if let Err(err) = self.client.encryption().bootstrap_cross_signing_if_needed(None).await
+            {
+                warn!("cross-signing bootstrapping failed: {err}");
+            }
+        }
+
+        if let Some(cross_process_manager) = self.ctx().cross_process_token_refresh_manager.get() {
+            if let Some(tokens) = self.session_tokens() {
+                let mut cross_process_guard = cross_process_manager
+                    .spin_lock()
+                    .await
+                    .map_err(|err| crate::Error::Oidc(err.into()))?;
+
+                if cross_process_guard.hash_mismatch {
+                    // At this point, we're finishing a login while another process had written
+                    // something in the database. It's likely the information in the database it
+                    // just outdated and wasn't properly updated, but display a warning, just in
+                    // case this happens frequently.
+                    warn!(
+                        "unexpected cross-process hash mismatch when finishing login (see comment)"
+                    );
+                }
+
+                cross_process_guard
+                    .save_in_memory_and_db(&tokens)
+                    .await
+                    .map_err(|err| crate::Error::Oidc(err.into()))?;
+            }
+        }
+
+        #[cfg(feature = "e2e-encryption")]
+        self.client.encryption().run_initialization_tasks().await?;
 
         Ok(())
     }
@@ -789,50 +996,38 @@ impl Oidc {
     ///
     /// # Arguments
     ///
-    /// * `code` - The response received as part of the redirect URI when the
-    ///   authorization was successful.
+    /// * `auth_code` - The response received as part of the redirect URI when
+    ///   the authorization was successful.
     ///
     /// Returns an error if a request fails.
     pub async fn finish_authorization(
         &self,
-        code: AuthorizationCode,
-    ) -> Result<AccessTokenResponse, OidcError> {
-        let provider_metadata = self.provider_metadata().await?;
+        auth_code: AuthorizationCode,
+    ) -> Result<(), OidcError> {
         let data = self.data().ok_or(OidcError::NotAuthenticated)?;
         let validation_data = data
             .authorization_data
             .lock()
             .await
-            .remove(&code.state)
+            .remove(&auth_code.state)
             .ok_or(OidcError::InvalidState)?;
 
-        let jwks = self.fetch_jwks(provider_metadata.jwks_uri()).await?;
-        let id_token_verification_data = JwtVerificationData {
-            issuer: provider_metadata.issuer(),
-            jwks: &jwks,
-            client_id: &data.credentials.client_id().to_owned(),
-            signing_algorithm: data.metadata.id_token_signed_response_alg(),
-        };
+        let provider_metadata = self.provider_metadata().await?;
 
-        let (response, id_token) = access_token_with_authorization_code(
-            &self.http_service(),
-            data.credentials.clone(),
-            provider_metadata.token_endpoint(),
-            code.code,
-            validation_data,
-            Some(id_token_verification_data),
-            Utc::now(),
-            &mut rng()?,
-        )
-        .await?;
+        let session_tokens = self
+            .backend
+            .trade_authorization_code_for_tokens(
+                provider_metadata,
+                data.credentials.clone(),
+                data.metadata.clone(),
+                auth_code,
+                validation_data,
+            )
+            .await?;
 
-        self.set_session_tokens(SessionTokens {
-            access_token: response.access_token.clone(),
-            refresh_token: response.refresh_token.clone(),
-            latest_id_token: id_token,
-        });
+        self.set_session_tokens(session_tokens);
 
-        Ok(response)
+        Ok(())
     }
 
     /// Abort the authorization process.
@@ -858,54 +1053,89 @@ impl Oidc {
 
     async fn refresh_access_token_inner(
         &self,
-        latest_id_token: Option<IdToken<'static>>,
         refresh_token: String,
-    ) -> Result<AccessTokenResponse, OidcError> {
+        latest_id_token: Option<IdToken<'static>>,
+        lock: Option<CrossProcessRefreshLockGuard>,
+    ) -> Result<(), OidcError> {
+        // Do not interrupt refresh access token requests and processing, by detaching
+        // the request sending and response processing.
+
         let provider_metadata = self.provider_metadata().await?;
+
+        let this = self.clone();
         let data = self.data().ok_or(OidcError::NotAuthenticated)?;
+        let credentials = data.credentials.clone();
+        let metadata = data.metadata.clone();
 
-        let jwks = self.fetch_jwks(provider_metadata.jwks_uri()).await?;
-        let id_token_verification_data = JwtVerificationData {
-            issuer: provider_metadata.issuer(),
-            jwks: &jwks,
-            client_id: &data.credentials.client_id().to_owned(),
-            signing_algorithm: data.metadata.id_token_signed_response_alg(),
-        };
+        spawn(async move {
+            trace!(
+                "Token refresh: attempting to refresh with refresh_token {:x}",
+                hash_str(&refresh_token)
+            );
 
-        tracing::trace!(
-            "Token refresh: attempting to refresh with refresh_token {}",
-            hash(&refresh_token)
-        );
+            match this
+                .backend
+                .refresh_access_token(
+                    provider_metadata,
+                    credentials,
+                    &metadata,
+                    refresh_token.clone(),
+                    latest_id_token.clone(),
+                )
+                .await
+                .map_err(OidcError::from)
+            {
+                Ok(new_tokens) => {
+                    trace!(
+                        "Token refresh: new refresh_token: {} / access_token: {:x}",
+                        new_tokens
+                            .refresh_token
+                            .as_deref()
+                            .map(|token| format!("{:x}", hash_str(token)))
+                            .unwrap_or_else(|| "<none>".to_owned()),
+                        hash_str(&new_tokens.access_token)
+                    );
 
-        let (response, _id_token) = refresh_access_token(
-            &self.http_service(),
-            data.credentials.clone(),
-            provider_metadata.token_endpoint(),
-            refresh_token.clone(),
-            None,
-            Some(id_token_verification_data),
-            latest_id_token.as_ref(),
-            Utc::now(),
-            &mut rng()?,
-        )
+                    let tokens = OidcSessionTokens {
+                        access_token: new_tokens.access_token,
+                        refresh_token: new_tokens.refresh_token.clone().or(Some(refresh_token)),
+                        latest_id_token,
+                    };
+
+                    this.set_session_tokens(tokens.clone());
+
+                    // Call the save_session_callback if set, while the optional lock is being held.
+                    if let Some(save_session_callback) =
+                        this.client.inner.auth_ctx.save_session_callback.get()
+                    {
+                        // Satisfies the save_session_callback invariant: set_session_tokens has
+                        // been called just above.
+                        if let Err(err) = save_session_callback(this.client.clone()).await {
+                            error!("when saving session after refresh: {err}");
+                        }
+                    }
+
+                    if let Some(mut lock) = lock {
+                        lock.save_in_memory_and_db(&tokens).await?;
+                    }
+
+                    _ = this
+                        .client
+                        .inner
+                        .auth_ctx
+                        .session_change_sender
+                        .send(SessionChange::TokensRefreshed);
+
+                    Ok(())
+                }
+
+                Err(err) => Err(err),
+            }
+        })
         .await
-        .map_err(OidcError::from)?;
+        .expect("joining")?;
 
-        tracing::trace!(
-            "Token refresh: new refresh_token: {:?} / access_token: {}",
-            response.refresh_token.as_ref().map(hash),
-            hash(&response.access_token)
-        );
-
-        self.set_session_tokens(SessionTokens {
-            access_token: response.access_token.clone(),
-            refresh_token: response.refresh_token.clone().or(Some(refresh_token)),
-            latest_id_token,
-        });
-
-        _ = self.client.inner.session_change_sender.send(SessionChange::TokensRefreshed);
-
-        Ok(response)
+        Ok(())
     }
 
     /// Refresh the access token.
@@ -922,44 +1152,74 @@ impl Oidc {
     /// or the same [`RefreshTokenError`], if it failed.
     ///
     /// [`ClientBuilder::handle_refresh_tokens()`]: crate::ClientBuilder::handle_refresh_tokens()
-    pub async fn refresh_access_token(
-        &self,
-    ) -> Result<Option<AccessTokenResponse>, RefreshTokenError> {
+    pub async fn refresh_access_token(&self) -> Result<(), RefreshTokenError> {
         let client = &self.client;
-        let lock = client.inner.refresh_token_lock.try_lock();
+
+        let refresh_status_lock = client.inner.auth_ctx.refresh_token_lock.try_lock();
 
         macro_rules! fail {
-            ($lock:expr, $error:expr) => {
-                let error = $error;
+            ($lock:expr, $err:expr) => {
+                let error = $err;
                 *$lock = Err(error.clone());
                 return Err(error);
             };
         }
 
-        if let Ok(mut guard) = lock {
-            let Some(session_tokens) = self.session_tokens() else {
-                fail!(guard, RefreshTokenError::RefreshTokenRequired);
-            };
-            let Some(refresh_token) = session_tokens.refresh_token else {
-                fail!(guard, RefreshTokenError::RefreshTokenRequired);
+        let Ok(mut refresh_status_guard) = refresh_status_lock else {
+            // There's already a request to refresh happening in the same process. Wait for
+            // it to finish.
+            return client.inner.auth_ctx.refresh_token_lock.lock().await.clone();
+        };
+
+        let cross_process_guard =
+            if let Some(manager) = self.ctx().cross_process_token_refresh_manager.get() {
+                let mut cross_process_guard = match manager
+                    .spin_lock()
+                    .await
+                    .map_err(|err| RefreshTokenError::Oidc(Arc::new(err.into())))
+                {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        fail!(refresh_status_guard, err);
+                    }
+                };
+
+                if cross_process_guard.hash_mismatch {
+                    Box::pin(self.handle_session_hash_mismatch(&mut cross_process_guard))
+                        .await
+                        .map_err(|err| RefreshTokenError::Oidc(Arc::new(err.into())))?;
+                    // Optimistic exit: assume that the underlying process did update fast enough.
+                    // In the worst case, we'll do another refresh Soon™.
+                    *refresh_status_guard = Ok(());
+                    return Ok(());
+                }
+
+                Some(cross_process_guard)
+            } else {
+                None
             };
 
-            match self
-                .refresh_access_token_inner(session_tokens.latest_id_token, refresh_token)
-                .await
-            {
-                Ok(response) => {
-                    *guard = Ok(());
-                    Ok(Some(response))
-                }
-                Err(error) => {
-                    fail!(guard, RefreshTokenError::Oidc(error.into()));
-                }
+        let Some(session_tokens) = self.session_tokens() else {
+            fail!(refresh_status_guard, RefreshTokenError::RefreshTokenRequired);
+        };
+        let Some(refresh_token) = session_tokens.refresh_token else {
+            fail!(refresh_status_guard, RefreshTokenError::RefreshTokenRequired);
+        };
+
+        match self
+            .refresh_access_token_inner(
+                refresh_token,
+                session_tokens.latest_id_token,
+                cross_process_guard,
+            )
+            .await
+        {
+            Ok(()) => {
+                *refresh_status_guard = Ok(());
+                Ok(())
             }
-        } else {
-            match client.inner.refresh_token_lock.lock().await.as_ref() {
-                Ok(_) => Ok(None),
-                Err(error) => Err(error.clone()),
+            Err(error) => {
+                fail!(refresh_status_guard, RefreshTokenError::Oidc(error.into()));
             }
         }
     }
@@ -979,32 +1239,27 @@ impl Oidc {
             provider_metadata.revocation_endpoint.as_ref().ok_or(OidcError::NoRevocationSupport)?;
 
         let tokens = self.session_tokens().ok_or(OidcError::NotAuthenticated)?;
-        let mut rng = rng()?;
 
         // Revoke the access token.
-        revoke_token(
-            &self.http_service(),
-            client_credentials.clone(),
-            revocation_endpoint,
-            tokens.access_token,
-            Some(OAuthTokenTypeHint::AccessToken),
-            Utc::now(),
-            &mut rng,
-        )
-        .await?;
+        self.backend
+            .revoke_token(
+                client_credentials.clone(),
+                revocation_endpoint,
+                tokens.access_token,
+                Some(OAuthTokenTypeHint::AccessToken),
+            )
+            .await?;
 
         // Revoke the refresh token, if any.
         if let Some(refresh_token) = tokens.refresh_token {
-            revoke_token(
-                &self.http_service(),
-                client_credentials.clone(),
-                revocation_endpoint,
-                refresh_token,
-                Some(OAuthTokenTypeHint::RefreshToken),
-                Utc::now(),
-                &mut rng,
-            )
-            .await?;
+            self.backend
+                .revoke_token(
+                    client_credentials.clone(),
+                    revocation_endpoint,
+                    refresh_token,
+                    Some(OAuthTokenTypeHint::RefreshToken),
+                )
+                .await?;
         }
 
         let end_session_builder =
@@ -1016,28 +1271,25 @@ impl Oidc {
                 )
             });
 
+        if let Some(manager) = self.ctx().cross_process_token_refresh_manager.get() {
+            manager.on_logout().await?;
+        }
+
         Ok(end_session_builder)
     }
 }
 
 /// A full session for the OpenID Connect API.
 #[derive(Debug, Clone)]
-pub struct FullSession {
-    /// The registered client data.
-    pub client: RegisteredClientData,
-
-    /// The user session.
-    pub user: UserSession,
-}
-
-/// The data used to identify a registered client for the OpenID Connect API.
-#[derive(Debug, Clone)]
-pub struct RegisteredClientData {
+pub struct OidcSession {
     /// The credentials obtained after registration.
     pub credentials: ClientCredentials,
 
     /// The client metadata sent for registration.
     pub metadata: VerifiedClientMetadata,
+
+    /// The user session.
+    pub user: UserSession,
 }
 
 /// A user session for the OpenID Connect API.
@@ -1049,7 +1301,7 @@ pub struct UserSession {
 
     /// The tokens used for authentication.
     #[serde(flatten)]
-    pub tokens: SessionTokens,
+    pub tokens: OidcSessionTokens,
 
     /// Information about the OpenID Connect provider used for this session.
     pub issuer_info: AuthenticationServerInfo,
@@ -1058,7 +1310,7 @@ pub struct UserSession {
 /// The tokens for a user session obtained with the OpenID Connect API.
 #[derive(Clone, Eq, PartialEq)]
 #[allow(missing_debug_implementations)]
-pub struct SessionTokens {
+pub struct OidcSessionTokens {
     /// The access token used for this session.
     pub access_token: String,
 
@@ -1069,7 +1321,8 @@ pub struct SessionTokens {
     pub latest_id_token: Option<IdToken<'static>>,
 }
 
-impl fmt::Debug for SessionTokens {
+#[cfg(not(tarpaulin_include))]
+impl fmt::Debug for OidcSessionTokens {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionTokens").finish_non_exhaustive()
     }
@@ -1111,14 +1364,6 @@ impl AuthorizationResponse {
 
         Err(RedirectUriQueryParseError::UnknownFormat)
     }
-
-    /// Access the state field, on either variant.
-    pub fn state(&self) -> &str {
-        match self {
-            Self::Success(code) => &code.state,
-            Self::Error(error) => &error.state,
-        }
-    }
 }
 
 /// The data returned by the provider in the redirect URI after a successful
@@ -1152,6 +1397,26 @@ pub enum RedirectUriQueryParseError {
     /// Deserialization failed.
     #[error("Query is not using one of the defined formats")]
     UnknownFormat,
+}
+
+/// Indicates the action that the user wishes to take when showing the account
+/// URL page.
+#[derive(Debug)]
+pub enum OidcAccountManagementAction {
+    /// The user wishes to view their profile (name, avatar, contact details).
+    Profile,
+    /// The user wishes to view a list of their sessions.
+    SessionsList,
+    /// The user wishes to view the details of a session.
+    SessionView {
+        /// The Matrix device ID to be shown.
+        device_id: OwnedDeviceId,
+    },
+    /// The user wishes to end/logout a session.
+    SessionEnd {
+        /// The Matrix device ID to be ended.
+        device_id: OwnedDeviceId,
+    },
 }
 
 /// All errors that can occur when using the OpenID Connect API.
@@ -1197,6 +1462,10 @@ pub enum OidcError {
     #[error(transparent)]
     Rand(rand::Error),
 
+    /// An error occurred caused by the cross-process locks.
+    #[error(transparent)]
+    LockError(#[from] CrossProcessRefreshLockError),
+
     /// An unknown error occurred.
     #[error("unknown error")]
     UnknownError(#[source] Box<dyn std::error::Error + Send + Sync>),
@@ -1215,8 +1484,6 @@ fn rng() -> Result<StdRng, OidcError> {
     StdRng::from_rng(rand::thread_rng()).map_err(OidcError::Rand)
 }
 
-fn hash<T: Hash>(x: &T) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    x.hash(&mut hasher);
-    hasher.finish()
+fn hash_str(x: &str) -> impl std::fmt::LowerHex {
+    sha2::Sha256::new().chain_update(x).finalize()
 }

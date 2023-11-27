@@ -1,13 +1,8 @@
 use std::{
     collections::HashMap,
-    fs,
-    fs::File,
-    io::{BufReader, BufWriter},
-    path::PathBuf,
     sync::{Arc, RwLock},
 };
 
-use futures_util::future::join;
 use matrix_sdk::{
     oidc::{
         types::{
@@ -18,20 +13,20 @@ use matrix_sdk::{
             registration::{ClientMetadata, Localized, VerifiedClientMetadata},
             requests::{GrantType, Prompt},
         },
-        AuthorizationResponse, Oidc, OidcError, RegisteredClientData,
+        AuthorizationResponse, Oidc, OidcError,
     },
     AuthSession,
 };
+use matrix_sdk_ui::authentication::oidc::{ClientId, OidcRegistrations, OidcRegistrationsError};
 use ruma::{
     api::client::discovery::discover_homeserver::AuthenticationServerInfo, IdParseError,
     OwnedUserId,
 };
-use serde::{Deserialize, Serialize};
 use url::Url;
 use zeroize::Zeroize;
 
 use super::{client::Client, client_builder::ClientBuilder, RUNTIME};
-use crate::{client_builder::UrlScheme, error::ClientError};
+use crate::{client::ClientSessionDelegate, client_builder::UrlScheme, error::ClientError};
 
 #[derive(uniffi::Object)]
 pub struct AuthenticationService {
@@ -42,6 +37,8 @@ pub struct AuthenticationService {
     homeserver_details: RwLock<Option<Arc<HomeserverLoginDetails>>>,
     oidc_configuration: Option<OidcConfiguration>,
     custom_sliding_sync_proxy: RwLock<Option<String>>,
+    cross_process_refresh_lock_id: Option<String>,
+    session_delegate: Option<Arc<dyn ClientSessionDelegate>>,
 }
 
 impl Drop for AuthenticationService {
@@ -93,6 +90,15 @@ impl From<IdParseError> for AuthenticationError {
     }
 }
 
+impl From<OidcRegistrationsError> for AuthenticationError {
+    fn from(e: OidcRegistrationsError) -> AuthenticationError {
+        match e {
+            OidcRegistrationsError::InvalidBasePath => AuthenticationError::InvalidBasePath,
+            _ => AuthenticationError::OidcError { message: e.to_string() },
+        }
+    }
+}
+
 impl From<OidcError> for AuthenticationError {
     fn from(e: OidcError) -> AuthenticationError {
         AuthenticationError::OidcError { message: e.to_string() }
@@ -115,73 +121,12 @@ pub struct OidcConfiguration {
     pub tos_uri: Option<String>,
     /// A URI that contains the client's privacy policy.
     pub policy_uri: Option<String>,
+    /// An array of e-mail addresses of people responsible for this client.
+    pub contacts: Option<Vec<String>>,
 
     /// Pre-configured registrations for use with issuers that don't support
     /// dynamic client registration.
     pub static_registrations: HashMap<String, String>,
-}
-
-/// The data needed to restore an OpenID Connect session.
-#[derive(Debug, Serialize, Deserialize)]
-struct OidcRegistrations {
-    /// The path of the file where the registrations are stored.
-    file_path: PathBuf,
-    /// Pre-configured registrations for use with issuers that don't support
-    /// dynamic client registration.
-    static_registrations: HashMap<String, String>,
-}
-
-/// Manages the storage of OIDC registrations.
-impl OidcRegistrations {
-    fn new(
-        base_path: &str,
-        static_registrations: HashMap<String, String>,
-    ) -> Result<Self, AuthenticationError> {
-        let oidc_directory = PathBuf::from(base_path).join("oidc");
-        fs::create_dir_all(&oidc_directory).map_err(|_| AuthenticationError::InvalidBasePath)?;
-
-        Ok(OidcRegistrations {
-            file_path: oidc_directory.join("registrations.json"),
-            static_registrations,
-        })
-    }
-
-    /// Returns all of the registrations this client has made as a HashMap of
-    /// issuer URL (as a string) to client ID (as a string).
-    fn dynamic_registrations(&self) -> HashMap<String, String> {
-        let reader = match File::open(&self.file_path) {
-            Ok(file) => BufReader::new(file),
-            Err(e) => {
-                tracing::error!("Failed to open registrations file: {e}");
-                return HashMap::new();
-            }
-        };
-
-        serde_json::from_reader(reader).unwrap_or_else(|e| {
-            tracing::error!("Failed to parse registrations file: {e}");
-            HashMap::new()
-        })
-    }
-
-    /// Returns the client ID registered for a particular issuer or None if a
-    /// registration hasn't been made.
-    fn client_id(&self, issuer: &str) -> Option<String> {
-        let mut registrations = self.dynamic_registrations();
-        registrations.extend(self.static_registrations.clone());
-        registrations.get(issuer).cloned()
-    }
-
-    /// Stores a new client ID registration for a particular issuer. If a client
-    /// ID has already been stored, this will overwrite the old value.
-    fn set_client_id(&self, client_id: String, issuer: String) -> Result<(), AuthenticationError> {
-        let mut current = self.dynamic_registrations();
-        current.insert(issuer, client_id);
-
-        let writer = BufWriter::new(
-            File::create(&self.file_path).map_err(|_| AuthenticationError::InvalidBasePath)?,
-        );
-        serde_json::to_writer(writer, &current).map_err(|_| AuthenticationError::InvalidBasePath)
-    }
 }
 
 /// The data required to authenticate against an OIDC server.
@@ -237,6 +182,8 @@ impl AuthenticationService {
         user_agent: Option<String>,
         oidc_configuration: Option<OidcConfiguration>,
         custom_sliding_sync_proxy: Option<String>,
+        session_delegate: Option<Box<dyn ClientSessionDelegate>>,
+        cross_process_refresh_lock_id: Option<String>,
     ) -> Arc<Self> {
         Arc::new(AuthenticationService {
             base_path,
@@ -246,6 +193,8 @@ impl AuthenticationService {
             homeserver_details: RwLock::new(None),
             oidc_configuration,
             custom_sliding_sync_proxy: RwLock::new(custom_sliding_sync_proxy),
+            session_delegate: session_delegate.map(Into::into),
+            cross_process_refresh_lock_id,
         })
     }
 
@@ -438,11 +387,9 @@ impl AuthenticationService {
         &self,
         client: &Arc<Client>,
     ) -> Result<HomeserverLoginDetails, AuthenticationError> {
-        let login_details = join(client.async_homeserver(), client.supports_password_login()).await;
-
-        let url = login_details.0;
         let supports_oidc_login = client.discovered_authentication_server().is_some();
-        let supports_password_login = login_details.1.ok().unwrap_or(false);
+        let supports_password_login = client.supports_password_login().await.ok().unwrap_or(false);
+        let url = client.homeserver();
 
         Ok(HomeserverLoginDetails { url, supports_oidc_login, supports_password_login })
     }
@@ -475,15 +422,11 @@ impl AuthenticationService {
             .register_client(&authentication_server.issuer, oidc_metadata.clone(), None)
             .await?;
 
-        let client_data = RegisteredClientData {
-            // The format of the credentials changes according to the client metadata that was sent.
-            // Public clients only get a client ID.
-            credentials: ClientCredentials::None {
-                client_id: registration_response.client_id.clone(),
-            },
-            metadata: oidc_metadata,
-        };
-        oidc.restore_registered_client(authentication_server, client_data).await;
+        // The format of the credentials changes according to the client metadata that
+        // was sent. Public clients only get a client ID.
+        let credentials =
+            ClientCredentials::None { client_id: registration_response.client_id.clone() };
+        oidc.restore_registered_client(authentication_server, oidc_metadata, credentials);
 
         tracing::info!("Persisting OIDC registration data.");
         self.store_client_registration(oidc).await?;
@@ -494,7 +437,10 @@ impl AuthenticationService {
     /// Stores the current OIDC dynamic client registration so it can be re-used
     /// if we ever log in via the same issuer again.
     async fn store_client_registration(&self, oidc: &Oidc) -> Result<(), AuthenticationError> {
-        let issuer = oidc.issuer().ok_or(AuthenticationError::OidcNotSupported)?;
+        let issuer = Url::parse(oidc.issuer().ok_or(AuthenticationError::OidcNotSupported)?)
+            .map_err(|_| AuthenticationError::OidcError {
+                message: String::from("Failed to parse issuer URL."),
+            })?;
         let client_id = oidc
             .client_credentials()
             .ok_or(AuthenticationError::OidcError {
@@ -503,14 +449,16 @@ impl AuthenticationService {
             .client_id()
             .to_owned();
 
+        let metadata = oidc.client_metadata().ok_or(AuthenticationError::OidcError {
+            message: String::from("Missing client metadata."),
+        })?;
+
         let registrations = OidcRegistrations::new(
             &self.base_path,
-            self.oidc_configuration
-                .as_ref()
-                .map(|c| c.static_registrations.clone())
-                .unwrap_or_default(),
+            metadata.clone(),
+            self.oidc_static_registrations(),
         )?;
-        registrations.set_client_id(client_id, issuer.to_owned())?;
+        registrations.set_and_write_client_id(ClientId(client_id), issuer)?;
 
         Ok(())
     }
@@ -523,27 +471,27 @@ impl AuthenticationService {
         authentication_server: &AuthenticationServerInfo,
         oidc_metadata: VerifiedClientMetadata,
     ) -> bool {
-        let issuer = &authentication_server.issuer;
+        let Ok(issuer) = Url::parse(&authentication_server.issuer) else {
+            tracing::error!("Failed to parse {:?}", authentication_server.issuer);
+            return false;
+        };
         let Some(registrations) = OidcRegistrations::new(
             &self.base_path,
-            self.oidc_configuration
-                .as_ref()
-                .map(|c| c.static_registrations.clone())
-                .unwrap_or_default(),
+            oidc_metadata.clone(),
+            self.oidc_static_registrations(),
         )
         .ok() else {
             return false;
         };
-        let Some(client_id) = registrations.client_id(issuer) else {
+        let Some(client_id) = registrations.client_id(&issuer) else {
             return false;
         };
 
-        let client_data = RegisteredClientData {
-            credentials: ClientCredentials::None { client_id },
-            metadata: oidc_metadata,
-        };
-
-        oidc.restore_registered_client(authentication_server.clone(), client_data).await;
+        oidc.restore_registered_client(
+            authentication_server.clone(),
+            oidc_metadata,
+            ClientCredentials::None { client_id: client_id.0 },
+        );
 
         true
     }
@@ -562,6 +510,7 @@ impl AuthenticationService {
         let logo_uri = configuration.logo_uri.localized_url()?;
         let policy_uri = configuration.policy_uri.localized_url()?;
         let tos_uri = configuration.tos_uri.localized_url()?;
+        let contacts = configuration.contacts.clone();
 
         ClientMetadata {
             application_type: Some(ApplicationType::Native),
@@ -571,7 +520,7 @@ impl AuthenticationService {
             token_endpoint_auth_method: Some(OAuthClientAuthenticationMethod::None),
             // The server should display the following fields when getting the user's consent.
             client_name,
-            contacts: None,
+            contacts,
             client_uri,
             logo_uri,
             policy_uri,
@@ -580,6 +529,24 @@ impl AuthenticationService {
         }
         .validate()
         .map_err(|_| AuthenticationError::OidcMetadataInvalid)
+    }
+
+    fn oidc_static_registrations(&self) -> HashMap<Url, ClientId> {
+        let registrations = self
+            .oidc_configuration
+            .as_ref()
+            .map(|c| c.static_registrations.clone())
+            .unwrap_or_default();
+        registrations
+            .iter()
+            .filter_map(|(issuer, client_id)| {
+                let Ok(issuer) = Url::parse(issuer) else {
+                    tracing::error!("Failed to parse {:?}", issuer);
+                    return None;
+                };
+                Some((issuer, ClientId(client_id.clone())))
+            })
+            .collect()
     }
 
     /// Creates a new client to setup the store path now the user ID is known.
@@ -600,13 +567,26 @@ impl AuthenticationService {
             sliding_sync_proxy = None;
         }
 
-        let client = self
+        let mut client = self
             .new_client_builder()
             .passphrase(self.passphrase.clone())
             .homeserver_url(homeserver_url)
             .sliding_sync_proxy(sliding_sync_proxy)
-            .username(user_id.to_string())
-            .build_inner()?;
+            .username(user_id.to_string());
+
+        if let Some(id) = &self.cross_process_refresh_lock_id {
+            let Some(ref session_delegate) = self.session_delegate else {
+                return Err(AuthenticationError::OidcError {
+                    message: "cross-process refresh lock requires session delegate".to_owned(),
+                });
+            };
+            client = client
+                .enable_cross_process_refresh_lock_inner(id.clone(), session_delegate.clone());
+        } else if let Some(ref session_delegate) = self.session_delegate {
+            client = client.set_session_delegate_inner(session_delegate.clone());
+        }
+
+        let client = client.build_inner()?;
 
         // Restore the client using the session from the login request.
         client.restore_session_inner(session)?;

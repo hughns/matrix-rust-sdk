@@ -15,10 +15,9 @@ use super::{
     FrozenSlidingSync, FrozenSlidingSyncList, SlidingSync, SlidingSyncList,
     SlidingSyncPositionMarkers,
 };
-use crate::{
-    sliding_sync::{FrozenSlidingSyncPos, SlidingSyncListCachePolicy},
-    Client, Result,
-};
+#[cfg(feature = "e2e-encryption")]
+use crate::sliding_sync::FrozenSlidingSyncPos;
+use crate::{sliding_sync::SlidingSyncListCachePolicy, Client, Result};
 
 /// Be careful: as this is used as a storage key; changing it requires migrating
 /// data!
@@ -279,7 +278,6 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     use assert_matches::assert_matches;
-    use futures_util::StreamExt;
     use matrix_sdk_test::async_test;
 
     use super::{

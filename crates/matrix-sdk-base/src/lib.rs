@@ -43,22 +43,16 @@ pub use http;
 pub use matrix_sdk_crypto as crypto;
 pub use once_cell;
 pub use rooms::{
-    DisplayName, Room, RoomInfo, RoomMember, RoomMemberships, RoomState, RoomStateFilter,
+    DisplayName, Room, RoomCreateWithCreatorEventContent, RoomInfo, RoomMember, RoomMemberships,
+    RoomState, RoomStateFilter,
 };
 pub use store::{StateChanges, StateStore, StateStoreDataKey, StateStoreDataValue, StoreError};
 pub use utils::{
     MinimalRoomMemberEvent, MinimalStateEvent, OriginalMinimalStateEvent, RedactedMinimalStateEvent,
 };
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
-#[ctor::ctor]
-fn init_logging() {
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::from_default_env())
-        .with(tracing_subscriber::fmt::layer().with_test_writer())
-        .init();
-}
+#[cfg(test)]
+matrix_sdk_test::init_tracing_for_tests!();
 
 /// The Matrix user session info.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]

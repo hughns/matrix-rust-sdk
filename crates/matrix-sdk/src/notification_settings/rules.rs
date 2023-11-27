@@ -227,7 +227,7 @@ impl Rules {
         } else if let Some(rule) = self.ruleset.get(kind, rule_id) {
             Ok(rule.enabled())
         } else {
-            Err(NotificationSettingsError::RuleNotFound)
+            Err(NotificationSettingsError::RuleNotFound(rule_id.to_owned()))
         }
     }
 
@@ -273,6 +273,15 @@ pub(crate) fn get_predefined_underride_room_rule_id(
         (IsEncrypted::No, IsOneToOne::Yes) => PredefinedUnderrideRuleId::RoomOneToOne,
         (IsEncrypted::Yes, IsOneToOne::No) => PredefinedUnderrideRuleId::Encrypted,
         (IsEncrypted::No, IsOneToOne::No) => PredefinedUnderrideRuleId::Message,
+    }
+}
+
+impl From<IsOneToOne> for PredefinedUnderrideRuleId {
+    fn from(is_one_to_one: IsOneToOne) -> Self {
+        match is_one_to_one {
+            IsOneToOne::Yes => Self::PollStartOneToOne,
+            IsOneToOne::No => Self::PollStart,
+        }
     }
 }
 
@@ -539,7 +548,7 @@ pub(crate) mod tests {
 
         assert_eq!(
             rules.is_enabled(RuleKind::Override, "unknown_rule_id"),
-            Err(NotificationSettingsError::RuleNotFound)
+            Err(NotificationSettingsError::RuleNotFound("unknown_rule_id".to_owned()))
         );
     }
 
@@ -650,7 +659,7 @@ pub(crate) mod tests {
         ]
         .into_iter()
         .collect();
-        assert!(expected_set.difference(HashSet::from(room_ids)).is_empty());
+        assert!(expected_set.symmetric_difference(HashSet::from(room_ids)).is_empty());
 
         // Only disabled rules
         let room_ids = rules.get_rooms_with_user_defined_rules(Some(false));
@@ -674,6 +683,6 @@ pub(crate) mod tests {
         assert_eq!(room_ids.len(), 2);
         let expected_set: HashSet<String> =
             vec!["!room_a:matrix.org", "!room_d:matrix.org"].into_iter().collect();
-        assert!(expected_set.difference(HashSet::from(room_ids)).is_empty());
+        assert!(expected_set.symmetric_difference(HashSet::from(room_ids)).is_empty());
     }
 }

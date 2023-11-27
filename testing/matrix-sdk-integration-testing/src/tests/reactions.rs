@@ -16,10 +16,11 @@ use std::sync::Arc;
 
 use anyhow::{Ok, Result};
 use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use assign::assign;
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
-use futures_util::{future::join_all, StreamExt};
+use futures_util::{future::join_all, FutureExt, StreamExt};
 use matrix_sdk::{
     config::SyncSettings,
     ruma::{
@@ -31,12 +32,12 @@ use matrix_sdk::{
 };
 use matrix_sdk_ui::timeline::{EventTimelineItem, RoomExt, TimelineItem};
 
-use crate::helpers::get_client_for_user;
+use crate::helpers::TestClientBuilder;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_toggling_reaction() -> Result<()> {
     // Set up
-    let alice = get_client_for_user("alice".to_owned(), true).await?;
+    let alice = TestClientBuilder::new("alice".to_owned()).use_sqlite().build().await?;
     let user_id = alice.user_id().unwrap();
     let room = alice
         .create_room(assign!(CreateRoomRequest::new(), {
@@ -49,42 +50,20 @@ async fn test_toggling_reaction() -> Result<()> {
     let (_items, mut stream) = timeline.subscribe().await;
 
     // Send message
-    timeline.send(RoomMessageEventContent::text_plain("hi!").into(), None).await;
-    {
-        let _day_divider = stream.next().await;
-        let event =
-            assert_matches!(stream.next().await, Some(VectorDiff::PushBack { value }) => value);
-        let event = event.as_event().unwrap();
-        assert_matches!(event.content().as_message(), Some(_));
-        assert!(event.is_local_echo());
-        assert!(event.reactions().is_empty());
-    }
+    timeline.send(RoomMessageEventContent::text_plain("hi!").into()).await;
 
-    // Receive updated local echo with event ID
-    let event_id = {
-        let event = assert_matches!(stream.next().await, Some(VectorDiff::Set { index: 1, value }) => value);
-        let event = event.as_event().unwrap();
-        event.event_id().unwrap().to_owned()
+    // Sync until the remote echo arrives
+    let event_id = loop {
+        sync_room(&alice, room_id).await?;
+        let items = timeline.items().await;
+        let last_item = items.last().unwrap().as_event().unwrap();
+        if !last_item.is_local_echo() {
+            break last_item.event_id().unwrap().to_owned();
+        }
     };
 
-    // Sync remaining remote events
-    sync_room(&alice, room_id).await?;
-    {
-        let _room_create = stream.next().await;
-        let _membership_change = stream.next().await;
-        let _power_levels = stream.next().await;
-        let _join_rules = stream.next().await;
-        let _history_visibility = stream.next().await;
-        let _guest_access = stream.next().await;
-    }
-
-    // Check we have the remote echo
-    {
-        let event = assert_matches!(stream.next().await, Some(VectorDiff::Set { index: 7, value }) => value);
-        let event = event.as_event().unwrap();
-        assert_eq!(event.event_id().unwrap(), &event_id);
-        assert!(!event.is_local_echo());
-    };
+    // Skip all stream updates that have happened so far
+    while stream.next().now_or_never().is_some() {}
 
     let message_position = timeline.items().await.len() - 1;
     let reaction = Annotation::new(event_id.clone(), reaction_key.into());
@@ -204,10 +183,7 @@ async fn assert_event_is_updated(
     event_id: &EventId,
     index: usize,
 ) -> EventTimelineItem {
-    let (i, event) = assert_matches!(
-        stream.next().await,
-        Some(VectorDiff::Set { index, value }) => (index, value)
-    );
+    assert_let!(Some(VectorDiff::Set { index: i, value: event }) = stream.next().await);
     assert_eq!(i, index);
     let event = event.as_event().unwrap();
     assert_eq!(event.event_id().unwrap(), event_id);

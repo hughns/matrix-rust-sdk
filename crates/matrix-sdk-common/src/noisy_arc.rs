@@ -17,6 +17,12 @@ pub struct NoisyArc<T: ?Sized> {
     id: u64,
 }
 
+impl<T> NoisyArc<T> {
+    pub fn as_ref(&self) -> &T {
+        self.ptr.inner.as_ref()
+    }
+}
+
 impl<T: ?Sized + Debug> Clone for NoisyArc<T> {
     fn clone(&self) -> Self {
         let res = Self { ptr: self.ptr.clone(), id: self.ptr.get_next_id() };

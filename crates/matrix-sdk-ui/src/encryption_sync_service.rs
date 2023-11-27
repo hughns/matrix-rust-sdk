@@ -31,8 +31,7 @@ use std::time::Duration;
 use async_stream::stream;
 use futures_core::stream::Stream;
 use futures_util::{pin_mut, StreamExt};
-use matrix_sdk::{Client, SlidingSync};
-use matrix_sdk_crypto::store::locks::CryptoStoreLock;
+use matrix_sdk::{Client, SlidingSync, LEASE_DURATION_MS};
 use ruma::{api::client::sync::sync_events::v4, assign};
 use tokio::sync::OwnedMutexGuard;
 use tracing::{debug, trace};
@@ -103,7 +102,7 @@ impl EncryptionSyncService {
         let mut builder = client
             .sliding_sync("encryption")
             .map_err(Error::SlidingSync)?
-            .share_pos()
+            //.share_pos() // TODO(bnjbvr) This is racy, needs cross-process lock :')
             .with_to_device_extension(
                 assign!(v4::ToDeviceConfig::default(), { enabled: Some(true)}),
             )
@@ -168,13 +167,10 @@ impl EncryptionSyncService {
                 // yet. In case it's the latter, wait a bit and retry.
                 tracing::debug!(
                     "Lock was already taken, and we're not the main loop; retrying in {}ms...",
-                    CryptoStoreLock::LEASE_DURATION_MS
+                    LEASE_DURATION_MS
                 );
 
-                tokio::time::sleep(Duration::from_millis(
-                    CryptoStoreLock::LEASE_DURATION_MS.into(),
-                ))
-                .await;
+                tokio::time::sleep(Duration::from_millis(LEASE_DURATION_MS.into())).await;
 
                 lock_guard = self
                     .client

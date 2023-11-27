@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use as_variant::as_variant;
 #[cfg(test)]
 use matrix_sdk_common::instant::Instant;
 use ruma::{
@@ -31,12 +32,13 @@ use super::{
 };
 use crate::{
     identities::{ReadOnlyDevice, ReadOnlyUserIdentities},
+    olm::StaticAccountData,
     verification::{
         cache::RequestInfo,
         event_enums::{AnyVerificationContent, OutgoingContent, OwnedAcceptContent, StartContent},
         Cancelled, Emoji,
     },
-    ReadOnlyAccount, ReadOnlyOwnUserIdentity,
+    ReadOnlyOwnUserIdentity,
 };
 
 #[derive(Clone, Debug)]
@@ -57,7 +59,7 @@ pub enum InnerSas {
 
 impl InnerSas {
     pub fn start(
-        account: ReadOnlyAccount,
+        account: StaticAccountData,
         other_device: ReadOnlyDevice,
         own_identity: Option<ReadOnlyOwnUserIdentity>,
         other_identity: Option<ReadOnlyUserIdentities>,
@@ -156,7 +158,7 @@ impl InnerSas {
     }
 
     pub fn from_start_event(
-        account: ReadOnlyAccount,
+        account: StaticAccountData,
         other_device: ReadOnlyDevice,
         flow_id: FlowId,
         content: &StartContent<'_>,
@@ -443,18 +445,10 @@ impl InnerSas {
     }
 
     pub fn verified_devices(&self) -> Option<Arc<[ReadOnlyDevice]>> {
-        if let InnerSas::Done(s) = self {
-            Some(s.verified_devices())
-        } else {
-            None
-        }
+        as_variant!(self, InnerSas::Done).map(|s| s.verified_devices())
     }
 
     pub fn verified_identities(&self) -> Option<Arc<[ReadOnlyUserIdentities]>> {
-        if let InnerSas::Done(s) = self {
-            Some(s.verified_identities())
-        } else {
-            None
-        }
+        as_variant!(self, InnerSas::Done).map(|s| s.verified_identities())
     }
 }

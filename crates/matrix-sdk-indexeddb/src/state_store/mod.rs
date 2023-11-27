@@ -163,9 +163,10 @@ where
     T: SafeEncode,
 {
     match store_cipher {
-        Some(cipher) => key.encode_secure(table_name, cipher),
-        None => key.encode(),
+        Some(cipher) => key.as_secure_string(table_name, cipher),
+        None => key.as_encoded_string(),
     }
+    .into()
 }
 
 fn encode_to_range<T>(
@@ -243,6 +244,7 @@ pub struct IndexeddbStateStore {
     pub(crate) store_cipher: Option<Arc<StoreCipher>>,
 }
 
+#[cfg(not(tarpaulin_include))]
 impl std::fmt::Debug for IndexeddbStateStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IndexeddbStateStore").field("name", &self.name).finish()

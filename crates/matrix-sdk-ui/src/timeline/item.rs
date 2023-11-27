@@ -14,6 +14,8 @@
 
 use std::{ops::Deref, sync::Arc};
 
+use as_variant::as_variant;
+
 use super::{EventTimelineItem, VirtualTimelineItem};
 
 #[derive(Clone, Debug)]
@@ -46,19 +48,13 @@ impl TimelineItem {
     /// Get the inner `EventTimelineItem`, if this is a
     /// [`TimelineItemKind::Event`].
     pub fn as_event(&self) -> Option<&EventTimelineItem> {
-        match &self.kind {
-            TimelineItemKind::Event(v) => Some(v),
-            _ => None,
-        }
+        as_variant!(&self.kind, TimelineItemKind::Event)
     }
 
     /// Get the inner `VirtualTimelineItem`, if this is a
     /// [`TimelineItemKind::Virtual`].
     pub fn as_virtual(&self) -> Option<&VirtualTimelineItem> {
-        match &self.kind {
-            TimelineItemKind::Virtual(v) => Some(v),
-            _ => None,
-        }
+        as_variant!(&self.kind, TimelineItemKind::Virtual)
     }
 
     /// Get a unique ID for this timeline item.
@@ -92,7 +88,9 @@ impl TimelineItem {
         matches!(self.kind, TimelineItemKind::Virtual(_))
     }
 
-    pub(crate) fn is_day_divider(&self) -> bool {
+    /// Check whether this item is a day divider.
+    #[must_use]
+    pub fn is_day_divider(&self) -> bool {
         matches!(self.kind, TimelineItemKind::Virtual(VirtualTimelineItem::DayDivider(_)))
     }
 

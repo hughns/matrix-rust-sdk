@@ -58,6 +58,7 @@ use super::{
 };
 use crate::{
     identities::{ReadOnlyDevice, ReadOnlyUserIdentities},
+    olm::StaticAccountData,
     verification::{
         cache::RequestInfo,
         event_enums::{
@@ -66,7 +67,7 @@ use crate::{
         },
         Cancelled, Emoji, FlowId,
     },
-    ReadOnlyAccount, ReadOnlyOwnUserIdentity,
+    ReadOnlyOwnUserIdentity,
 };
 
 const KEY_AGREEMENT_PROTOCOLS: &[KeyAgreementProtocol] =
@@ -90,8 +91,7 @@ fn the_protocol_definitions(
         ],
         hashes: HASHES.to_vec(),
     }
-    .try_into()
-    .expect("Invalid protocol definition.")
+    .into()
 }
 
 // The max time a SAS flow can take from start to done.
@@ -484,12 +484,12 @@ impl<S: Clone> SasState<S> {
     /// Get our own user id.
     #[cfg(test)]
     pub fn user_id(&self) -> &UserId {
-        self.ids.account.user_id()
+        &self.ids.account.user_id
     }
 
     /// Get our own device ID.
     pub fn device_id(&self) -> &DeviceId {
-        self.ids.account.device_id()
+        &self.ids.account.device_id
     }
 
     #[cfg(test)]
@@ -551,7 +551,7 @@ impl SasState<Created> {
     ///
     /// * `other_identity` - The identity of the other user if one exists.
     pub fn new(
-        account: ReadOnlyAccount,
+        account: StaticAccountData,
         other_device: ReadOnlyDevice,
         own_identity: Option<ReadOnlyOwnUserIdentity>,
         other_identity: Option<ReadOnlyUserIdentities>,
@@ -572,7 +572,7 @@ impl SasState<Created> {
 
     fn new_helper(
         flow_id: FlowId,
-        account: ReadOnlyAccount,
+        account: StaticAccountData,
         other_device: ReadOnlyDevice,
         own_identity: Option<ReadOnlyOwnUserIdentity>,
         other_identity: Option<ReadOnlyUserIdentities>,
@@ -674,7 +674,7 @@ impl SasState<Started> {
     /// * `event` - The m.key.verification.start event that was sent to us by
     /// the other side.
     pub fn from_start_event(
-        account: ReadOnlyAccount,
+        account: StaticAccountData,
         other_device: ReadOnlyDevice,
         own_identity: Option<ReadOnlyOwnUserIdentity>,
         other_identity: Option<ReadOnlyUserIdentities>,
@@ -978,25 +978,21 @@ impl SasState<Accepted> {
     }
 
     pub fn into_key_sent(self, request_id: &TransactionId) -> Option<SasState<KeySent>> {
-        if self.state.request_id == request_id {
-            Some(SasState {
-                inner: self.inner,
-                our_public_key: self.our_public_key,
-                ids: self.ids,
-                verification_flow_id: self.verification_flow_id,
-                creation_time: self.creation_time,
-                last_event_time: Instant::now().into(),
-                started_from_request: self.started_from_request,
-                state: Arc::new(KeySent {
-                    we_started: true,
-                    start_content: self.state.start_content.clone(),
-                    commitment: self.state.commitment.clone(),
-                    accepted_protocols: self.state.accepted_protocols.clone(),
-                }),
-            })
-        } else {
-            None
-        }
+        (self.state.request_id == request_id).then(|| SasState {
+            inner: self.inner,
+            our_public_key: self.our_public_key,
+            ids: self.ids,
+            verification_flow_id: self.verification_flow_id,
+            creation_time: self.creation_time,
+            last_event_time: Instant::now().into(),
+            started_from_request: self.started_from_request,
+            state: Arc::new(KeySent {
+                we_started: true,
+                start_content: self.state.start_content.clone(),
+                commitment: self.state.commitment.clone(),
+                accepted_protocols: self.state.accepted_protocols.clone(),
+            }),
+        })
     }
 
     /// Get the content for the key event.
@@ -1106,25 +1102,21 @@ impl SasState<KeyReceived> {
         self,
         request_id: &TransactionId,
     ) -> Option<SasState<KeysExchanged>> {
-        if self.state.request_id == request_id {
-            Some(SasState {
-                inner: self.inner,
-                our_public_key: self.our_public_key,
-                ids: self.ids,
-                verification_flow_id: self.verification_flow_id,
-                creation_time: self.creation_time,
-                last_event_time: Instant::now().into(),
-                started_from_request: self.started_from_request,
-                state: KeysExchanged {
-                    sas: self.state.sas.clone(),
-                    we_started: self.state.we_started,
-                    accepted_protocols: self.state.accepted_protocols.clone(),
-                }
-                .into(),
-            })
-        } else {
-            None
-        }
+        (self.state.request_id == request_id).then(|| SasState {
+            inner: self.inner,
+            our_public_key: self.our_public_key,
+            ids: self.ids,
+            verification_flow_id: self.verification_flow_id,
+            creation_time: self.creation_time,
+            last_event_time: Instant::now().into(),
+            started_from_request: self.started_from_request,
+            state: KeysExchanged {
+                sas: self.state.sas.clone(),
+                we_started: self.state.we_started,
+                accepted_protocols: self.state.accepted_protocols.clone(),
+            }
+            .into(),
+        })
     }
 }
 
@@ -1537,7 +1529,7 @@ mod tests {
             event_enums::{AcceptContent, KeyContent, MacContent, StartContent},
             FlowId,
         },
-        AcceptedProtocols, ReadOnlyAccount, ReadOnlyDevice,
+        AcceptedProtocols, Account, ReadOnlyDevice,
     };
 
     fn alice_id() -> &'static UserId {
@@ -1553,27 +1545,34 @@ mod tests {
     }
 
     fn bob_device_id() -> &'static DeviceId {
-        device_id!("BOBDEVCIE")
+        device_id!("BOBDEVICE")
     }
 
     async fn get_sas_pair(
         mac_method: Option<SupportedMacMethod>,
     ) -> (SasState<Created>, SasState<WeAccepted>) {
-        let alice = ReadOnlyAccount::with_device_id(alice_id(), alice_device_id());
-        let alice_device = ReadOnlyDevice::from_account(&alice).await;
+        let alice = Account::with_device_id(alice_id(), alice_device_id());
+        let alice_device = ReadOnlyDevice::from_account(&alice);
 
-        let bob = ReadOnlyAccount::with_device_id(bob_id(), bob_device_id());
-        let bob_device = ReadOnlyDevice::from_account(&bob).await;
+        let bob = Account::with_device_id(bob_id(), bob_device_id());
+        let bob_device = ReadOnlyDevice::from_account(&bob);
 
         let flow_id = TransactionId::new().into();
-        let alice_sas =
-            SasState::<Created>::new(alice.clone(), bob_device, None, None, flow_id, false, None);
+        let alice_sas = SasState::<Created>::new(
+            alice.static_data().clone(),
+            bob_device,
+            None,
+            None,
+            flow_id,
+            false,
+            None,
+        );
 
         let start_content = alice_sas.as_content();
         let flow_id = start_content.flow_id();
 
         let bob_sas = SasState::<Started>::from_start_event(
-            bob.clone(),
+            bob.static_data().clone(),
             alice_device,
             None,
             None,
@@ -1805,7 +1804,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn sas_unknown_method() {
+    async fn test_sas_unknown_method() {
         let (alice, bob) = get_sas_pair(None).await;
 
         let content = json!({
@@ -1824,16 +1823,23 @@ mod tests {
     }
 
     #[async_test]
-    async fn sas_from_start_unknown_method() {
-        let alice = ReadOnlyAccount::with_device_id(alice_id(), alice_device_id());
-        let alice_device = ReadOnlyDevice::from_account(&alice).await;
+    async fn test_sas_from_start_unknown_method() {
+        let alice = Account::with_device_id(alice_id(), alice_device_id());
+        let alice_device = ReadOnlyDevice::from_account(&alice);
 
-        let bob = ReadOnlyAccount::with_device_id(bob_id(), bob_device_id());
-        let bob_device = ReadOnlyDevice::from_account(&bob).await;
+        let bob = Account::with_device_id(bob_id(), bob_device_id());
+        let bob_device = ReadOnlyDevice::from_account(&bob);
 
         let flow_id = TransactionId::new().into();
-        let alice_sas =
-            SasState::<Created>::new(alice.clone(), bob_device, None, None, flow_id, false, None);
+        let alice_sas = SasState::<Created>::new(
+            alice.static_data().clone(),
+            bob_device,
+            None,
+            None,
+            flow_id,
+            false,
+            None,
+        );
 
         let mut start_content = alice_sas.as_content();
         let method = start_content.method_mut();
@@ -1849,7 +1855,7 @@ mod tests {
         let content = StartContent::from(&start_content);
 
         SasState::<Started>::from_start_event(
-            bob.clone(),
+            bob.static_data().clone(),
             alice_device.clone(),
             None,
             None,
@@ -1872,7 +1878,7 @@ mod tests {
         let flow_id = content.flow_id().to_owned();
 
         SasState::<Started>::from_start_event(
-            bob.clone(),
+            bob.static_data().clone(),
             alice_device,
             None,
             None,

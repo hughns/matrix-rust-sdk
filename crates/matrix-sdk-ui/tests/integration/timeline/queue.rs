@@ -15,10 +15,11 @@
 use std::{sync::Arc, time::Duration};
 
 use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::config::SyncSettings;
-use matrix_sdk_test::{async_test, JoinedRoomBuilder, SyncResponseBuilder, TimelineTestEvent};
+use matrix_sdk_test::{async_test, EventBuilder, JoinedRoomBuilder, SyncResponseBuilder, ALICE};
 use matrix_sdk_ui::timeline::{EventItemOrigin, EventSendState, RoomExt};
 use ruma::{events::room::message::RoomMessageEventContent, room_id};
 use serde_json::json;
@@ -76,8 +77,8 @@ async fn message_order() {
         .mount(&server)
         .await;
 
-    timeline.send(RoomMessageEventContent::text_plain("First!").into(), None).await;
-    timeline.send(RoomMessageEventContent::text_plain("Second.").into(), None).await;
+    timeline.send(RoomMessageEventContent::text_plain("First!").into()).await;
+    timeline.send(RoomMessageEventContent::text_plain("Second.").into()).await;
 
     // Local echoes are available as soon as `timeline.send` returns
     assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
@@ -125,8 +126,8 @@ async fn retry_order() {
 
     // Send two messages without mocking the server response.
     // It will respond with a 404, resulting in a failed-to-send state.
-    timeline.send(RoomMessageEventContent::text_plain("First!").into(), Some("1".into())).await;
-    timeline.send(RoomMessageEventContent::text_plain("Second.").into(), Some("2".into())).await;
+    timeline.send(RoomMessageEventContent::text_plain("First!").into()).await;
+    timeline.send(RoomMessageEventContent::text_plain("Second.").into()).await;
 
     // Local echoes are available as soon as `timeline.send` returns
     assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
@@ -138,13 +139,15 @@ async fn retry_order() {
 
     // Local echoes are updated with the failed send state as soon as
     // the 404 response is received
-    assert_matches!(timeline_stream.next().await, Some(VectorDiff::Set { index: 0, value }) => {
-        assert_matches!(value.send_state().unwrap(), EventSendState::SendingFailed { .. });
-    });
+    assert_let!(Some(VectorDiff::Set { index: 0, value: first }) = timeline_stream.next().await);
+    assert_matches!(first.send_state().unwrap(), EventSendState::SendingFailed { .. });
+    let txn_id_1 = first.transaction_id().unwrap().to_owned();
+
     // The second one is cancelled without an extra delay
-    assert_next_matches!(timeline_stream, VectorDiff::Set { index: 1, value } => {
-        assert_matches!(value.send_state().unwrap(), EventSendState::Cancelled);
-    });
+    let second =
+        assert_next_matches!(timeline_stream, VectorDiff::Set { index: 1, value } => value);
+    assert_matches!(second.send_state().unwrap(), EventSendState::Cancelled);
+    let txn_id_2 = second.transaction_id().unwrap().to_owned();
 
     // Response for first message takes 100ms to respond
     Mock::given(method("PUT"))
@@ -172,8 +175,8 @@ async fn retry_order() {
         .await;
 
     // Retry the second message first
-    timeline.retry_send("2".into()).await.unwrap();
-    timeline.retry_send("1".into()).await.unwrap();
+    timeline.retry_send(&txn_id_2).await.unwrap();
+    timeline.retry_send(&txn_id_1).await.unwrap();
 
     // Both items are immediately updated and moved to the bottom in the order
     // of the function calls to indicate they are being sent
@@ -213,6 +216,7 @@ async fn clear_with_echoes() {
     let (client, server) = logged_in_client().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
+    let event_builder = EventBuilder::new();
     let mut sync_builder = SyncResponseBuilder::new();
     sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
 
@@ -229,7 +233,7 @@ async fn clear_with_echoes() {
     {
         let (_, mut timeline_stream) = timeline.subscribe().await;
 
-        timeline.send(RoomMessageEventContent::text_plain("Send failure").into(), None).await;
+        timeline.send(RoomMessageEventContent::text_plain("Send failure").into()).await;
 
         // Wait for the first message to fail. Don't use time, but listen for the first
         // timeline item diff to get back signalling the error.
@@ -250,12 +254,15 @@ async fn clear_with_echoes() {
         .await;
 
     // (this one)
-    timeline.send(RoomMessageEventContent::text_plain("Pending").into(), None).await;
+    timeline.send(RoomMessageEventContent::text_plain("Pending").into()).await;
 
     // Another message comes in.
-    sync_builder.add_joined_room(
-        JoinedRoomBuilder::new(room_id).add_timeline_event(TimelineTestEvent::MessageText),
-    );
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
+        event_builder.make_sync_message_event(
+            &ALICE,
+            RoomMessageEventContent::text_plain("another message"),
+        ),
+    ));
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     client.sync_once(sync_settings.clone()).await.unwrap();
 

@@ -14,37 +14,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "experimental-sliding-sync")]
-use std::sync::RwLock as StdRwLock;
 use std::{
-    collections::{btree_map, hash_map::DefaultHasher, BTreeMap},
+    collections::{btree_map, BTreeMap},
     fmt::{self, Debug},
     future::Future,
-    hash::{Hash, Hasher},
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock},
 };
 
-use dashmap::DashMap;
-use eyeball::{Observable, SharedObservable, Subscriber};
+use eyeball::{SharedObservable, Subscriber};
 use futures_core::Stream;
-#[cfg(feature = "experimental-oidc")]
-use mas_oidc_client::{
-    error::{
-        Error as OidcClientError, ErrorBody as OidcErrorBody, HttpError as OidcHttpError,
-        TokenRefreshError, TokenRequestError,
-    },
-    types::errors::ClientErrorCode,
-};
 #[cfg(feature = "e2e-encryption")]
-use matrix_sdk_base::crypto::store::locks::CryptoStoreLock;
+use matrix_sdk_base::crypto::store::LockableCryptoStore;
 use matrix_sdk_base::{
     store::DynStateStore, BaseClient, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
     SyncOutsideWasm,
 };
 use matrix_sdk_common::instant::Instant;
-#[cfg(feature = "experimental-sliding-sync")]
-use ruma::api::client::error::ErrorKind;
 use ruma::{
     api::{
         client::{
@@ -53,7 +39,6 @@ use ruma::{
             device::{delete_devices, get_devices, update_device},
             directory::{get_public_rooms, get_public_rooms_filtered},
             discovery::{
-                discover_homeserver::AuthenticationServerInfo,
                 get_capabilities::{self, Capabilities},
                 get_supported_versions,
             },
@@ -77,16 +62,16 @@ use ruma::{
 };
 use serde::de::DeserializeOwned;
 use tokio::sync::{broadcast, Mutex, OnceCell, RwLock, RwLockReadGuard};
-use tracing::{debug, error, info, instrument, trace, Instrument, Span};
+use tracing::{debug, error, instrument, trace, Instrument, Span};
 use url::Url;
 
-#[cfg(feature = "e2e-encryption")]
-use crate::encryption::Encryption;
+use self::futures::SendRequest;
 #[cfg(feature = "experimental-oidc")]
-use crate::oidc::{Oidc, OidcError};
+use crate::oidc::Oidc;
 use crate::{
-    authentication::AuthData,
+    authentication::{AuthCtx, AuthData, ReloadSessionCallback, SaveSessionCallback},
     config::RequestConfig,
+    deduplicating_handler::DeduplicatingHandler,
     error::{HttpError, HttpResult},
     event_handler::{
         EventHandler, EventHandlerDropGuard, EventHandlerHandle, EventHandlerStore, SyncEvent,
@@ -98,14 +83,21 @@ use crate::{
     Account, AuthApi, AuthSession, Error, Media, RefreshTokenError, Result, Room,
     TransmissionProgress,
 };
+#[cfg(feature = "e2e-encryption")]
+use crate::{
+    encryption::backups::types::BackupClientState,
+    encryption::{Encryption, EncryptionSettings},
+    store_locks::CrossProcessStoreLock,
+};
 
 mod builder;
-mod futures;
+pub(crate) mod futures;
+#[cfg(feature = "e2e-encryption")]
+mod tasks;
 
-pub use self::{
-    builder::{ClientBuildError, ClientBuilder},
-    futures::SendRequest,
-};
+pub use self::builder::{ClientBuildError, ClientBuilder};
+#[cfg(feature = "e2e-encryption")]
+use self::tasks::{BackupUploadingTask, ClientTasks};
 
 #[cfg(not(target_arch = "wasm32"))]
 type NotificationHandlerFut = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -133,7 +125,7 @@ pub enum LoopCtrl {
 }
 
 /// Represents changes that can occur to a `Client`s `Session`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SessionChange {
     /// The session's token is no longer valid.
     UnknownToken {
@@ -152,60 +144,50 @@ pub struct Client {
     pub(crate) inner: Arc<ClientInner>,
 }
 
-pub(crate) struct ClientInner {
-    /// The URL of the homeserver to connect to.
-    homeserver: RwLock<Url>,
-    /// The authentication server info discovered from the homeserver.
-    pub(crate) authentication_server_info: Option<AuthenticationServerInfo>,
-    /// The sliding sync proxy that is trusted by the homeserver.
-    #[cfg(feature = "experimental-sliding-sync")]
-    sliding_sync_proxy: StdRwLock<Option<Url>>,
-    /// The underlying HTTP client.
-    pub(crate) http_client: HttpClient,
-    /// User session data.
-    base_client: BaseClient,
-    /// The Matrix versions the server supports (well-known ones only)
-    server_versions: OnceCell<Box<[MatrixVersion]>>,
-    /// Locks making sure we only have one group session sharing request in
+#[derive(Default)]
+pub(crate) struct ClientLocks {
+    /// Lock ensuring that only a single room may be marked as a DM at once.
+    /// Look at the [`Account::mark_as_dm()`] method for a more detailed
+    /// explanation.
+    pub(crate) mark_as_dm_lock: Mutex<()>,
+    /// Lock ensuring that only a single secret store is getting opened at the
+    /// same time.
+    ///
+    /// This is important so we don't accidentally create multiple different new
+    /// default secret storage keys.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) open_secret_store_lock: Mutex<()>,
+    /// Lock ensuring that we're only storing a single secret at a time.
+    ///
+    /// Take a look at the [`SecretStore::put_secret`] method for a more
+    /// detailed explanation.
+    ///
+    /// [`SecretStore::put_secret`]: crate::encryption::secret_storage::SecretStore::put_secret
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) store_secret_lock: Mutex<()>,
+    /// Lock ensuring that only one method at a time might modify our backup.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) backup_modify_lock: Mutex<()>,
+    /// Lock ensuring that we're going to attempt to upload backups for a single
+    /// requester.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) backup_upload_lock: Mutex<()>,
+    /// Handler making sure we only have one group session sharing request in
     /// flight per room.
     #[cfg(feature = "e2e-encryption")]
-    pub(crate) group_session_locks: Mutex<BTreeMap<OwnedRoomId, Arc<Mutex<()>>>>,
+    pub(crate) group_session_deduplicated_handler: DeduplicatingHandler<OwnedRoomId>,
     /// Lock making sure we're only doing one key claim request at a time.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) key_claim_lock: Mutex<()>,
-    pub(crate) members_request_locks: Mutex<BTreeMap<OwnedRoomId, Arc<Mutex<()>>>>,
-    /// Locks for requests on the encryption state of rooms.
-    pub(crate) encryption_state_request_locks: Mutex<BTreeMap<OwnedRoomId, Arc<Mutex<()>>>>,
-    pub(crate) typing_notice_times: DashMap<OwnedRoomId, Instant>,
-    /// Event handlers. See `add_event_handler`.
-    pub(crate) event_handlers: EventHandlerStore,
-    /// Notification handlers. See `register_notification_handler`.
-    notification_handlers: RwLock<Vec<NotificationHandlerFn>>,
-    pub(crate) room_update_channels: StdMutex<BTreeMap<OwnedRoomId, broadcast::Sender<RoomUpdate>>>,
-    pub(crate) sync_gap_broadcast_txs: StdMutex<BTreeMap<OwnedRoomId, Observable<()>>>,
-    /// Whether the client should update its homeserver URL with the discovery
-    /// information present in the login response.
-    respect_login_well_known: bool,
-    /// Whether to try to refresh the access token automatically when an
-    /// `M_UNKNOWN_TOKEN` error is encountered.
-    handle_refresh_tokens: bool,
-    /// Lock making sure we're only doing one token refresh at a time.
-    pub(crate) refresh_token_lock: Mutex<Result<(), RefreshTokenError>>,
-    /// An event that can be listened on to wait for a successful sync. The
-    /// event will only be fired if a sync loop is running. Can be used for
-    /// synchronization, e.g. if we send out a request to create a room, we can
-    /// wait for the sync to get the data to fetch a room object from the state
-    /// store.
-    pub(crate) sync_beat: event_listener::Event,
-    /// Session change publisher. Allows the subscriber to handle changes to the
-    /// session such as logging out when the access token is invalid or
-    /// persisting updates to the access/refresh tokens.
-    pub(crate) session_change_sender: broadcast::Sender<SessionChange>,
-    /// Authentication data to keep in memory.
-    pub(crate) auth_data: OnceCell<AuthData>,
-
+    /// Handler to ensure that only one members request is running at a time,
+    /// given a room.
+    pub(crate) members_request_deduplicated_handler: DeduplicatingHandler<OwnedRoomId>,
+    /// Handler to ensure that only one encryption state request is running at a
+    /// time, given a room.
+    pub(crate) encryption_state_deduplicated_handler: DeduplicatingHandler<OwnedRoomId>,
     #[cfg(feature = "e2e-encryption")]
-    pub(crate) cross_process_crypto_store_lock: OnceCell<CryptoStoreLock>,
+    pub(crate) cross_process_crypto_store_lock:
+        OnceCell<CrossProcessStoreLock<LockableCryptoStore>>,
     /// Latest "generation" of data known by the crypto store.
     ///
     /// This is a counter that only increments, set in the database (and can
@@ -228,50 +210,101 @@ pub(crate) struct ClientInner {
     pub(crate) crypto_store_generation: Arc<Mutex<Option<u64>>>,
 }
 
+pub(crate) struct ClientInner {
+    /// All the data related to authentication and authorization.
+    pub(crate) auth_ctx: Arc<AuthCtx>,
+
+    /// The URL of the homeserver to connect to.
+    homeserver: StdRwLock<Url>,
+    /// The sliding sync proxy that is trusted by the homeserver.
+    #[cfg(feature = "experimental-sliding-sync")]
+    sliding_sync_proxy: StdRwLock<Option<Url>>,
+    /// The underlying HTTP client.
+    pub(crate) http_client: HttpClient,
+    /// User session data.
+    base_client: BaseClient,
+    /// The Matrix versions the server supports (well-known ones only)
+    server_versions: OnceCell<Box<[MatrixVersion]>>,
+    /// Collection of locks individual client methods might want to use, either
+    /// to ensure that only a single call to a method happens at once or to
+    /// deduplicate multiple calls to a method.
+    locks: ClientLocks,
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) tasks: StdMutex<ClientTasks>,
+    pub(crate) typing_notice_times: StdRwLock<BTreeMap<OwnedRoomId, Instant>>,
+    /// Event handlers. See `add_event_handler`.
+    pub(crate) event_handlers: EventHandlerStore,
+    /// Notification handlers. See `register_notification_handler`.
+    notification_handlers: RwLock<Vec<NotificationHandlerFn>>,
+    pub(crate) room_update_channels: StdMutex<BTreeMap<OwnedRoomId, broadcast::Sender<RoomUpdate>>>,
+    /// Whether the client should update its homeserver URL with the discovery
+    /// information present in the login response.
+    respect_login_well_known: bool,
+    /// An event that can be listened on to wait for a successful sync. The
+    /// event will only be fired if a sync loop is running. Can be used for
+    /// synchronization, e.g. if we send out a request to create a room, we can
+    /// wait for the sync to get the data to fetch a room object from the state
+    /// store.
+    pub(crate) sync_beat: event_listener::Event,
+    /// End-to-end encryption settings.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) encryption_settings: EncryptionSettings,
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) backup_state: BackupClientState,
+}
+
 impl ClientInner {
+    /// Create a new `ClientInner`.
+    ///
+    /// All the fields passed as parameters here are those that must be cloned
+    /// upon instantiation of a sub-client, e.g. a client specialized for
+    /// notifications.
     #[allow(clippy::too_many_arguments)]
     fn new(
+        auth_ctx: Arc<AuthCtx>,
         homeserver: Url,
-        authentication_server_info: Option<AuthenticationServerInfo>,
         #[cfg(feature = "experimental-sliding-sync")] sliding_sync_proxy: Option<Url>,
         http_client: HttpClient,
         base_client: BaseClient,
         server_versions: Option<Box<[MatrixVersion]>>,
         respect_login_well_known: bool,
-        handle_refresh_tokens: bool,
-    ) -> Self {
-        let session_change_sender = broadcast::Sender::new(1);
-
-        Self {
-            homeserver: RwLock::new(homeserver),
-            authentication_server_info,
+        #[cfg(feature = "e2e-encryption")] encryption_settings: EncryptionSettings,
+    ) -> Arc<Self> {
+        let client = Self {
+            homeserver: StdRwLock::new(homeserver),
+            auth_ctx,
             #[cfg(feature = "experimental-sliding-sync")]
             sliding_sync_proxy: StdRwLock::new(sliding_sync_proxy),
             http_client,
             base_client,
+            #[cfg(feature = "e2e-encryption")]
+            tasks: StdMutex::new(Default::default()),
+            locks: Default::default(),
             server_versions: OnceCell::new_with(server_versions),
-            #[cfg(feature = "e2e-encryption")]
-            group_session_locks: Default::default(),
-            #[cfg(feature = "e2e-encryption")]
-            key_claim_lock: Default::default(),
-            members_request_locks: Default::default(),
-            encryption_state_request_locks: Default::default(),
             typing_notice_times: Default::default(),
             event_handlers: Default::default(),
             notification_handlers: Default::default(),
             room_update_channels: Default::default(),
-            sync_gap_broadcast_txs: Default::default(),
             respect_login_well_known,
             sync_beat: event_listener::Event::new(),
-            handle_refresh_tokens,
-            refresh_token_lock: Mutex::new(Ok(())),
-            session_change_sender,
-            auth_data: Default::default(),
             #[cfg(feature = "e2e-encryption")]
-            cross_process_crypto_store_lock: OnceCell::new(),
+            encryption_settings,
             #[cfg(feature = "e2e-encryption")]
-            crypto_store_generation: Arc::new(Mutex::new(None)),
+            backup_state: Default::default(),
+        };
+
+        #[allow(clippy::let_and_return)]
+        let client = Arc::new(client);
+
+        #[cfg(feature = "e2e-encryption")]
+        {
+            let weak_client = Arc::downgrade(&client);
+
+            client.tasks.lock().unwrap().upload_room_keys =
+                Some(BackupUploadingTask::new(weak_client));
         }
+
+        client
     }
 }
 
@@ -311,14 +344,17 @@ impl Client {
         &self.inner.base_client
     }
 
+    pub(crate) fn locks(&self) -> &ClientLocks {
+        &self.inner.locks
+    }
+
     /// Change the homeserver URL used by this client.
     ///
     /// # Arguments
     ///
     /// * `homeserver_url` - The new URL to use.
-    async fn set_homeserver(&self, homeserver_url: Url) {
-        let mut homeserver = self.inner.homeserver.write().await;
-        *homeserver = homeserver_url;
+    fn set_homeserver(&self, homeserver_url: Url) {
+        *self.inner.homeserver.write().unwrap() = homeserver_url;
     }
 
     /// Get the capabilities of the homeserver.
@@ -366,20 +402,8 @@ impl Client {
     }
 
     /// The Homeserver of the client.
-    pub async fn homeserver(&self) -> Url {
-        self.inner.homeserver.read().await.clone()
-    }
-
-    /// The authentication server info discovered from the homeserver.
-    ///
-    /// This will only be set if the homeserver supports authenticating via
-    /// OpenID Connect ([MSC3861]) and this `Client` was constructed using
-    /// auto-discovery by setting the homeserver with
-    /// [`ClientBuilder::server_name()`].
-    ///
-    /// [MSC3861]: https://github.com/matrix-org/matrix-spec-proposals/pull/3861
-    pub fn authentication_server_info(&self) -> Option<&AuthenticationServerInfo> {
-        self.inner.authentication_server_info.as_ref()
+    pub fn homeserver(&self) -> Url {
+        self.inner.homeserver.read().unwrap().clone()
     }
 
     /// The sliding sync proxy that is trusted by the homeserver.
@@ -443,14 +467,14 @@ impl Client {
     ///
     /// Will be `None` if the client has not been logged in.
     pub fn access_token(&self) -> Option<String> {
-        self.inner.auth_data.get()?.access_token()
+        self.inner.auth_ctx.auth_data.get()?.access_token()
     }
 
     /// Access the authentication API used to log in this client.
     ///
     /// Will be `None` if the client has not been logged in.
     pub fn auth_api(&self) -> Option<AuthApi> {
-        match self.inner.auth_data.get()? {
+        match self.inner.auth_ctx.auth_data.get()? {
             AuthData::Matrix(_) => Some(AuthApi::Matrix(self.matrix_auth())),
             #[cfg(feature = "experimental-oidc")]
             AuthData::Oidc(_) => Some(AuthApi::Oidc(self.oidc())),
@@ -533,7 +557,7 @@ impl Client {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// # use url::Url;
     /// # let homeserver = Url::parse("http://localhost:8080").unwrap();
     /// use matrix_sdk::{
@@ -684,7 +708,7 @@ impl Client {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// # use url::Url;
     /// # use tokio::sync::mpsc;
     /// #
@@ -736,7 +760,7 @@ impl Client {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// use matrix_sdk::{
     ///     event_handler::Ctx, ruma::events::room::message::SyncRoomMessageEvent,
     ///     Room,
@@ -887,14 +911,11 @@ impl Client {
     ///
     /// * `login_well_known` - The `well_known` field from a successful login
     ///   response.
-    pub(crate) async fn maybe_update_login_well_known(
-        &self,
-        login_well_known: Option<&DiscoveryInfo>,
-    ) {
+    pub(crate) fn maybe_update_login_well_known(&self, login_well_known: Option<&DiscoveryInfo>) {
         if self.inner.respect_login_well_known {
             if let Some(well_known) = login_well_known {
                 if let Ok(homeserver) = Url::parse(&well_known.homeserver.base_url) {
-                    self.set_homeserver(homeserver).await;
+                    self.set_homeserver(homeserver);
                 }
             }
         }
@@ -913,10 +934,15 @@ impl Client {
     pub async fn restore_session(&self, session: impl Into<AuthSession>) -> Result<()> {
         let session = session.into();
         match session {
-            AuthSession::Matrix(s) => self.matrix_auth().restore_session(s).await,
+            AuthSession::Matrix(s) => Box::pin(self.matrix_auth().restore_session(s)).await,
             #[cfg(feature = "experimental-oidc")]
-            AuthSession::Oidc(s) => self.oidc().restore_session(s).await,
+            AuthSession::Oidc(s) => Box::pin(self.oidc().restore_session(s)).await,
         }
+    }
+
+    pub(crate) async fn set_session_meta(&self, session_meta: SessionMeta) -> Result<()> {
+        self.base_client().set_session_meta(session_meta).await?;
+        Ok(())
     }
 
     /// Refresh the access token using the authentication API used to log into
@@ -930,14 +956,14 @@ impl Client {
         };
 
         match auth_api {
-            AuthApi::Matrix(a) => {
+            AuthApi::Matrix(api) => {
                 trace!("Token refresh: Using the homeserver.");
-                a.refresh_access_token().await?;
+                Box::pin(api.refresh_access_token()).await?;
             }
             #[cfg(feature = "experimental-oidc")]
             AuthApi::Oidc(api) => {
                 trace!("Token refresh: Using OIDC.");
-                api.refresh_access_token().await?;
+                Box::pin(api.refresh_access_token()).await?;
             }
         }
 
@@ -1243,97 +1269,35 @@ impl Client {
         Request: OutgoingRequest + Clone + Debug,
         HttpError: From<FromHttpResponseError<Request::EndpointError>>,
     {
-        SendRequest { client: self.clone(), request, config, send_progress: Default::default() }
+        SendRequest {
+            client: self.clone(),
+            request,
+            config,
+            send_progress: Default::default(),
+            sliding_sync_proxy_url: None,
+        }
     }
 
     #[cfg(feature = "experimental-sliding-sync")]
     // FIXME: remove this as soon as Sliding-Sync isn't needing an external server
     // anymore
-    pub(crate) async fn send_with_homeserver<Request>(
+    pub(crate) fn send_with_homeserver<Request>(
         &self,
         request: Request,
         config: Option<RequestConfig>,
         sliding_sync_proxy: Option<String>,
-    ) -> HttpResult<Request::IncomingResponse>
+    ) -> SendRequest<Request>
     where
         Request: OutgoingRequest + Clone + Debug,
         HttpError: From<FromHttpResponseError<Request::EndpointError>>,
     {
-        let res = Box::pin(self.send_inner(
-            request.clone(),
+        SendRequest {
+            client: self.clone(),
+            request,
             config,
-            sliding_sync_proxy.clone(),
-            Default::default(),
-        ))
-        .await;
-
-        // An `M_UNKNOWN_TOKEN` error can potentially be fixed with a token refresh.
-        if let Err(Some(ErrorKind::UnknownToken { soft_logout })) =
-            res.as_ref().map_err(HttpError::client_api_error_kind)
-        {
-            trace!("Token refresh: Unknown token error received.");
-            // If automatic token refresh isn't supported, there is nothing more to do.
-            if !self.inner.handle_refresh_tokens {
-                trace!("Token refresh: Automatic refresh disabled.");
-                self.broadcast_unknown_token(soft_logout);
-                return res;
-            }
-
-            // Try to refresh the token and retry the request.
-            if let Err(refresh_error) = self.refresh_access_token().await {
-                match &refresh_error {
-                    RefreshTokenError::RefreshTokenRequired => {
-                        trace!("Token refresh: The session doesn't have a refresh token.");
-                        // Refreshing access tokens is not supported by this `Session`, ignore.
-                        self.broadcast_unknown_token(soft_logout);
-                    }
-                    #[cfg(feature = "experimental-oidc")]
-                    RefreshTokenError::Oidc(oidc_error) => {
-                        match **oidc_error {
-                            OidcError::Oidc(OidcClientError::TokenRefresh(
-                                TokenRefreshError::Token(TokenRequestError::Http(OidcHttpError {
-                                    body:
-                                        Some(OidcErrorBody {
-                                            error: ClientErrorCode::InvalidGrant, ..
-                                        }),
-                                    ..
-                                })),
-                            )) => {
-                                error!(
-                                    "Token refresh: OIDC refresh_token rejected with invalid grant"
-                                );
-                                // The refresh was denied, signal to sign out the user.
-                                self.broadcast_unknown_token(soft_logout);
-                            }
-                            _ => {
-                                trace!("Token refresh: OIDC refresh encountered a problem.");
-                                // The refresh failed for other reasons, no need
-                                // to sign out.
-                            }
-                        };
-                        return Err(refresh_error.into());
-                    }
-                    _ => {
-                        trace!("Token refresh: Token refresh failed.");
-                        // This isn't necessarily correct, but matches the behaviour when
-                        // implementing OIDC.
-                        self.broadcast_unknown_token(soft_logout);
-                        return Err(refresh_error.into());
-                    }
-                }
-            } else {
-                trace!("Token refresh: Refresh succeeded, retrying request.");
-                return Box::pin(self.send_inner(
-                    request,
-                    config,
-                    sliding_sync_proxy,
-                    Default::default(),
-                ))
-                .await;
-            }
+            send_progress: Default::default(),
+            sliding_sync_proxy_url: sliding_sync_proxy,
         }
-
-        res
     }
 
     pub(crate) async fn send_inner<Request>(
@@ -1349,19 +1313,10 @@ impl Client {
     {
         let homeserver = match homeserver {
             Some(hs) => hs,
-            None => self.homeserver().await.to_string(),
+            None => self.homeserver().to_string(),
         };
 
         let access_token = self.access_token();
-        let access_token = access_token.as_deref();
-        {
-            let hash = access_token.as_ref().map(|t| {
-                let mut hasher = DefaultHasher::new();
-                t.hash(&mut hasher);
-                hasher.finish()
-            });
-            tracing::trace!("Attempting request with access_token {hash:?}");
-        }
 
         self.inner
             .http_client
@@ -1369,7 +1324,7 @@ impl Client {
                 request,
                 config,
                 homeserver,
-                access_token,
+                access_token.as_deref(),
                 self.server_versions().await?,
                 send_progress,
             )
@@ -1377,9 +1332,9 @@ impl Client {
     }
 
     fn broadcast_unknown_token(&self, soft_logout: &bool) {
-        info!("An unknown token error has been encountered.");
         _ = self
             .inner
+            .auth_ctx
             .session_change_sender
             .send(SessionChange::UnknownToken { soft_logout: *soft_logout });
     }
@@ -1391,7 +1346,7 @@ impl Client {
             .send(
                 get_supported_versions::Request::new(),
                 None,
-                self.homeserver().await.to_string(),
+                self.homeserver().to_string(),
                 None,
                 &[MatrixVersion::V1_0],
                 Default::default(),
@@ -1408,8 +1363,11 @@ impl Client {
     }
 
     pub(crate) async fn server_versions(&self) -> HttpResult<&[MatrixVersion]> {
-        let server_versions =
-            self.inner.server_versions.get_or_try_init(|| self.request_server_versions()).await?;
+        let server_versions = self
+            .inner
+            .server_versions
+            .get_or_try_init(|| Box::pin(self.request_server_versions()))
+            .await?;
 
         Ok(server_versions)
     }
@@ -1955,24 +1913,38 @@ impl Client {
 
     /// Subscribes a new receiver to client SessionChange broadcasts.
     pub fn subscribe_to_session_changes(&self) -> broadcast::Receiver<SessionChange> {
-        let broadcast = &self.inner.session_change_sender;
+        let broadcast = &self.inner.auth_ctx.session_change_sender;
         broadcast.subscribe()
+    }
+
+    /// Sets the save/restore session callbacks.
+    ///
+    /// This is another mechanism to get synchronous updates to session tokens,
+    /// while [`Self::subscribe_to_session_changes`] provides an async update.
+    pub fn set_session_callbacks(
+        &self,
+        reload_session_callback: Box<ReloadSessionCallback>,
+        save_session_callback: Box<SaveSessionCallback>,
+    ) -> Result<()> {
+        self.inner
+            .auth_ctx
+            .reload_session_callback
+            .set(reload_session_callback)
+            .map_err(|_| Error::MultipleSessionCallbacks)?;
+
+        self.inner
+            .auth_ctx
+            .save_session_callback
+            .set(save_session_callback)
+            .map_err(|_| Error::MultipleSessionCallbacks)?;
+
+        Ok(())
     }
 
     /// Sets a given pusher
     pub async fn set_pusher(&self, pusher: Pusher) -> HttpResult<set_pusher::v3::Response> {
         let request = set_pusher::v3::Request::post(pusher);
         self.send(request, None).await
-    }
-
-    /// Subscribe to sync gaps for the given room.
-    ///
-    /// This method is meant to be removed in favor of making event handlers
-    /// more general in the future.
-    pub fn subscribe_sync_gap(&self, room_id: &RoomId) -> Subscriber<()> {
-        let mut lock = self.inner.sync_gap_broadcast_txs.lock().unwrap();
-        let observable = lock.entry(room_id.to_owned()).or_default();
-        Observable::subscribe(observable)
     }
 
     /// Get the profile for a given user id
@@ -1994,22 +1966,29 @@ impl Client {
     /// Create a new specialized `Client` that can process notifications.
     pub async fn notification_client(&self) -> Result<Client> {
         let client = Client {
-            inner: Arc::new(ClientInner::new(
-                self.inner.homeserver.read().await.clone(),
-                self.inner.authentication_server_info.clone(),
+            inner: ClientInner::new(
+                self.inner.auth_ctx.clone(),
+                self.homeserver(),
                 #[cfg(feature = "experimental-sliding-sync")]
                 self.inner.sliding_sync_proxy.read().unwrap().clone(),
                 self.inner.http_client.clone(),
                 self.inner.base_client.clone_with_in_memory_state_store(),
                 self.inner.server_versions.get().cloned(),
                 self.inner.respect_login_well_known,
-                self.inner.handle_refresh_tokens,
-            )),
+                #[cfg(feature = "e2e-encryption")]
+                self.inner.encryption_settings,
+            ),
         };
 
-        // Copy the parent's session into the child.
+        // Copy the parent's session meta into the child. This initializes the in-memory
+        // state store of the child client with `SessionMeta`, and regenerates
+        // the `OlmMachine` if needs be.
+        //
+        // Note: we don't need to do a full `restore_session`, because this would
+        // overwrite the session information shared with the parent too, and it
+        // must be initialized at most once.
         if let Some(session) = self.session() {
-            client.restore_session(session).await?;
+            client.set_session_meta(session.into_meta()).await?;
         }
 
         Ok(client)
@@ -2024,6 +2003,7 @@ pub(crate) mod tests {
     use matrix_sdk_base::RoomState;
     use matrix_sdk_test::{
         async_test, test_json, JoinedRoomBuilder, StateTestEvent, SyncResponseBuilder,
+        DEFAULT_TEST_ROOM_ID,
     };
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
@@ -2042,7 +2022,7 @@ pub(crate) mod tests {
     };
 
     #[async_test]
-    async fn account_data() {
+    async fn test_account_data() {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
@@ -2069,7 +2049,7 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn successful_discovery() {
+    async fn test_successful_discovery() {
         let server = MockServer::start().await;
         let server_url = server.uri();
         let domain = server_url.strip_prefix("http://").unwrap();
@@ -2095,11 +2075,11 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert_eq!(client.homeserver().await, Url::parse(server_url.as_ref()).unwrap());
+        assert_eq!(client.homeserver(), Url::parse(server_url.as_ref()).unwrap());
     }
 
     #[async_test]
-    async fn discovery_broken_server() {
+    async fn test_discovery_broken_server() {
         let server = MockServer::start().await;
         let server_url = server.uri();
         let domain = server_url.strip_prefix("http://").unwrap();
@@ -2122,7 +2102,7 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn room_creation() {
+    async fn test_room_creation() {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
@@ -2135,16 +2115,15 @@ pub(crate) mod tests {
             .build_sync_response();
 
         client.inner.base_client.receive_sync_response(response).await.unwrap();
-        let room_id = &test_json::DEFAULT_SYNC_ROOM_ID;
 
-        assert_eq!(client.homeserver().await, Url::parse(&server.uri()).unwrap());
+        assert_eq!(client.homeserver(), Url::parse(&server.uri()).unwrap());
 
-        let room = client.get_room(room_id).unwrap();
+        let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
         assert_eq!(room.state(), RoomState::Joined);
     }
 
     #[async_test]
-    async fn retry_limit_http_requests() {
+    async fn test_retry_limit_http_requests() {
         let server = MockServer::start().await;
         let client = test_client_builder(Some(server.uri()))
             .request_config(RequestConfig::new().retry_limit(3))
@@ -2165,7 +2144,7 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn retry_timeout_http_requests() {
+    async fn test_retry_timeout_http_requests() {
         // Keep this timeout small so that the test doesn't take long
         let retry_timeout = Duration::from_secs(5);
         let server = MockServer::start().await;
@@ -2188,7 +2167,7 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn short_retry_initial_http_requests() {
+    async fn test_short_retry_initial_http_requests() {
         let server = MockServer::start().await;
         let client = test_client_builder(Some(server.uri())).build().await.unwrap();
 
@@ -2203,7 +2182,7 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn no_retry_http_requests() {
+    async fn test_no_retry_http_requests() {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
@@ -2218,17 +2197,17 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn set_homeserver() {
+    async fn test_set_homeserver() {
         let client = no_retry_test_client(Some("http://localhost".to_owned())).await;
-        assert_eq!(client.homeserver().await.as_ref(), "http://localhost/");
+        assert_eq!(client.homeserver().as_ref(), "http://localhost/");
 
         let homeserver = Url::parse("http://example.com/").unwrap();
-        client.set_homeserver(homeserver.clone()).await;
-        assert_eq!(client.homeserver().await, homeserver);
+        client.set_homeserver(homeserver.clone());
+        assert_eq!(client.homeserver(), homeserver);
     }
 
     #[async_test]
-    async fn search_user_request() {
+    async fn test_search_user_request() {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
@@ -2243,11 +2222,11 @@ pub(crate) mod tests {
             .await;
 
         let response = client.search_users("test", 50).await.unwrap();
-        let result = response.results.first().unwrap();
+        assert_eq!(response.results.len(), 1);
+        let result = &response.results[0];
         assert_eq!(result.user_id.to_string(), "@test:example.me");
         assert_eq!(result.display_name.clone().unwrap(), "Test");
         assert_eq!(result.avatar_url.clone().unwrap().to_string(), "mxc://example.me/someid");
-        assert_eq!(response.results.len(), 1);
         assert!(!response.limited);
     }
 }

@@ -25,6 +25,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use bytesize::ByteSize;
 use eyeball::SharedObservable;
+use http::Method;
 use ruma::api::{
     error::{FromHttpResponseError, IntoHttpError},
     AuthScheme, MatrixVersion, OutgoingRequest, SendAccessToken,
@@ -93,8 +94,18 @@ impl HttpClient {
 
     #[allow(clippy::too_many_arguments)]
     #[instrument(
-        skip(self, access_token, config, request, send_progress),
-        fields(config, path, request_size, request_body, request_id, status, response_size,)
+        skip(self, request, config, homeserver, access_token, send_progress),
+        fields(
+            config,
+            uri,
+            method,
+            request_size,
+            request_body,
+            request_id,
+            status,
+            response_size,
+            sentry_event_id,
+        )
     )]
     pub async fn send<R>(
         &self,
@@ -132,8 +143,23 @@ impl HttpClient {
             let request =
                 self.serialize_request(request, config, homeserver, access_token, server_versions)?;
 
-            let request_size = ByteSize(request.body().len().try_into().unwrap_or(u64::MAX));
-            span.record("request_size", request_size.to_string_as(true));
+            let method = request.method();
+
+            let mut uri_parts = request.uri().clone().into_parts();
+            if let Some(path_and_query) = &mut uri_parts.path_and_query {
+                *path_and_query =
+                    path_and_query.path().try_into().expect("path is valid PathAndQuery");
+            }
+            let uri = http::Uri::from_parts(uri_parts).expect("created from valid URI");
+
+            span.record("method", debug(method)).record("uri", uri.to_string());
+
+            // POST, PUT, PATCH are the only methods that are reasonably used
+            // in conjunction with request bodies
+            if [Method::POST, Method::PUT, Method::PATCH].contains(method) {
+                let request_size = request.body().len().try_into().unwrap_or(u64::MAX);
+                span.record("request_size", ByteSize(request_size).to_string_as(true));
+            }
 
             // Since sliding sync is experimental, and the proxy might not do what we expect
             // it to do given a specific request body, it's useful to log the
@@ -142,13 +168,7 @@ impl HttpClient {
             #[cfg(feature = "experimental-sliding-sync")]
             if type_name::<R>() == "ruma_client_api::sync::sync_events::v4::Request" {
                 span.record("request_body", debug(request.body()));
-                span.record("path", request.uri().path_and_query().map(|p| p.as_str()));
-            } else {
-                span.record("path", request.uri().path());
             }
-
-            #[cfg(not(feature = "experimental-sliding-sync"))]
-            span.record("path", request.uri().path());
 
             request
         };

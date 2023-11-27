@@ -1,11 +1,11 @@
 use anyhow::{bail, Context};
 use ruma::events::{
-    AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, AnyTimelineEvent,
-    MessageLikeEventContent as RumaMessageLikeEventContent, RedactContent,
+    room::message::Relation, AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent,
+    AnyTimelineEvent, MessageLikeEventContent as RumaMessageLikeEventContent, RedactContent,
     RedactedStateEventContent, StaticStateEventContent, SyncMessageLikeEvent, SyncStateEvent,
 };
 
-use crate::{room_member::MembershipState, timeline::MessageType, ClientError};
+use crate::{room_member::MembershipState, ruma::MessageType, ClientError};
 
 #[derive(uniffi::Object)]
 pub struct TimelineEvent(pub(crate) AnySyncTimelineEvent);
@@ -126,9 +126,10 @@ pub enum MessageLikeEventContent {
     KeyVerificationKey,
     KeyVerificationMac,
     KeyVerificationDone,
+    Poll { question: String },
     ReactionContent { related_event_id: String },
     RoomEncrypted,
-    RoomMessage { message_type: MessageType },
+    RoomMessage { message_type: MessageType, in_reply_to_event_id: Option<String> },
     RoomRedaction,
     Sticker,
 }
@@ -163,6 +164,12 @@ impl TryFrom<AnySyncMessageLikeEvent> for MessageLikeEventContent {
             AnySyncMessageLikeEvent::KeyVerificationDone(_) => {
                 MessageLikeEventContent::KeyVerificationDone
             }
+            AnySyncMessageLikeEvent::UnstablePollStart(content) => {
+                let original_content = get_message_like_event_original_content(content)?;
+                MessageLikeEventContent::Poll {
+                    question: original_content.poll_start().question.text.clone(),
+                }
+            }
             AnySyncMessageLikeEvent::Reaction(content) => {
                 let original_content = get_message_like_event_original_content(content)?;
                 MessageLikeEventContent::ReactionContent {
@@ -172,8 +179,14 @@ impl TryFrom<AnySyncMessageLikeEvent> for MessageLikeEventContent {
             AnySyncMessageLikeEvent::RoomEncrypted(_) => MessageLikeEventContent::RoomEncrypted,
             AnySyncMessageLikeEvent::RoomMessage(content) => {
                 let original_content = get_message_like_event_original_content(content)?;
+                let in_reply_to_event_id =
+                    original_content.relates_to.and_then(|relation| match relation {
+                        Relation::Reply { in_reply_to } => Some(in_reply_to.event_id.to_string()),
+                        _ => None,
+                    });
                 MessageLikeEventContent::RoomMessage {
-                    message_type: original_content.msgtype.try_into()?,
+                    message_type: original_content.msgtype.into(),
+                    in_reply_to_event_id,
                 }
             }
             AnySyncMessageLikeEvent::RoomRedaction(_) => MessageLikeEventContent::RoomRedaction,

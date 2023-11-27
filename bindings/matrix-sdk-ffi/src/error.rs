@@ -5,6 +5,7 @@ use matrix_sdk::{
     NotificationSettingsError as SdkNotificationSettingsError, StoreError,
 };
 use matrix_sdk_ui::{encryption_sync_service, notification_client, sync_service, timeline};
+use uniffi::UnexpectedUniFFICallbackError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -21,6 +22,12 @@ impl ClientError {
 impl From<anyhow::Error> for ClientError {
     fn from(e: anyhow::Error) -> ClientError {
         ClientError::Generic { msg: format!("{e:#}") }
+    }
+}
+
+impl From<UnexpectedUniFFICallbackError> for ClientError {
+    fn from(e: UnexpectedUniFFICallbackError) -> Self {
+        Self::new(e)
     }
 }
 
@@ -102,6 +109,12 @@ impl From<OidcError> for ClientError {
     }
 }
 
+impl From<RoomError> for ClientError {
+    fn from(e: RoomError) -> Self {
+        Self::new(e)
+    }
+}
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 #[uniffi(flat_error)]
 pub enum RoomError {
@@ -109,6 +122,8 @@ pub enum RoomError {
     InvalidAttachmentData,
     #[error("Invalid attachment mime type")]
     InvalidAttachmentMimeType,
+    #[error("Invalid media info")]
+    InvalidMediaInfo,
     #[error("Timeline unavailable")]
     TimelineUnavailable,
     #[error("Invalid thumbnail data")]
@@ -119,27 +134,26 @@ pub enum RoomError {
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 #[uniffi(flat_error)]
-pub enum TimelineError {
+pub enum MediaInfoError {
     #[error("Required value missing from the media info")]
-    MissingMediaInfoField,
+    MissingField,
     #[error("Media info field invalid")]
-    InvalidMediaInfoField,
+    InvalidField,
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
-#[uniffi(flat_error)]
 pub enum NotificationSettingsError {
     #[error("client error: {msg}")]
     Generic { msg: String },
     /// Invalid parameter.
-    #[error("Invalid parameter `{0}`")]
-    InvalidParameter(String),
+    #[error("Invalid parameter: {msg}")]
+    InvalidParameter { msg: String },
     /// Invalid room id.
-    #[error("Invalid room ID `{0}`")]
-    InvalidRoomId(String),
+    #[error("Invalid room ID {room_id}")]
+    InvalidRoomId { room_id: String },
     /// Rule not found
-    #[error("Rule not found")]
-    RuleNotFound,
+    #[error("Rule not found: {rule_id}")]
+    RuleNotFound { rule_id: String },
     /// Unable to add push rule.
     #[error("Unable to add push rule")]
     UnableToAddPushRule,
@@ -157,13 +171,11 @@ pub enum NotificationSettingsError {
 impl From<SdkNotificationSettingsError> for NotificationSettingsError {
     fn from(value: SdkNotificationSettingsError) -> Self {
         match value {
-            SdkNotificationSettingsError::RuleNotFound => Self::RuleNotFound,
+            SdkNotificationSettingsError::RuleNotFound(rule_id) => Self::RuleNotFound { rule_id },
             SdkNotificationSettingsError::UnableToAddPushRule => Self::UnableToAddPushRule,
             SdkNotificationSettingsError::UnableToRemovePushRule => Self::UnableToRemovePushRule,
             SdkNotificationSettingsError::UnableToSavePushRules => Self::UnableToSavePushRules,
-            SdkNotificationSettingsError::InvalidParameter(parameter) => {
-                Self::InvalidParameter(parameter)
-            }
+            SdkNotificationSettingsError::InvalidParameter(msg) => Self::InvalidParameter { msg },
             SdkNotificationSettingsError::UnableToUpdatePushRule => Self::UnableToUpdatePushRule,
         }
     }

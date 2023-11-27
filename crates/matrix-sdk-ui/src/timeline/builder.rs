@@ -12,20 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
-use async_std::sync::Mutex;
 use eyeball::SharedObservable;
+use futures_util::{pin_mut, StreamExt};
 use imbl::Vector;
 use matrix_sdk::{
     deserialized_responses::SyncTimelineEvent, executor::spawn, sync::RoomUpdate, Room,
 };
-use ruma::events::{
-    receipt::{ReceiptThread, ReceiptType},
-    AnySyncTimelineEvent,
-};
-use tokio::sync::{broadcast, mpsc};
-use tracing::{error, info, info_span, trace, warn, Instrument};
+use ruma::events::{receipt::ReceiptType, AnySyncTimelineEvent};
+use tokio::sync::{broadcast, mpsc, Notify};
+use tracing::{info, info_span, trace, warn, Instrument, Span};
 
 #[cfg(feature = "e2e-encryption")]
 use super::to_device::{handle_forwarded_room_key_event, handle_room_key_event};
@@ -124,46 +121,12 @@ impl TimelineBuilder {
         let mut inner = TimelineInner::new(room).with_settings(settings);
 
         if track_read_marker_and_receipts {
-            match inner
-                .room()
-                .user_receipt(
-                    ReceiptType::Read,
-                    ReceiptThread::Unthreaded,
-                    inner.room().own_user_id(),
-                )
-                .await
-            {
-                Ok(Some(read_receipt)) => {
-                    inner.set_initial_user_receipt(ReceiptType::Read, read_receipt).await;
-                }
-                Err(e) => {
-                    error!("Failed to get public read receipt of own user from the store: {e}");
-                }
-                _ => {}
-            }
-            match inner
-                .room()
-                .user_receipt(
-                    ReceiptType::ReadPrivate,
-                    ReceiptThread::Unthreaded,
-                    inner.room().own_user_id(),
-                )
-                .await
-            {
-                Ok(Some(private_read_receipt)) => {
-                    inner
-                        .set_initial_user_receipt(ReceiptType::ReadPrivate, private_read_receipt)
-                        .await;
-                }
-                Err(e) => {
-                    error!("Failed to get private read receipt of own user from the store: {e}");
-                }
-                _ => {}
-            }
+            inner.populate_initial_user_receipt(ReceiptType::Read).await;
+            inner.populate_initial_user_receipt(ReceiptType::ReadPrivate).await;
         }
 
         if has_events {
-            inner.add_initial_events(events).await;
+            inner.add_initial_events(events, prev_token).await;
         }
         if track_read_marker_and_receipts {
             inner.load_fully_read_event().await;
@@ -172,13 +135,16 @@ impl TimelineBuilder {
         let room = inner.room();
         let client = room.client();
 
-        let start_token = Arc::new(Mutex::new(prev_token));
-        let end_token = Arc::new(Mutex::new(None));
-
+        let sync_response_notify = Arc::new(Notify::new());
         let mut room_update_rx = room.subscribe_to_updates();
         let room_update_join_handle = spawn({
+            let sync_response_notify = sync_response_notify.clone();
             let inner = inner.clone();
-            let start_token = start_token.clone();
+
+            let span =
+                info_span!(parent: Span::none(), "room_update_handler", room_id = ?room.room_id());
+            span.follows_from(Span::current());
+
             async move {
                 loop {
                     let update = match room_update_rx.recv().await {
@@ -193,52 +159,37 @@ impl TimelineBuilder {
 
                     trace!("Handling a room update");
 
-                    let update_start_token = |prev_batch: &Option<_>| {
-                        // Only update start_token if it's not currently locked.
-                        // If it is locked, pagination is currently in progress.
-                        if let Some(mut start_token) = start_token.try_lock() {
-                            if start_token.is_none() && prev_batch.is_some() {
-                                *start_token = prev_batch.clone();
-                            }
-                        }
-                    };
-
                     match update {
                         RoomUpdate::Left { updates, .. } => {
-                            update_start_token(&updates.timeline.prev_batch);
                             inner.handle_sync_timeline(updates.timeline).await;
                         }
                         RoomUpdate::Joined { updates, .. } => {
-                            update_start_token(&updates.timeline.prev_batch);
                             inner.handle_joined_room_update(updates).await;
                         }
                         RoomUpdate::Invited { .. } => {
                             warn!("Room is in invited state, can't build or update its timeline");
                         }
                     }
+
+                    sync_response_notify.notify_waiters();
                 }
             }
-            .instrument(info_span!("room_update_handler", room_id = ?room.room_id()))
+            .instrument(span)
         });
 
         let mut ignore_user_list_stream = client.subscribe_to_ignore_user_list_changes();
         let ignore_user_list_update_join_handle = spawn({
             let inner = inner.clone();
-            let start_token = start_token.clone();
-            let end_token = end_token.clone();
+
+            let span = info_span!(parent: Span::none(), "ignore_user_list_update_handler", room_id = ?room.room_id());
+            span.follows_from(Span::current());
+
             async move {
                 while ignore_user_list_stream.next().await.is_some() {
-                    // Same as `Timeline::reset`, but Timeline is s not clonable
-                    // and we need to avoid circular references
-                    let mut start_lock = start_token.lock().await;
-                    let mut end_lock = end_token.lock().await;
-
-                    *start_lock = None;
-                    *end_lock = None;
-
                     inner.clear().await;
                 }
             }
+            .instrument(span)
         });
 
         // Not using room.add_event_handler here because RoomKey events are
@@ -260,22 +211,51 @@ impl TimelineBuilder {
             forwarded_room_key_handle,
         ];
 
+        let room_key_from_backups_join_handle = {
+            let inner = inner.clone();
+            let room_id = inner.room().room_id();
+
+            let stream = client.encryption().backups().room_keys_for_room_stream(room_id);
+
+            spawn(async move {
+                pin_mut!(stream);
+
+                while let Some(update) = stream.next().await {
+                    let room = inner.room();
+
+                    match update {
+                        Ok(info) => {
+                            let mut session_ids = BTreeSet::new();
+
+                            for set in info.into_values() {
+                                session_ids.extend(set);
+                            }
+
+                            inner.retry_event_decryption(room, Some(session_ids)).await;
+                        }
+                        // We lagged, so retry every event.
+                        Err(_) => inner.retry_event_decryption(room, None).await,
+                    }
+                }
+            })
+        };
+
         let (msg_sender, msg_receiver) = mpsc::channel(1);
         info!("Starting message-sending loop");
         spawn(send_queued_messages(inner.clone(), room.clone(), msg_receiver));
 
         let timeline = Timeline {
             inner,
-            start_token,
-            start_token_condvar: Default::default(),
+            back_pagination_mtx: Default::default(),
             back_pagination_status: SharedObservable::new(BackPaginationStatus::Idle),
-            _end_token: end_token,
+            sync_response_notify,
             msg_sender,
             drop_handle: Arc::new(TimelineDropHandle {
                 client,
                 event_handler_handles: handles,
                 room_update_join_handle,
                 ignore_user_list_update_join_handle,
+                room_key_from_backups_join_handle,
             }),
         };
 

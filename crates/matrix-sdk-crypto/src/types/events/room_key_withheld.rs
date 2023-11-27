@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use ruma::{
     exports::ruma_macros::AsStrAsRefStr,
     serde::{AsRefStr, DebugAsRefStr, DeserializeFromCowStr, FromString, SerializeAsRefStr},
-    JsOption, OwnedDeviceId, OwnedRoomId,
+    OwnedDeviceId, OwnedRoomId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -107,7 +107,7 @@ impl RoomKeyWithheldContent {
         sender_key: Curve25519PublicKey,
         from_device: OwnedDeviceId,
     ) -> Self {
-        let from_device = JsOption::Some(from_device);
+        let from_device = Some(from_device);
 
         match algorithm {
             EventEncryptionAlgorithm::MegolmV1AesSha2 => {
@@ -222,7 +222,7 @@ impl std::fmt::Display for WithheldCode {
 #[derive(Debug, Deserialize, Serialize)]
 struct WithheldHelper {
     pub algorithm: EventEncryptionAlgorithm,
-    pub reason: JsOption<String>,
+    pub reason: Option<String>,
     pub code: WithheldCode,
     #[serde(flatten)]
     other: Value,
@@ -259,8 +259,8 @@ pub struct CommonWithheldCodeContent {
 
     /// The device ID of the device sending the m.room_key.withheld message
     /// MSC3735.
-    #[serde(default, skip_serializing_if = "JsOption::is_undefined")]
-    pub from_device: JsOption<OwnedDeviceId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_device: Option<OwnedDeviceId>,
 
     #[serde(flatten)]
     other: BTreeMap<String, Value>,
@@ -278,7 +278,7 @@ impl CommonWithheldCodeContent {
             room_id,
             session_id,
             sender_key,
-            from_device: JsOption::Some(device_id),
+            from_device: Some(device_id),
             other: Default::default(),
         }
     }
@@ -318,13 +318,14 @@ pub struct NoOlmWithheldContent {
 
     /// The device ID of the device sending the m.room_key.withheld message
     /// MSC3735.
-    #[serde(default, skip_serializing_if = "JsOption::is_undefined")]
-    pub from_device: JsOption<OwnedDeviceId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_device: Option<OwnedDeviceId>,
 
     #[serde(flatten)]
     other: BTreeMap<String, Value>,
 }
 
+#[cfg(not(tarpaulin_include))]
 impl std::fmt::Debug for CommonWithheldCodeContent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnyWithheldContent")
@@ -336,6 +337,7 @@ impl std::fmt::Debug for CommonWithheldCodeContent {
     }
 }
 
+#[cfg(not(tarpaulin_include))]
 impl std::fmt::Debug for NoOlmWithheldContent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NoOlmWithheldContent")
@@ -356,8 +358,8 @@ pub struct UnknownRoomKeyWithHeld {
     /// The withheld code
     pub code: WithheldCode,
     /// A human-readable reason for why the key was not sent.
-    #[serde(default, skip_serializing_if = "JsOption::is_undefined")]
-    pub reason: JsOption<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// The other data of the unknown room key.
     #[serde(flatten)]
     other: BTreeMap<String, Value>,
@@ -427,7 +429,7 @@ impl Serialize for RoomKeyWithheldContent {
         let helper = match self {
             Self::MegolmV1AesSha2(r) => {
                 let code = r.withheld_code();
-                let reason = JsOption::Some(code.to_string());
+                let reason = Some(code.to_string());
 
                 match r {
                     MegolmV1AesSha2WithheldContent::BlackListed(content)
@@ -450,7 +452,7 @@ impl Serialize for RoomKeyWithheldContent {
             #[cfg(feature = "experimental-algorithms")]
             Self::MegolmV2AesSha2(r) => {
                 let code = r.withheld_code();
-                let reason = JsOption::Some(code.to_string());
+                let reason = Some(code.to_string());
 
                 match r {
                     MegolmV1AesSha2WithheldContent::BlackListed(content)
@@ -487,6 +489,7 @@ pub(super) mod tests {
     use std::collections::BTreeMap;
 
     use assert_matches::assert_matches;
+    use assert_matches2::assert_let;
     use ruma::{device_id, room_id, serde::Raw, to_device::DeviceIdOrAllDevices, user_id};
     use serde_json::{json, Value};
     use vodozemac::Curve25519PublicKey;
@@ -575,7 +578,8 @@ pub(super) mod tests {
             let json = json(&code);
             let event: RoomKeyWithheldEvent = serde_json::from_value(json.clone())?;
 
-            assert_matches!(&event.content, RoomKeyWithheldContent::MegolmV1AesSha2(content) if code == content.withheld_code());
+            assert_let!(RoomKeyWithheldContent::MegolmV1AesSha2(content) = &event.content);
+            assert_eq!(code, content.withheld_code());
 
             assert_eq!(event.content.algorithm(), EventEncryptionAlgorithm::MegolmV1AesSha2);
             let serialized = serde_json::to_value(event)?;
@@ -604,11 +608,8 @@ pub(super) mod tests {
         let event: RoomKeyWithheldEvent = serde_json::from_value(json.clone())?;
         assert_matches!(event.content, RoomKeyWithheldContent::Unknown(_));
 
-        assert_matches!(
-            &event.content,
-            RoomKeyWithheldContent::Unknown(content)
-            if content.code.as_str() == "org.mscXXX.new_code"
-        );
+        assert_let!(RoomKeyWithheldContent::Unknown(content) = &event.content);
+        assert_eq!(content.code.as_str(), "org.mscXXX.new_code");
 
         let serialized = serde_json::to_value(event)?;
         assert_eq!(json, serialized);
@@ -622,11 +623,8 @@ pub(super) mod tests {
         let event: RoomKeyWithheldEvent = serde_json::from_value(json.clone())?;
         assert_matches!(event.content, RoomKeyWithheldContent::Unknown(_));
 
-        if let RoomKeyWithheldContent::Unknown(content) = &event.content {
-            assert_matches!(content.code, WithheldCode::_Custom(_));
-        } else {
-            panic!()
-        }
+        assert_let!(RoomKeyWithheldContent::Unknown(content) = &event.content);
+        assert_matches!(&content.code, WithheldCode::_Custom(_));
         let serialized = serde_json::to_value(event)?;
         assert_eq!(json, serialized);
 
@@ -695,11 +693,12 @@ pub(super) mod tests {
             device_id.to_owned(),
         );
 
-        assert_matches!(
-            content,
-            RoomKeyWithheldContent::MegolmV1AesSha2(MegolmV1AesSha2WithheldContent::NoOlm(content))
-            if content.sender_key == sender_key
+        assert_let!(
+            RoomKeyWithheldContent::MegolmV1AesSha2(MegolmV1AesSha2WithheldContent::NoOlm(
+                content
+            )) = content
         );
+        assert_eq!(content.sender_key, sender_key);
 
         let content = RoomKeyWithheldContent::new(
             EventEncryptionAlgorithm::MegolmV1AesSha2,
@@ -710,10 +709,11 @@ pub(super) mod tests {
             device_id.to_owned(),
         );
 
-        assert_matches!(
-            content,
-            RoomKeyWithheldContent::MegolmV1AesSha2(MegolmV1AesSha2WithheldContent::Unverified(content))
-            if content.session_id == "0ZcULv8j1nqVWx6orFjD6OW9JQHydDPXfaanA+uRyfs"
+        assert_let!(
+            RoomKeyWithheldContent::MegolmV1AesSha2(MegolmV1AesSha2WithheldContent::Unverified(
+                content
+            )) = content
         );
+        assert_eq!(content.session_id, "0ZcULv8j1nqVWx6orFjD6OW9JQHydDPXfaanA+uRyfs");
     }
 }

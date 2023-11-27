@@ -13,16 +13,17 @@
 // limitations under the License.
 
 use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use chrono::{Datelike, Local, TimeZone};
 use eyeball_im::VectorDiff;
-use matrix_sdk_test::async_test;
+use matrix_sdk_test::{async_test, ALICE, BOB};
 use ruma::{
     event_id,
     events::{room::message::RoomMessageEventContent, AnyMessageLikeEventContent},
 };
 use stream_assert::assert_next_matches;
 
-use super::{TestTimeline, ALICE, BOB};
+use super::TestTimeline;
 use crate::timeline::{TimelineItemKind, VirtualTimelineItem};
 
 #[async_test]
@@ -38,10 +39,7 @@ async fn day_divider() {
         .await;
 
     let day_divider = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    let ts = assert_matches!(
-        day_divider.as_virtual().unwrap(),
-        VirtualTimelineItem::DayDivider(ts) => *ts
-    );
+    assert_let!(VirtualTimelineItem::DayDivider(ts) = day_divider.as_virtual().unwrap());
     let date = Local.timestamp_millis_opt(ts.0.into()).single().unwrap();
     assert_eq!(date.year(), 1970);
     assert_eq!(date.month(), 1);
@@ -61,7 +59,7 @@ async fn day_divider() {
     item.as_event().unwrap();
 
     // Timestamps start at unix epoch, advance to one day later
-    timeline.set_next_ts(24 * 60 * 60 * 1000);
+    timeline.event_builder.set_next_ts(24 * 60 * 60 * 1000);
 
     timeline
         .handle_live_message_event(
@@ -71,10 +69,7 @@ async fn day_divider() {
         .await;
 
     let day_divider = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    let ts = assert_matches!(
-        day_divider.as_virtual().unwrap(),
-        VirtualTimelineItem::DayDivider(ts) => *ts
-    );
+    assert_let!(VirtualTimelineItem::DayDivider(ts) = day_divider.as_virtual().unwrap());
     let date = Local.timestamp_millis_opt(ts.0.into()).single().unwrap();
     assert_eq!(date.year(), 1970);
     assert_eq!(date.month(), 1);

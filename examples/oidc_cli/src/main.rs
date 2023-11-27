@@ -35,8 +35,8 @@ use matrix_sdk::{
             requests::GrantType,
             scope::{Scope, ScopeToken},
         },
-        AuthorizationCode, AuthorizationResponse, FullSession, OidcAuthorizationData,
-        RegisteredClientData, UserSession,
+        AuthorizationCode, AuthorizationResponse, OidcAccountManagementAction,
+        OidcAuthorizationData, OidcSession, UserSession,
     },
     room::Room,
     ruma::{
@@ -45,9 +45,10 @@ use matrix_sdk::{
     },
     Client, ClientBuildError, Result, RoomState, ServerName,
 };
+use matrix_sdk_ui::sync_service::SyncService;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
-use tokio::{fs, net::TcpListener, sync::oneshot};
+use tokio::{fs, io::AsyncBufReadExt as _, net::TcpListener, sync::oneshot};
 use tower::make::Shared;
 use url::Url;
 
@@ -91,7 +92,7 @@ fn help() {
     println!("Commands:");
     println!("  whoami                 Get information about this session");
     println!("  account                Get the URL to manage this account");
-    println!("  watch                  Watch new incoming messages until an error occurs");
+    println!("  watch [sliding?]       Watch new incoming messages until an error occurs");
     println!("  authorize [scope…]     Authorize the given scope");
     println!("  refresh                Refresh the access token");
     println!("  logout                 Log out of this account");
@@ -133,7 +134,7 @@ struct StoredSession {
 }
 
 /// An OpenID Connect CLI.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct OidcCli {
     /// The Matrix client.
     client: Client,
@@ -179,6 +180,8 @@ impl OidcCli {
 
         println!("Session persisted in {}", cli.session_file.to_string_lossy());
 
+        cli.setup_background_save();
+
         Ok(cli)
     }
 
@@ -211,13 +214,11 @@ impl OidcCli {
         // the JWT.
         let res = oidc.register_client(&issuer_info.issuer, metadata.clone(), None).await?;
 
-        let client_data = RegisteredClientData {
-            // The format of the credentials changes according to the client metadata that was sent.
-            // Public clients only get a client ID.
-            credentials: ClientCredentials::None { client_id: res.client_id.clone() },
+        oidc.restore_registered_client(
+            issuer_info,
             metadata,
-        };
-        oidc.restore_registered_client(issuer_info, client_data).await;
+            ClientCredentials::None { client_id: res.client_id.clone() },
+        );
 
         println!("\nRegistered successfully");
 
@@ -280,26 +281,54 @@ impl OidcCli {
         let StoredSession { client_session, user_session, client_credentials } =
             serde_json::from_str(&serialized_session)?;
 
+        // We're using autodiscovery here too because we need to properly discover the
+        // OIDC endpoints to properly support refreshing tokens in the watch
+        // command.
+        let (homeserver, insecure) =
+            if let Some(base) = client_session.homeserver.strip_prefix("http://") {
+                (base, true)
+            } else {
+                (
+                    client_session
+                        .homeserver
+                        .strip_prefix("https://")
+                        .unwrap_or(&client_session.homeserver),
+                    false,
+                )
+            };
+        let homeserver = homeserver.strip_suffix('/').unwrap_or(homeserver);
+        let server_name = ServerName::parse(homeserver)?;
+
         // Build the client with the previous settings from the session.
-        let client = Client::builder()
-            .homeserver_url(client_session.homeserver)
+        let mut client = Client::builder();
+
+        if insecure {
+            client = client.insecure_server_name_no_tls(&server_name);
+        } else {
+            client = client.server_name(&server_name);
+        }
+
+        let client = client
+            .handle_refresh_tokens()
             .sqlite_store(client_session.db_path, Some(&client_session.passphrase))
             .build()
             .await?;
 
         println!("Restoring session for {}…", user_session.meta.user_id);
 
-        let session = FullSession {
-            client: RegisteredClientData {
-                credentials: ClientCredentials::None { client_id: client_credentials.client_id },
-                metadata: client_metadata(),
-            },
+        let session = OidcSession {
+            credentials: ClientCredentials::None { client_id: client_credentials.client_id },
+            metadata: client_metadata(),
             user: user_session,
         };
         // Restore the Matrix user session.
         client.restore_session(session).await?;
 
-        Ok(Self { client, restored: true, session_file })
+        let this = Self { client, restored: true, session_file };
+
+        this.setup_background_save();
+
+        Ok(this)
     }
 
     /// Run the main program.
@@ -319,14 +348,27 @@ impl OidcCli {
 
             match cmd {
                 Some("whoami") => {
-                    self.whoami().await;
+                    self.whoami();
                 }
                 Some("account") => {
-                    self.account();
+                    self.account(None);
                 }
-                Some("watch") => {
-                    self.watch().await?;
+                Some("profile") => {
+                    self.account(Some(OidcAccountManagementAction::Profile));
                 }
+                Some("sessions") => {
+                    self.account(Some(OidcAccountManagementAction::SessionsList));
+                }
+                Some("watch") => match args.next() {
+                    Some(sub) => {
+                        if sub == "sliding" {
+                            self.watch_sliding_sync().await?;
+                        } else {
+                            println!("unknown subcommand for watch: available is 'sliding'");
+                        }
+                    }
+                    None => self.watch().await?,
+                },
                 Some("authorize") => {
                     let mut scopes = args.peekable();
                     if scopes.peek().is_some() {
@@ -363,13 +405,13 @@ impl OidcCli {
     }
 
     /// Get information about this session.
-    async fn whoami(&self) {
+    fn whoami(&self) {
         let client = &self.client;
         let oidc = client.oidc();
 
         let user_id = client.user_id().expect("A logged in client has a user ID");
         let device_id = client.device_id().expect("A logged in client has a device ID");
-        let homeserver = client.homeserver().await;
+        let homeserver = client.homeserver();
         let issuer = oidc.issuer().expect("A logged in OIDC client has an issuer");
 
         println!("\nUser ID: {user_id}");
@@ -379,8 +421,8 @@ impl OidcCli {
     }
 
     /// Get the account management URL.
-    fn account(&self) {
-        match self.client.oidc().account_management_url() {
+    fn account(&self, action: Option<OidcAccountManagementAction>) {
+        match self.client.oidc().account_management_url(action) {
             Ok(Some(url)) => {
                 println!("\nTo manage your account, visit: {url}");
             }
@@ -416,11 +458,121 @@ impl OidcCli {
         Ok(())
     }
 
+    /// This watches for incoming responses using the high-level sliding sync
+    /// helpers (`SyncService`).
+    async fn watch_sliding_sync(&self) -> anyhow::Result<()> {
+        let sync_service = Arc::new(SyncService::builder(self.client.clone()).build().await?);
+
+        sync_service.start().await;
+
+        println!("press enter to exit the sync loop");
+
+        let mut sync_service_state = sync_service.state();
+
+        let sync_service_clone = sync_service.clone();
+        let task = tokio::spawn(async move {
+            // Only fail after getting 5 errors in a row. When we're in an always-refail
+            // scenario, we move from the Error to the Running state for a bit
+            // until we fail again, so we need to track both failure state and
+            // running state, hence `num_errors` and `num_running`:
+            // - if we failed and num_running was 1, then this is a failure following a
+            //   failure.
+            // - otherwise, we recovered from the failure and we can plain continue.
+
+            let mut num_errors = 0;
+            let mut num_running = 0;
+
+            let mut _unused = String::new();
+            let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+
+            loop {
+                // Concurrently wait for an update from the sync service OR for the user to
+                // press enter and leave early.
+                tokio::select! {
+                    res = sync_service_state.next() => {
+                        if let Some(state) = res {
+                            match state {
+                                matrix_sdk_ui::sync_service::State::Idle
+                                | matrix_sdk_ui::sync_service::State::Terminated => {
+                                    num_errors = 0;
+                                    num_running = 0;
+                                }
+
+                                matrix_sdk_ui::sync_service::State::Running => {
+                                    num_running += 1;
+                                    if num_running > 1 {
+                                        num_errors = 0;
+                                    }
+                                }
+
+                                matrix_sdk_ui::sync_service::State::Error => {
+                                    num_errors += 1;
+                                    num_running = 0;
+
+                                    if num_errors == 5 {
+                                        println!("ran into 5 errors in a row, terminating");
+                                        break;
+                                    }
+
+                                    sync_service_clone.start().await;
+                                }
+                            }
+                            println!("New sync service state update: {state:?}");
+                        } else {
+                            break;
+                        }
+                    }
+
+                    _ = stdin.read_line(&mut _unused) => {
+                        println!("Stopping loop because of user request");
+
+                        if let Err(err) = sync_service.stop().await {
+                            println!("Error when stopping the sync service: {err}");
+                        }
+
+                        break;
+                    }
+                }
+            }
+        });
+
+        println!("waiting for sync service to stop...");
+        task.await.unwrap();
+
+        println!("done!");
+        Ok(())
+    }
+
+    /// Sets up this client so that it automatically saves the session onto disk
+    /// whenever there are new tokens that have been received.
+    ///
+    /// This should always be set up whenever automatic refresh is happening.
+    fn setup_background_save(&self) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            while let Ok(update) = this.client.subscribe_to_session_changes().recv().await {
+                match update {
+                    matrix_sdk::SessionChange::UnknownToken { soft_logout } => {
+                        println!("Received an unknown token error; soft logout? {soft_logout:?}");
+                    }
+                    matrix_sdk::SessionChange::TokensRefreshed => {
+                        // The tokens have been refreshed, persist them to disk.
+                        if let Err(err) = this.update_stored_session().await {
+                            println!("Unable to store a session in the background: {err}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Update the session stored on the system.
     ///
     /// This should be called everytime the access token (and possibly refresh
     /// token) has changed.
     async fn update_stored_session(&self) -> anyhow::Result<()> {
+        println!("Updating the stored session...");
+
         let serialized_session = fs::read_to_string(&self.session_file).await?;
         let mut session = serde_json::from_str::<StoredSession>(&serialized_session)?;
 
@@ -431,6 +583,7 @@ impl OidcCli {
         let serialized_session = serde_json::to_string(&session)?;
         fs::write(&self.session_file, serialized_session).await?;
 
+        println!("Updating the stored session: done!");
         Ok(())
     }
 
@@ -460,7 +613,7 @@ impl OidcCli {
 
         oidc.finish_authorization(authorization_code).await?;
 
-        // Now we refresh the stored session to always have the latest tokens.
+        // Now we store the latest session to always have the latest tokens.
         self.update_stored_session().await?;
 
         println!("\nAuthorized successfully");
@@ -472,8 +625,8 @@ impl OidcCli {
     async fn refresh_token(&self) -> anyhow::Result<()> {
         self.client.oidc().refresh_access_token().await?;
 
-        // Now we refresh the stored session to always have the latest tokens.
-        self.update_stored_session().await?;
+        // The session will automatically be refreshed because of the task persisting
+        // the full session upon refresh in `setup_background_save`.
 
         println!("\nToken refreshed successfully");
 
@@ -527,6 +680,13 @@ async fn build_client(
         io::stdout().flush().expect("Unable to write to stdout");
         io::stdin().read_line(&mut homeserver).expect("Unable to read user input");
 
+        let homeserver = homeserver.trim();
+        let (homeserver, insecure) = if let Some(base) = homeserver.strip_prefix("http://") {
+            (base, true)
+        } else {
+            (homeserver, false)
+        };
+
         let server_name = match ServerName::parse(homeserver.trim()) {
             Ok(s) => s,
             Err(error) => {
@@ -537,10 +697,19 @@ async fn build_client(
 
         println!("\nChecking homeserver…");
 
-        match Client::builder()
-            // We need to use server autodiscovery to get the authentication issuer advertised by
-            // the homeserver.
-            .server_name(&server_name)
+        let mut client = Client::builder();
+
+        // We need to use server autodiscovery to get the authentication issuer
+        // advertised by the homeserver.
+        if insecure {
+            client = client.insecure_server_name_no_tls(&server_name);
+        } else {
+            client = client.server_name(&server_name);
+        }
+
+        match client
+            // Make sure to automatically refresh tokens if needs be.
+            .handle_refresh_tokens()
             // We use the sqlite store, which is available by default. This is the crucial part to
             // persist the encryption setup.
             // Note that other store backends are available and you can even implement your own.
@@ -552,10 +721,10 @@ async fn build_client(
                 // Check if the homeserver advertises an OIDC Provider with auto-discovery.
                 // This can be bypassed by providing the issuer manually, but it should be the
                 // most common case for public homeservers.
-                if let Some(issuer_info) = client.authentication_server_info().cloned() {
+                if let Some(issuer_info) = client.oidc().authentication_server_info().cloned() {
                     println!("Found issuer: {}", issuer_info.issuer);
 
-                    let homeserver = client.homeserver().await.to_string();
+                    let homeserver = client.homeserver().to_string();
                     return Ok((
                         client,
                         ClientSession { homeserver, db_path, passphrase },

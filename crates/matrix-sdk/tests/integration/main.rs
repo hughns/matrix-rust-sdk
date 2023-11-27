@@ -3,7 +3,7 @@
 
 use matrix_sdk::{
     config::{RequestConfig, SyncSettings},
-    matrix_auth::{Session, SessionTokens},
+    matrix_auth::{MatrixSession, MatrixSessionTokens},
     Client, ClientBuilder,
 };
 use matrix_sdk_base::SessionMeta;
@@ -16,19 +16,15 @@ use wiremock::{
 };
 
 mod client;
+#[cfg(feature = "e2e-encryption")]
+mod encryption;
 mod matrix_auth;
 mod refresh_token;
 mod room;
+#[cfg(feature = "experimental-widgets")]
+mod widget;
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
-#[ctor::ctor]
-fn init_logging() {
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::from_default_env())
-        .with(tracing_subscriber::fmt::layer().with_test_writer())
-        .init();
-}
+matrix_sdk_test::init_tracing_for_tests!();
 
 async fn test_client_builder() -> (ClientBuilder, MockServer) {
     let server = MockServer::start().await;
@@ -45,12 +41,12 @@ async fn no_retry_test_client() -> (Client, MockServer) {
 }
 
 async fn logged_in_client() -> (Client, MockServer) {
-    let session = Session {
+    let session = MatrixSession {
         meta: SessionMeta {
             user_id: user_id!("@example:localhost").to_owned(),
             device_id: device_id!("DEVICEID").to_owned(),
         },
-        tokens: SessionTokens { access_token: "1234".to_owned(), refresh_token: None },
+        tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
     };
     let (client, server) = no_retry_test_client().await;
     client.restore_session(session).await.unwrap();

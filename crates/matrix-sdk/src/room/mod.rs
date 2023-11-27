@@ -1,12 +1,13 @@
 //! High-level room API
 
-use std::{borrow::Borrow, collections::BTreeMap, ops::Deref, sync::Arc, time::Duration};
+use std::{borrow::Borrow, collections::BTreeMap, ops::Deref, time::Duration};
 
 use eyeball::SharedObservable;
+use futures_core::Stream;
+use futures_util::stream::FuturesUnordered;
 use matrix_sdk_base::{
     deserialized_responses::{
-        MembersResponse, RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState,
-        TimelineEvent,
+        RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState, TimelineEvent,
     },
     instant::Instant,
     store::StateStoreExt,
@@ -54,22 +55,24 @@ use ruma::{
             topic::RoomTopicEventContent,
             MediaSource,
         },
+        space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
         tag::{TagInfo, TagName},
         AnyRoomAccountDataEvent, AnyStateEvent, EmptyStateKey, MessageLikeEventContent,
         MessageLikeEventType, RedactContent, RedactedStateEventContent, RoomAccountDataEvent,
         RoomAccountDataEventContent, RoomAccountDataEventType, StateEventContent, StateEventType,
-        StaticEventContent, StaticStateEventContent,
+        StaticEventContent, StaticStateEventContent, SyncStateEvent,
     },
     push::{Action, PushConditionRoomCtx},
     serde::Raw,
-    uint, EventId, Int, MatrixToUri, MatrixUri, MxcUri, OwnedEventId, OwnedServerName,
+    uint, EventId, Int, MatrixToUri, MatrixUri, MxcUri, OwnedEventId, OwnedRoomId, OwnedServerName,
     OwnedTransactionId, OwnedUserId, TransactionId, UInt, UserId,
 };
 use serde::de::DeserializeOwned;
 use thiserror::Error;
-use tokio::sync::{broadcast, Mutex};
-use tracing::{debug, instrument, warn};
+use tokio::sync::broadcast;
+use tracing::{debug, info, instrument, warn};
 
+use self::futures::{SendAttachment, SendMessageLikeEvent, SendRawMessageLikeEvent};
 use crate::{
     attachment::AttachmentConfig,
     error::WrongRoomState,
@@ -77,15 +80,15 @@ use crate::{
     media::{MediaFormat, MediaRequest},
     notification_settings::{IsEncrypted, IsOneToOne, RoomNotificationMode},
     sync::RoomUpdate,
+    utils::{IntoRawMessageLikeEventContent, IntoRawStateEventContent},
     BaseRoom, Client, Error, HttpError, HttpResult, Result, RoomState, TransmissionProgress,
 };
 
-mod futures;
+pub mod futures;
 mod member;
 mod messages;
 
 pub use self::{
-    futures::SendAttachment,
     member::RoomMember,
     messages::{Messages, MessagesOptions},
 };
@@ -381,91 +384,58 @@ impl Room {
         Ok(Some((TimelineEvent { event, encryption_info: None, push_actions }, response.state)))
     }
 
-    pub(crate) async fn request_members(&self) -> Result<Option<MembersResponse>> {
-        let mut map = self.client.inner.members_request_locks.lock().await;
+    pub(crate) async fn request_members(&self) -> Result<()> {
+        self.client
+            .locks()
+            .members_request_deduplicated_handler
+            .run(self.room_id().to_owned(), async move {
+                let request = get_member_events::v3::Request::new(self.inner.room_id().to_owned());
+                let response = self.client.send(request, None).await?;
 
-        if let Some(mutex) = map.get(self.inner.room_id()).cloned() {
-            // If a member request is already going on, await the release of
-            // the lock.
-            drop(map);
-            _ = mutex.lock().await;
+                // That's a large `Future`. Let's `Box::pin` to reduce its size on the stack.
+                Box::pin(self.client.base_client().receive_members(self.room_id(), &response))
+                    .await?;
 
-            Ok(None)
-        } else {
-            let mutex = Arc::new(Mutex::new(()));
-            map.insert(self.inner.room_id().to_owned(), mutex.clone());
-
-            let _guard = mutex.lock().await;
-            drop(map);
-
-            let request = get_member_events::v3::Request::new(self.inner.room_id().to_owned());
-            let response = self.client.send(request, None).await?;
-
-            let response = Box::pin(
-                self.client.base_client().receive_members(self.inner.room_id(), &response),
-            )
-            .await?;
-
-            self.client.inner.members_request_locks.lock().await.remove(self.inner.room_id());
-
-            Ok(Some(response))
-        }
+                Ok(())
+            })
+            .await
     }
 
     async fn request_encryption_state(&self) -> Result<()> {
-        let mut map = self.client.inner.encryption_state_request_locks.lock().await;
+        self.client
+            .locks()
+            .encryption_state_deduplicated_handler
+            .run(self.room_id().to_owned(), async move {
+                // Request the event from the server.
+                let request = get_state_events_for_key::v3::Request::new(
+                    self.room_id().to_owned(),
+                    StateEventType::RoomEncryption,
+                    "".to_owned(),
+                );
+                let response = match self.client.send(request, None).await {
+                    Ok(response) => {
+                        Some(response.content.deserialize_as::<RoomEncryptionEventContent>()?)
+                    }
+                    Err(err) if err.client_api_error_kind() == Some(&ErrorKind::NotFound) => None,
+                    Err(err) => return Err(err.into()),
+                };
 
-        if let Some(mutex) = map.get(self.inner.room_id()).cloned() {
-            // If a encryption state request is already going on, await the release of
-            // the lock.
-            drop(map);
-            _ = mutex.lock().await;
-        } else {
-            let mutex = Arc::new(Mutex::new(()));
-            map.insert(self.inner.room_id().to_owned(), mutex.clone());
+                let _sync_lock = self.client.base_client().sync_lock().read().await;
 
-            let _guard = mutex.lock().await;
-            drop(map);
+                // Persist the event and the fact that we requested it from the server in
+                // `RoomInfo`.
+                let mut room_info = self.clone_info();
+                room_info.mark_encryption_state_synced();
+                room_info.set_encryption_event(response.clone());
+                let mut changes = StateChanges::default();
+                changes.add_room(room_info.clone());
 
-            // Request the event from the server.
-            let request = get_state_events_for_key::v3::Request::new(
-                self.inner.room_id().to_owned(),
-                StateEventType::RoomEncryption,
-                "".to_owned(),
-            );
-            let response = match self.client.send(request, None).await {
-                Ok(response) => {
-                    Some(response.content.deserialize_as::<RoomEncryptionEventContent>()?)
-                }
-                Err(err) if err.client_api_error_kind() == Some(&ErrorKind::NotFound) => None,
-                Err(err) => return Err(err.into()),
-            };
+                self.client.store().save_changes(&changes).await?;
+                self.update_summary(room_info);
 
-            let sync_lock = self.client.base_client().sync_lock().read().await;
-
-            // Persist the event and the fact that we requested it from the server in
-            // `RoomInfo`.
-            let mut room_info = self.inner.clone_info();
-            room_info.mark_encryption_state_synced();
-            room_info.set_encryption_event(response.clone());
-            let mut changes = StateChanges::default();
-            changes.add_room(room_info.clone());
-
-            self.client.store().save_changes(&changes).await?;
-            self.update_summary(room_info);
-
-            // Alright, we're done, release the locks and let the client send an event to
-            // the room.
-            drop(sync_lock);
-            self.client
-                .inner
-                .encryption_state_request_locks
-                .lock()
-                .await
-                .remove(self.inner.room_id());
-        }
-
-        Ok(())
+                Ok(())
+            })
+            .await
     }
 
     /// Check whether this room is encrypted. If the room encryption state is
@@ -496,15 +466,15 @@ impl Room {
     /// This method will de-duplicate requests if it is called multiple times in
     /// quick succession, in that case the return value will be `None`. This
     /// method does nothing if the members are already synced.
-    pub async fn sync_members(&self) -> Result<Option<MembersResponse>> {
+    pub async fn sync_members(&self) -> Result<()> {
         if !self.are_events_visible() {
-            return Ok(None);
+            return Ok(());
         }
 
         if !self.are_members_synced() {
             self.request_members().await
         } else {
-            Ok(None)
+            Ok(())
         }
     }
 
@@ -781,6 +751,81 @@ impl Room {
         K: AsRef<str> + ?Sized + Sync,
     {
         Ok(self.client.store().get_state_event_static_for_key(self.room_id(), state_key).await?)
+    }
+
+    /// Returns the parents this room advertises as its parents.
+    ///
+    /// Results are in no particular order.
+    pub async fn parent_spaces(&self) -> Result<impl Stream<Item = Result<ParentSpace>> + '_> {
+        // Implements this algorithm:
+        // https://spec.matrix.org/v1.8/client-server-api/#mspaceparent-relationships
+
+        // Get all m.room.parent events for this room
+        Ok(self
+            .get_state_events_static::<SpaceParentEventContent>()
+            .await?
+            .into_iter()
+            // Extract state key (ie. the parent's id) and sender
+            .flat_map(|parent_event| match parent_event.deserialize() {
+                Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(e))) => {
+                    Some((e.state_key.to_owned(), e.sender))
+                }
+                Ok(SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_))) => None,
+                Ok(SyncOrStrippedState::Stripped(e)) => Some((e.state_key.to_owned(), e.sender)),
+                Err(e) => {
+                    info!(room_id = ?self.room_id(), "Could not deserialize m.room.parent: {e}");
+                    None
+                }
+            })
+            // Check whether the parent recognizes this room as its child
+            .map(|(state_key, sender): (OwnedRoomId, OwnedUserId)| async move {
+                let Some(parent_room) = self.client.get_room(&state_key) else {
+                    // We are not in the room, cannot check if the relationship is reciprocal
+                    // TODO: try peeking into the room
+                    return Ok(ParentSpace::Unverifiable(state_key));
+                };
+                // Get the m.room.child state of the parent with this room's id
+                // as state key.
+                if let Some(child_event) = parent_room
+                    .get_state_event_static_for_key::<SpaceChildEventContent, _>(self.room_id())
+                    .await?
+                {
+                    match child_event.deserialize() {
+                        Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(_))) => {
+                            // There is a valid m.room.child in the parent pointing to
+                            // this room
+                            return Ok(ParentSpace::Reciprocal(parent_room));
+                        }
+                        Ok(SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_))) => {}
+                        Ok(SyncOrStrippedState::Stripped(_)) => {}
+                        Err(e) => {
+                            info!(
+                                room_id = ?self.room_id(), parent_room_id = ?state_key,
+                                "Could not deserialize m.room.child: {e}"
+                            );
+                        }
+                    }
+                    // Otherwise the event is either invalid or redacted. If
+                    // redacted it would be missing the
+                    // `via` key, thereby invalidating that end of the
+                    // relationship: https://spec.matrix.org/v1.8/client-server-api/#mspacechild
+                }
+
+                // No reciprocal m.room.child found, let's check if the sender has the
+                // power to set it
+                let Some(member) = parent_room.get_member(&sender).await? else {
+                    // Sender is not even in the parent room
+                    return Ok(ParentSpace::Illegitimate(parent_room));
+                };
+
+                if member.can_send_state(StateEventType::SpaceChild) {
+                    // Sender does have the power to set m.room.child
+                    Ok(ParentSpace::WithPowerlevel(parent_room))
+                } else {
+                    Ok(ParentSpace::Illegitimate(parent_room))
+                }
+            })
+            .collect::<FuturesUnordered<_>>())
     }
 
     /// Get account data in this room.
@@ -1075,24 +1120,24 @@ impl Room {
         self.ensure_room_joined()?;
 
         // Only send a request to the homeserver if the old timeout has elapsed
-        // or the typing notice changed state within the
-        // TYPING_NOTICE_TIMEOUT
-        let send =
-            if let Some(typing_time) = self.client.inner.typing_notice_times.get(self.room_id()) {
-                if typing_time.elapsed() > TYPING_NOTICE_RESEND_TIMEOUT {
-                    // We always reactivate the typing notice if typing is true or
-                    // we may need to deactivate it if it's
-                    // currently active if typing is false
-                    typing || typing_time.elapsed() <= TYPING_NOTICE_TIMEOUT
-                } else {
-                    // Only send a request when we need to deactivate typing
-                    !typing
-                }
+        // or the typing notice changed state within the `TYPING_NOTICE_TIMEOUT`
+        let send = if let Some(typing_time) =
+            self.client.inner.typing_notice_times.read().unwrap().get(self.room_id())
+        {
+            if typing_time.elapsed() > TYPING_NOTICE_RESEND_TIMEOUT {
+                // We always reactivate the typing notice if typing is true or
+                // we may need to deactivate it if it's
+                // currently active if typing is false
+                typing || typing_time.elapsed() <= TYPING_NOTICE_TIMEOUT
             } else {
-                // Typing notice is currently deactivated, therefore, send a request
-                // only when it's about to be activated
-                typing
-            };
+                // Only send a request when we need to deactivate typing
+                !typing
+            }
+        } else {
+            // Typing notice is currently deactivated, therefore, send a request
+            // only when it's about to be activated
+            typing
+        };
 
         if send {
             self.send_typing_notice(typing).await?;
@@ -1104,10 +1149,15 @@ impl Room {
     #[instrument(name = "typing_notice", skip(self))]
     async fn send_typing_notice(&self, typing: bool) -> Result<()> {
         let typing = if typing {
-            self.client.inner.typing_notice_times.insert(self.room_id().to_owned(), Instant::now());
+            self.client
+                .inner
+                .typing_notice_times
+                .write()
+                .unwrap()
+                .insert(self.room_id().to_owned(), Instant::now());
             Typing::Yes(TYPING_NOTICE_TIMEOUT)
         } else {
-            self.client.inner.typing_notice_times.remove(self.room_id());
+            self.client.inner.typing_notice_times.write().unwrap().remove(self.room_id());
             Typing::No
         };
 
@@ -1220,7 +1270,7 @@ impl Room {
             // TODO do we want to return an error here if we time out? This
             // could be quite useful if someone wants to enable encryption and
             // send a message right after it's enabled.
-            self.client.inner.sync_beat.listen().wait_timeout(SYNC_WAIT_TIME);
+            _ = timeout(self.client.inner.sync_beat.listen(), SYNC_WAIT_TIME).await;
         }
 
         Ok(())
@@ -1239,24 +1289,13 @@ impl Room {
     async fn preshare_room_key(&self) -> Result<()> {
         self.ensure_room_joined()?;
 
-        let inner = || async {
-            let mut map = self.client.inner.group_session_locks.lock().await;
+        // Take and release the lock on the store, if needs be.
+        let _guard = self.client.encryption().spin_lock_store(Some(60000)).await?;
 
-            if let Some(mutex) = map.get(self.room_id()).cloned() {
-                // If a group session share request is already going on, await the
-                // release of the lock.
-                drop(map);
-                _ = mutex.lock().await;
-            } else {
-                // Otherwise create a new lock and share the group
-                // session.
-                let mutex = Arc::new(Mutex::new(()));
-                map.insert(self.room_id().to_owned(), mutex.clone());
-
-                drop(map);
-
-                let _guard = mutex.lock().await;
-
+        self.client
+            .locks()
+            .group_session_deduplicated_handler
+            .run(self.room_id().to_owned(), async move {
                 {
                     let members = self
                         .client
@@ -1268,8 +1307,6 @@ impl Room {
 
                 let response = self.share_room_key().await;
 
-                self.client.inner.group_session_locks.lock().await.remove(self.room_id());
-
                 // If one of the responses failed invalidate the group
                 // session as using it would end up in undecryptable
                 // messages.
@@ -1280,15 +1317,10 @@ impl Room {
                     }
                     return Err(r);
                 }
-            }
 
-            Ok(())
-        };
-
-        // Take and release the lock on the store, if needs be.
-        let _guard = self.client.encryption().spin_lock_store(Some(60000)).await?;
-
-        inner().await
+                Ok(())
+            })
+            .await
     }
 
     /// Share a group session for a room.
@@ -1328,32 +1360,24 @@ impl Room {
         }
     }
 
-    /// Send a room message to this room.
+    /// Send a message-like event to this room.
     ///
     /// Returns the parsed response from the server.
     ///
     /// If the encryption feature is enabled this method will transparently
-    /// encrypt the room message if this room is encrypted.
+    /// encrypt the event if this room is encrypted (except for `m.reaction`
+    /// events, which are never encrypted).
     ///
-    /// **Note**: If you just want to send a custom JSON payload to a room, you
-    /// can use the [`send_raw()`][Self::send_raw] method for that.
+    /// **Note**: If you just want to send an event with custom JSON content to
+    /// a room, you can use the [`send_raw()`][Self::send_raw] method for that.
+    ///
+    /// If you want to set a transaction ID for the event, use
+    /// [`.with_transaction_id()`][SendMessageLikeEvent::with_transaction_id]
+    /// on the returned value before `.await`ing it.
     ///
     /// # Arguments
     ///
     /// * `content` - The content of the message event.
-    ///
-    /// * `txn_id` - A locally-unique ID describing a message transaction with
-    ///   the homeserver. Unless you're doing something special, you can pass in
-    ///   `None` which will create a suitable one for you automatically.
-    ///     * On the sending side, this field is used for re-trying earlier
-    ///       failed transactions. Subsequent messages *must never* re-use an
-    ///       earlier transaction ID.
-    ///     * On the receiving side, the field is used for recognizing our own
-    ///       messages when they arrive down the sync: the server includes the
-    ///       ID in the [`MessageLikeUnsigned`] field [`transaction_id`] of the
-    ///       corresponding [`SyncMessageLikeEvent`], but only for the *sending*
-    ///       device. Other devices will not see it. This is then used to ignore
-    ///       events sent by our own device and/or to implement local echo.
     ///
     /// # Examples
     ///
@@ -1379,7 +1403,7 @@ impl Room {
     /// let txn_id = TransactionId::new();
     ///
     /// if let Some(room) = client.get_room(&room_id) {
-    ///     room.send(content, Some(&txn_id)).await?;
+    ///     room.send(content).with_transaction_id(&txn_id).await?;
     /// }
     ///
     /// // Custom events work too:
@@ -1399,26 +1423,14 @@ impl Room {
     ///         MilliSecondsSinceUnixEpoch(now.0 + uint!(30_000))
     ///     },
     /// };
-    /// let txn_id = TransactionId::new();
     ///
     /// if let Some(room) = client.get_room(&room_id) {
-    ///     room.send(content, Some(&txn_id)).await?;
+    ///     room.send(content).await?;
     /// }
     /// # anyhow::Ok(()) };
     /// ```
-    ///
-    /// [`SyncMessageLikeEvent`]: ruma::events::SyncMessageLikeEvent
-    /// [`MessageLikeUnsigned`]: ruma::events::MessageLikeUnsigned
-    /// [`transaction_id`]: ruma::events::MessageLikeUnsigned#structfield.transaction_id
-    pub async fn send(
-        &self,
-        content: impl MessageLikeEventContent,
-        txn_id: Option<&TransactionId>,
-    ) -> Result<send_message_event::v3::Response> {
-        let event_type = content.event_type().to_string();
-        let content = serde_json::to_value(&content)?;
-
-        self.send_raw(content, &event_type, txn_id).await
+    pub fn send(&self, content: impl MessageLikeEventContent) -> SendMessageLikeEvent<'_> {
+        SendMessageLikeEvent::new(self, content)
     }
 
     /// Run /keys/query requests for all the non-tracked users.
@@ -1448,39 +1460,37 @@ impl Room {
         let (req_id, request) =
             olm.query_keys_for_users(members_with_unknown_devices.map(|owned| owned.borrow()));
 
-        self.client.keys_query(&req_id, request.device_keys).await?;
+        if !request.device_keys.is_empty() {
+            self.client.keys_query(&req_id, request.device_keys).await?;
+        }
+
         Ok(())
     }
 
-    /// Send a room message to this room from a json `Value`.
+    /// Send a message-like event with custom JSON content to this room.
     ///
     /// Returns the parsed response from the server.
     ///
     /// If the encryption feature is enabled this method will transparently
-    /// encrypt the room message if this room is encrypted.
+    /// encrypt the event if this room is encrypted (except for `m.reaction`
+    /// events, which are never encrypted).
     ///
     /// This method is equivalent to the [`send()`][Self::send] method but
     /// allows sending custom JSON payloads, e.g. constructed using the
     /// [`serde_json::json!()`] macro.
     ///
-    /// # Arguments
+    /// If you want to set a transaction ID for the event, use
+    /// [`.with_transaction_id()`][SendRawMessageLikeEvent::with_transaction_id]
+    /// on the returned value before `.await`ing it.
     ///
-    /// * `content` - The content of the event as a json `Value`.
+    /// # Arguments
     ///
     /// * `event_type` - The type of the event.
     ///
-    /// * `txn_id` - A locally-unique ID describing a message transaction with
-    ///   the homeserver. Unless you're doing something special, you can pass in
-    ///   `None` which will create a suitable one for you automatically.
-    ///     * On the sending side, this field is used for re-trying earlier
-    ///       failed transactions. Subsequent messages *must never* re-use an
-    ///       earlier transaction ID.
-    ///     * On the receiving side, the field is used for recognizing our own
-    ///       messages when they arrive down the sync: the server includes the
-    ///       ID in the [`StateUnsigned`] field [`transaction_id`] of the
-    ///       corresponding [`SyncMessageLikeEvent`], but only for the *sending*
-    ///       device. Other devices will not see it. This is then used to ignore
-    ///       events sent by our own device and/or to implement local echo.
+    /// * `content` - The content of the event as a raw JSON value. The argument
+    ///   type can be `serde_json::Value`, but also other raw JSON types; for
+    ///   the full list check the documentation of
+    ///   [`IntoRawMessageLikeEventContent`].
     ///
     /// # Examples
     ///
@@ -1495,92 +1505,18 @@ impl Room {
     /// # let room_id = room_id!("!test:localhost");
     /// use serde_json::json;
     ///
-    /// let content = json!({
-    ///     "body": "Hello world",
-    /// });
-    ///
     /// if let Some(room) = client.get_room(&room_id) {
-    ///     room.send_raw(content, "m.room.message", None).await?;
+    ///     room.send_raw("m.room.message", json!({ "body": "Hello world" })).await?;
     /// }
     /// # anyhow::Ok(()) };
     /// ```
-    ///
-    /// [`SyncMessageLikeEvent`]: ruma::events::SyncMessageLikeEvent
-    /// [`StateUnsigned`]: ruma::events::StateUnsigned
-    /// [`transaction_id`]: ruma::events::StateUnsigned#structfield.transaction_id
-    #[instrument(skip_all, fields(event_type, room_id = %self.room_id(), transaction_id, encrypted))]
-    pub async fn send_raw(
-        &self,
-        content: serde_json::Value,
-        event_type: &str,
-        txn_id: Option<&TransactionId>,
-    ) -> Result<send_message_event::v3::Response> {
-        self.ensure_room_joined()?;
-
-        let txn_id: OwnedTransactionId = txn_id.map_or_else(TransactionId::new, ToOwned::to_owned);
-        tracing::Span::current().record("transaction_id", tracing::field::debug(&txn_id));
-
-        #[cfg(not(feature = "e2e-encryption"))]
-        let content = {
-            debug!(
-                room_id = ?self.room_id(),
-                "Sending plaintext event to room because we don't have encryption support.",
-            );
-            Raw::new(&content)?.cast()
-        };
-
-        #[cfg(feature = "e2e-encryption")]
-        let (content, event_type) = if self.is_encrypted().await? {
-            tracing::Span::current().record("encrypted", tracing::field::debug(&txn_id));
-            // Reactions are currently famously not encrypted, skip encrypting
-            // them until they are.
-            if event_type == "m.reaction" {
-                debug!(
-                    room_id = ?self.room_id(),
-                    "Sending plaintext event because the event type is {event_type}",
-                );
-                (Raw::new(&content)?.cast(), event_type)
-            } else {
-                debug!(
-                    room_id = self.room_id().as_str(),
-                    "Sending encrypted event because the room is encrypted.",
-                );
-
-                if !self.are_members_synced() {
-                    self.sync_members().await?;
-
-                    // Query keys in case we don't have them for newly synced members.
-                    self.query_keys_for_untracked_users().await?;
-                }
-
-                self.preshare_room_key().await?;
-
-                let olm = self.client.olm_machine().await;
-                let olm = olm.as_ref().expect("Olm machine wasn't started");
-
-                let encrypted_content =
-                    olm.encrypt_room_event_raw(self.room_id(), content, event_type).await?;
-
-                (encrypted_content.cast(), "m.room.encrypted")
-            }
-        } else {
-            debug!(
-                room_id = ?self.room_id(),
-                "Sending plaintext event because the room is NOT encrypted.",
-            );
-
-            (Raw::new(&content)?.cast(), event_type)
-        };
-
-        let request = send_message_event::v3::Request::new_raw(
-            self.room_id().to_owned(),
-            txn_id,
-            event_type.into(),
-            content,
-        );
-
-        let response = self.client.send(request, None).await?;
-        Ok(response)
+    #[instrument(skip_all, fields(event_type, room_id = ?self.room_id(), transaction_id, encrypted))]
+    pub fn send_raw<'a>(
+        &'a self,
+        event_type: &'a str,
+        content: impl IntoRawMessageLikeEventContent,
+    ) -> SendRawMessageLikeEvent<'a> {
+        SendRawMessageLikeEvent::new(self, event_type, content)
     }
 
     /// Send an attachment to this room.
@@ -1714,7 +1650,11 @@ impl Room {
             )
             .await?;
 
-        self.send(RoomMessageEventContent::new(content), config.txn_id.as_deref()).await
+        let mut fut = self.send(RoomMessageEventContent::new(content));
+        if let Some(txn_id) = &config.txn_id {
+            fut = fut.with_transaction_id(txn_id);
+        }
+        fut.await
     }
 
     /// Update the power levels of a select set of users of this room.
@@ -1752,7 +1692,7 @@ impl Room {
     }
 
     /// Sets the name of this room.
-    pub async fn set_name(&self, name: Option<String>) -> Result<send_state_event::v3::Response> {
+    pub async fn set_name(&self, name: String) -> Result<send_state_event::v3::Response> {
         self.send_state_event(RoomNameEventContent::new(name)).await
     }
 
@@ -1922,12 +1862,14 @@ impl Room {
     ///
     /// # Arguments
     ///
-    /// * `content` - The raw content of the state event.
-    ///
     /// * `event_type` - The type of the event that we're sending out.
     ///
     /// * `state_key` - A unique key which defines the overwriting semantics for
     /// this piece of room state. This value is often a zero-length string.
+    ///
+    /// * `content` - The content of the event as a raw JSON value. The argument
+    ///   type can be `serde_json::Value`, but also other raw JSON types; for
+    ///   the full list check the documentation of [`IntoRawStateEventContent`].
     ///
     /// # Examples
     ///
@@ -1938,32 +1880,30 @@ impl Room {
     /// # let homeserver = url::Url::parse("http://localhost:8080")?;
     /// # let mut client = matrix_sdk::Client::new(homeserver).await?;
     /// # let room_id = matrix_sdk::ruma::room_id!("!test:localhost");
-    /// let content = json!({
-    ///     "avatar_url": "mxc://example.org/SEsfnsuifSDFSSEF",
-    ///     "displayname": "Alice Margatroid",
-    ///     "membership": "join"
-    /// });
     ///
     /// if let Some(room) = client.get_room(&room_id) {
-    ///     room.send_state_event_raw(content, "m.room.member", "").await?;
+    ///     room.send_state_event_raw("m.room.member", "", json!({
+    ///         "avatar_url": "mxc://example.org/SEsfnsuifSDFSSEF",
+    ///         "displayname": "Alice Margatroid",
+    ///         "membership": "join",
+    ///     })).await?;
     /// }
     /// # anyhow::Ok(()) };
     /// ```
     #[instrument(skip_all)]
     pub async fn send_state_event_raw(
         &self,
-        content: serde_json::Value,
         event_type: &str,
         state_key: &str,
+        content: impl IntoRawStateEventContent,
     ) -> Result<send_state_event::v3::Response> {
         self.ensure_room_joined()?;
 
-        let content = Raw::new(&content)?.cast();
         let request = send_state_event::v3::Request::new_raw(
             self.room_id().to_owned(),
             event_type.into(),
             state_key.to_owned(),
-            content,
+            content.into_raw_state_event_content(),
         );
 
         Ok(self.client.send(request, None).await?)
@@ -2387,6 +2327,17 @@ impl Room {
             None
         }
     }
+
+    /// Get the user-defined notification mode
+    pub async fn user_defined_notification_mode(&self) -> Option<RoomNotificationMode> {
+        if !matches!(self.state(), RoomState::Joined) {
+            return None;
+        }
+        let notification_settings = self.client().notification_settings().await;
+
+        // Get the user-defined mode if available
+        notification_settings.get_user_defined_room_notification_mode(self.room_id()).await
+    }
 }
 
 /// Details of the (latest) invite.
@@ -2461,6 +2412,26 @@ impl Receipts {
     }
 }
 
+/// [Parent space](https://spec.matrix.org/v1.8/client-server-api/#mspaceparent-relationships)
+/// listed by a room, possibly validated by checking the space's state.
+#[derive(Debug)]
+pub enum ParentSpace {
+    /// The room recognizes the given room as its parent, and the parent
+    /// recognizes it as its child.
+    Reciprocal(Room),
+    /// The room recognizes the given room as its parent, but the parent does
+    /// not recognizes it as its child. However, the author of the
+    /// `m.room.parent` event in the room has a sufficient power level in the
+    /// parent to create the child event.
+    WithPowerlevel(Room),
+    /// The room recognizes the given room as its parent, but the parent does
+    /// not recognizes it as its child.
+    Illegitimate(Room),
+    /// The room recognizes the given id as its parent room, but we cannot check
+    /// whether the parent recognizes it as its child.
+    Unverifiable(OwnedRoomId),
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use matrix_sdk_base::SessionMeta;
@@ -2475,20 +2446,22 @@ mod tests {
 
     use crate::{
         config::RequestConfig,
-        matrix_auth::{Session, SessionTokens},
+        matrix_auth::{MatrixSession, MatrixSessionTokens},
         Client,
     };
 
     #[cfg(all(feature = "sqlite", feature = "e2e-encryption"))]
     #[async_test]
     async fn test_cache_invalidation_while_encrypt() {
+        use matrix_sdk_test::{message_like_event_content, DEFAULT_TEST_ROOM_ID};
+
         let sqlite_path = std::env::temp_dir().join("cache_invalidation_while_encrypt.db");
-        let session = Session {
+        let session = MatrixSession {
             meta: SessionMeta {
                 user_id: user_id!("@example:localhost").to_owned(),
                 device_id: device_id!("DEVICEID").to_owned(),
             },
-            tokens: SessionTokens { access_token: "1234".to_owned(), refresh_token: None },
+            tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
         };
 
         let client = Client::builder()
@@ -2504,7 +2477,6 @@ mod tests {
 
         // Mock receiving an event to create an internal room.
         let server = MockServer::start().await;
-        let room_id = &test_json::DEFAULT_SYNC_ROOM_ID;
         {
             Mock::given(method("GET"))
                 .and(path_regex(r"^/_matrix/client/r0/rooms/.*/state/m.*room.*encryption.?"))
@@ -2526,7 +2498,7 @@ mod tests {
             client.base_client().receive_sync_response(response).await.unwrap();
         }
 
-        let room = client.get_room(room_id).expect("Room should exist");
+        let room = client.get_room(&DEFAULT_TEST_ROOM_ID).expect("Room should exist");
 
         // Step 1, preshare the room keys.
         room.preshare_room_key().await.unwrap();
@@ -2563,7 +2535,7 @@ mod tests {
         // Now pretend we're encrypting an event; the olm machine shouldn't rely on
         // caching the outgoing session before.
         let _encrypted_content = olm
-            .encrypt_room_event_raw(room.room_id(), serde_json::json!({}), "test-event")
+            .encrypt_room_event_raw(room.room_id(), "test-event", &message_like_event_content!({}))
             .await
             .unwrap();
     }

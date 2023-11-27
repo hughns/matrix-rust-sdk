@@ -2,16 +2,16 @@ use std::ops::Deref;
 
 use futures_core::Stream;
 use futures_util::StreamExt;
-use matrix_sdk_common::NoisyArc;
+use matrix_sdk_common::{store_locks::CrossProcessStoreLock, NoisyArc};
 use ruma::{OwnedUserId, UserId};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tracing::warn;
 
-use super::{DeviceChanges, IdentityChanges};
+use super::{DeviceChanges, IdentityChanges, LockableCryptoStore};
 use crate::{
     store,
-    store::{locks::CryptoStoreLock, Changes, DynCryptoStore, IntoCryptoStore, RoomKeyInfo},
+    store::{Changes, DynCryptoStore, IntoCryptoStore, RoomKeyInfo},
     GossippedSecret, ReadOnlyOwnUserIdentity,
 };
 
@@ -161,11 +161,16 @@ impl CryptoStoreWrapper {
         })
     }
 
-    /// Creates a `CryptoStoreLock` for this store, that will contain the given
-    /// key and value when held.
-    pub fn create_store_lock(&self, lock_key: String, lock_value: String) -> CryptoStoreLock {
+    /// Creates a `CrossProcessStoreLock` for this store, that will contain the
+    /// given key and value when hold.
+    pub(crate) fn create_store_lock(
+        &self,
+        lock_key: String,
+        lock_value: String,
+    ) -> CrossProcessStoreLock<LockableCryptoStore> {
         panic!("Store.create_store_lock");
-        // CryptoStoreLock::new(self.store.clone(), lock_key, lock_value)
+        //CrossProcessStoreLock::new(LockableCryptoStore(self.store.clone()),
+        // lock_key, lock_value)
     }
 }
 

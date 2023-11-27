@@ -14,7 +14,8 @@
 
 use std::sync::Arc;
 
-use eyeball_im::{ObservableVector, ObservableVectorEntry};
+use as_variant::as_variant;
+use eyeball_im::{ObservableVectorTransaction, ObservableVectorTransactionEntry};
 use indexmap::{map::Entry, IndexMap};
 use matrix_sdk::deserialized_responses::EncryptionInfo;
 use ruma::{
@@ -23,7 +24,8 @@ use ruma::{
             unstable_end::UnstablePollEndEventContent,
             unstable_response::UnstablePollResponseEventContent,
             unstable_start::{
-                UnstablePollStartEventContent, UnstablePollStartEventContentWithoutRelation,
+                NewUnstablePollStartEventContent, NewUnstablePollStartEventContentWithoutRelation,
+                UnstablePollStartEventContent,
             },
         },
         reaction::ReactionEventContent,
@@ -52,14 +54,14 @@ use super::{
         EventTimelineItemKind, LocalEventTimelineItem, Profile, RemoteEventOrigin,
         RemoteEventTimelineItem,
     },
+    inner::{TimelineInnerMetadata, TimelineInnerStateTransaction},
     item::timeline_item,
-    read_receipts::maybe_add_implicit_read_receipt,
-    util::{find_read_marker, rfind_event_by_id, rfind_event_item, timestamp_to_date},
+    polls::PollState,
+    util::{rfind_event_by_id, rfind_event_item, timestamp_to_date},
     EventTimelineItem, InReplyToDetails, Message, OtherState, ReactionGroup, ReactionSenderData,
-    Sticker, TimelineDetails, TimelineInnerState, TimelineItem, TimelineItemContent,
-    VirtualTimelineItem, DEFAULT_SANITIZER_MODE,
+    Sticker, TimelineDetails, TimelineItem, TimelineItemContent, VirtualTimelineItem,
 };
-use crate::{events::SyncTimelineEventWithoutContent, timeline::polls::PollState};
+use crate::{events::SyncTimelineEventWithoutContent, DEFAULT_SANITIZER_MODE};
 
 #[derive(Clone)]
 pub(super) enum Flow {
@@ -194,7 +196,7 @@ impl TimelineEventKind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum TimelineItemPosition {
     Start,
     End {
@@ -217,10 +219,10 @@ pub(super) struct HandleEventResult {
 // of handling an event (figuring out whether it should update an existing
 // timeline item, transforming that item or creating a new one, updating the
 // reactive Vec).
-pub(super) struct TimelineEventHandler<'a> {
-    state: &'a mut TimelineInnerState,
+pub(super) struct TimelineEventHandler<'a, 'o> {
+    items: &'a mut ObservableVectorTransaction<'o, Arc<TimelineItem>>,
+    meta: &'a mut TimelineInnerMetadata,
     ctx: TimelineEventContext,
-    track_read_receipts: bool,
     result: HandleEventResult,
 }
 
@@ -230,7 +232,7 @@ pub(super) struct TimelineEventHandler<'a> {
 macro_rules! update_timeline_item {
     ($this:ident, $event_id:expr, found: $found:expr, not_found: $not_found:expr) => {
         _update_timeline_item(
-            &mut $this.state.items,
+            &mut $this.items,
             &mut $this.result.items_updated,
             $event_id,
             $found,
@@ -244,13 +246,13 @@ macro_rules! update_timeline_item {
     };
 }
 
-impl<'a> TimelineEventHandler<'a> {
+impl<'a, 'o> TimelineEventHandler<'a, 'o> {
     pub(super) fn new(
-        state: &'a mut TimelineInnerState,
+        state: &'a mut TimelineInnerStateTransaction<'o>,
         ctx: TimelineEventContext,
-        track_read_receipts: bool,
     ) -> Self {
-        Self { state, ctx, track_read_receipts, result: HandleEventResult::default() }
+        let TimelineInnerStateTransaction { items, meta } = state;
+        Self { items, meta, ctx, result: HandleEventResult::default() }
     }
 
     /// Handle an event.
@@ -263,6 +265,7 @@ impl<'a> TimelineEventHandler<'a> {
         let should_add = match &self.ctx.flow {
             Flow::Local { txn_id, .. } => {
                 span.record("txn_id", debug(txn_id));
+                debug!("Handling local event");
 
                 true
             }
@@ -270,16 +273,14 @@ impl<'a> TimelineEventHandler<'a> {
             Flow::Remote { event_id, txn_id, position, should_add, .. } => {
                 span.record("event_id", debug(event_id));
                 span.record("position", debug(position));
-
                 if let Some(txn_id) = txn_id {
                     span.record("txn_id", debug(txn_id));
                 }
+                trace!("Handling remote event");
 
                 *should_add
             }
         };
-
-        trace!("Handling event");
 
         match event_kind {
             TimelineEventKind::Message { content, relations } => match content {
@@ -293,22 +294,18 @@ impl<'a> TimelineEventHandler<'a> {
                     self.handle_room_message_edit(re);
                 }
                 AnyMessageLikeEventContent::RoomMessage(c) => {
-                    self.add(
-                        should_add,
-                        TimelineItemContent::message(c, relations, &self.state.items),
-                    );
+                    self.add(should_add, TimelineItemContent::message(c, relations, self.items));
                 }
                 AnyMessageLikeEventContent::RoomEncrypted(c) => self.handle_room_encrypted(c),
                 AnyMessageLikeEventContent::Sticker(content) => {
                     self.add(should_add, TimelineItemContent::Sticker(Sticker { content }));
                 }
-                AnyMessageLikeEventContent::UnstablePollStart(UnstablePollStartEventContent {
-                    relates_to: Some(message::Relation::Replacement(re)),
-                    ..
-                }) => self.handle_poll_start_edit(re),
-                AnyMessageLikeEventContent::UnstablePollStart(c) => {
-                    self.handle_poll_start(c, should_add)
-                }
+                AnyMessageLikeEventContent::UnstablePollStart(
+                    UnstablePollStartEventContent::Replacement(c),
+                ) => self.handle_poll_start_edit(c.relates_to),
+                AnyMessageLikeEventContent::UnstablePollStart(
+                    UnstablePollStartEventContent::New(c),
+                ) => self.handle_poll_start(c, should_add),
                 AnyMessageLikeEventContent::UnstablePollResponse(c) => self.handle_poll_response(c),
                 AnyMessageLikeEventContent::UnstablePollEnd(c) => self.handle_poll_end(c),
                 // TODO
@@ -368,7 +365,7 @@ impl<'a> TimelineEventHandler<'a> {
                 // If add was not called, that means the UTD event is one that
                 // wouldn't normally be visible. Remove it.
                 trace!("Removing UTD that was successfully retried");
-                self.state.items.remove(idx);
+                self.items.remove(idx);
                 self.result.item_removed = true;
             }
 
@@ -392,35 +389,12 @@ impl<'a> TimelineEventHandler<'a> {
                 return None;
             }
 
-            let msg = match &event_item.content() {
-                TimelineItemContent::Message(msg) => msg,
-                TimelineItemContent::RedactedMessage => {
-                    info!("Edit event applies to a redacted message, discarding");
-                    return None;
-                }
-                TimelineItemContent::Sticker(_) => {
-                    info!("Edit event applies to a sticker, discarding");
-                    return None;
-                }
-                TimelineItemContent::Poll(_) => {
-                    info!("Edit event applies to a poll, discarding");
-                    return None;
-                }
-                TimelineItemContent::UnableToDecrypt(_) => {
-                    info!("Edit event applies to event that couldn't be decrypted, discarding");
-                    return None;
-                }
-                TimelineItemContent::MembershipChange(_)
-                | TimelineItemContent::ProfileChange(_)
-                | TimelineItemContent::OtherState { .. } => {
-                    info!("Edit event applies to a state event, discarding");
-                    return None;
-                }
-                TimelineItemContent::FailedToParseMessageLike { .. }
-                | TimelineItemContent::FailedToParseState { .. } => {
-                    info!("Edit event applies to event that couldn't be parsed, discarding");
-                    return None;
-                }
+            let TimelineItemContent::Message(msg) = event_item.content() else {
+                info!(
+                    "Edit of message event applies to {}, discarding",
+                    event_item.content().debug_string(),
+                );
+                return None;
             };
 
             let mut msgtype = replacement.new_content.msgtype;
@@ -430,6 +404,7 @@ impl<'a> TimelineEventHandler<'a> {
             let new_content = TimelineItemContent::Message(Message {
                 msgtype,
                 in_reply_to: msg.in_reply_to.clone(),
+                thread_root: msg.thread_root.clone(),
                 edited: true,
             });
 
@@ -456,7 +431,7 @@ impl<'a> TimelineEventHandler<'a> {
             }
         };
 
-        if let Some((idx, event_item)) = rfind_event_by_id(&self.state.items, event_id) {
+        if let Some((idx, event_item)) = rfind_event_by_id(self.items, event_id) {
             let Some(remote_event_item) = event_item.as_remote() else {
                 error!("inconsistent state: reaction received on a non-remote event item");
                 return;
@@ -490,7 +465,7 @@ impl<'a> TimelineEventHandler<'a> {
                 );
 
                 trace!("Adding reaction");
-                self.state.items.set(
+                self.items.set(
                     idx,
                     event_item.with_inner_kind(remote_event_item.with_reactions(reactions)),
                 );
@@ -503,7 +478,7 @@ impl<'a> TimelineEventHandler<'a> {
                 return;
             };
 
-            let pending = self.state.reactions.pending.entry(event_id.to_owned()).or_default();
+            let pending = self.meta.reactions.pending.entry(event_id.to_owned()).or_default();
 
             pending.insert(reaction_event_id);
         }
@@ -511,7 +486,7 @@ impl<'a> TimelineEventHandler<'a> {
         if let Flow::Remote { txn_id: Some(txn_id), .. } = &self.ctx.flow {
             let id = EventItemIdentifier::TransactionId(txn_id.clone());
             // Remove the local echo from the reaction map.
-            if self.state.reactions.map.remove(&id).is_none() {
+            if self.meta.reactions.map.remove(&id).is_none() {
                 warn!(
                     "Received reaction with transaction ID, but didn't \
                      find matching reaction in reaction_map"
@@ -522,13 +497,13 @@ impl<'a> TimelineEventHandler<'a> {
             sender_id: self.ctx.sender.clone(),
             timestamp: self.ctx.timestamp,
         };
-        self.state.reactions.map.insert(reaction_id, (reaction_sender_data, c.relates_to));
+        self.meta.reactions.map.insert(reaction_id, (reaction_sender_data, c.relates_to));
     }
 
     #[instrument(skip_all, fields(replacement_event_id = ?replacement.event_id))]
     fn handle_poll_start_edit(
         &mut self,
-        replacement: Replacement<UnstablePollStartEventContentWithoutRelation>,
+        replacement: Replacement<NewUnstablePollStartEventContentWithoutRelation>,
     ) {
         update_timeline_item!(self, &replacement.event_id, "poll edit", |event_item| {
             if self.ctx.sender != event_item.sender() {
@@ -541,8 +516,8 @@ impl<'a> TimelineEventHandler<'a> {
 
             let TimelineItemContent::Poll(poll_state) = &event_item.content() else {
                 info!(
-                    original_sender = ?event_item.sender(), edit_sender = ?self.ctx.sender,
-                    "Can't edit a poll that is not of type TimelineItemContent::Poll, discarding"
+                    "Edit of poll event applies to {}, discarding",
+                    event_item.content().debug_string(),
                 );
                 return None;
             };
@@ -550,10 +525,7 @@ impl<'a> TimelineEventHandler<'a> {
             let new_content = match poll_state.edit(&replacement.new_content) {
                 Ok(edited_poll_state) => TimelineItemContent::Poll(edited_poll_state),
                 Err(e) => {
-                    info!(
-                        original_sender = ?event_item.sender(), edit_sender = ?self.ctx.sender,
-                        "Failed to apply poll edit: {e:?}"
-                    );
+                    info!("Failed to apply poll edit: {e:?}");
                     return None;
                 }
             };
@@ -568,12 +540,12 @@ impl<'a> TimelineEventHandler<'a> {
         });
     }
 
-    fn handle_poll_start(&mut self, c: UnstablePollStartEventContent, should_add: bool) {
+    fn handle_poll_start(&mut self, c: NewUnstablePollStartEventContent, should_add: bool) {
         let mut poll_state = PollState::new(c);
         if let Flow::Remote { event_id, .. } = self.ctx.flow.clone() {
             // Applying the cache to remote events only because local echoes
             // don't have an event ID that could be referenced by responses yet.
-            self.state.poll_pending_events.apply(&event_id, &mut poll_state);
+            self.meta.poll_pending_events.apply(&event_id, &mut poll_state);
         }
         self.add(should_add, TimelineItemContent::Poll(poll_state));
     }
@@ -582,19 +554,19 @@ impl<'a> TimelineEventHandler<'a> {
         update_timeline_item!(
             self,
             &c.relates_to.event_id,
-            found: |event_item| match event_item.content() {
-                TimelineItemContent::Poll(poll_state) => Some(event_item.with_content(
+            found: |event_item| {
+                let poll_state = as_variant!(event_item.content(), TimelineItemContent::Poll)?;
+                Some(event_item.with_content(
                     TimelineItemContent::Poll(poll_state.add_response(
                         &self.ctx.sender,
                         self.ctx.timestamp,
                         &c,
                     )),
                     None,
-                )),
-                _ => None,
+                ))
             },
             not_found: || {
-                self.state.poll_pending_events.add_response(
+                self.meta.poll_pending_events.add_response(
                     &c.relates_to.event_id,
                     &self.ctx.sender,
                     self.ctx.timestamp,
@@ -608,20 +580,21 @@ impl<'a> TimelineEventHandler<'a> {
         update_timeline_item!(
             self,
             &c.relates_to.event_id,
-            found: |event_item| match event_item.content() {
-                TimelineItemContent::Poll(poll_state) => {
-                    match poll_state.end(self.ctx.timestamp) {
-                        Ok(poll_state) => Some(event_item.with_content(TimelineItemContent::Poll(poll_state), None)),
-                        Err(_) => {
-                            info!("Got multiple poll end events, discarding");
-                            None
-                        },
-                    }
-                },
-                _ => None,
+            found: |event_item| {
+                let poll_state = as_variant!(event_item.content(), TimelineItemContent::Poll)?;
+                match poll_state.end(self.ctx.timestamp) {
+                    Ok(poll_state) => Some(event_item.with_content(
+                        TimelineItemContent::Poll(poll_state),
+                        None
+                    )),
+                    Err(_) => {
+                        info!("Got multiple poll end events, discarding");
+                        None
+                    },
+                }
             },
             not_found: || {
-                self.state.poll_pending_events.add_end(&c.relates_to.event_id, self.ctx.timestamp);
+                self.meta.poll_pending_events.add_end(&c.relates_to.event_id, self.ctx.timestamp);
             }
         );
     }
@@ -639,7 +612,7 @@ impl<'a> TimelineEventHandler<'a> {
         // https://github.com/matrix-org/matrix-rust-sdk/pull/2381#issuecomment-1689647825
 
         let id = EventItemIdentifier::EventId(redacts.clone());
-        if let Some((_, rel)) = self.state.reactions.map.remove(&id) {
+        if let Some((_, rel)) = self.meta.reactions.map.remove(&id) {
             update_timeline_item!(self, &rel.event_id, "redaction", |event_item| {
                 let Some(remote_event_item) = event_item.as_remote() else {
                     error!("inconsistent state: redaction received on a non-remote event item");
@@ -674,7 +647,7 @@ impl<'a> TimelineEventHandler<'a> {
             });
 
             if self.result.items_updated == 0 {
-                if let Some(reactions) = self.state.reactions.pending.get_mut(&rel.event_id) {
+                if let Some(reactions) = self.meta.reactions.pending.get_mut(&rel.event_id) {
                     if !reactions.remove(&redacts.clone()) {
                         error!(
                             "inconsistent state: reaction from reaction_map not in reaction list \
@@ -703,7 +676,7 @@ impl<'a> TimelineEventHandler<'a> {
                 return None;
             }
 
-            Some(event_item.redact(&self.state.room_version))
+            Some(event_item.redact(&self.meta.room_version))
         });
 
         if self.result.items_updated == 0 {
@@ -711,13 +684,13 @@ impl<'a> TimelineEventHandler<'a> {
             debug!("redaction affected no event");
         }
 
-        self.state.items.for_each(|mut entry| {
+        self.items.for_each(|mut entry| {
             let Some(event_item) = entry.as_event() else { return };
             let Some(message) = event_item.content.as_message() else { return };
             let Some(in_reply_to) = message.in_reply_to() else { return };
             let TimelineDetails::Ready(replied_to_event) = &in_reply_to.event else { return };
             if redacts == in_reply_to.event_id {
-                let replied_to_event = replied_to_event.redact(&self.state.room_version);
+                let replied_to_event = replied_to_event.redact(&self.meta.room_version);
                 let in_reply_to = InReplyToDetails {
                     event_id: in_reply_to.event_id.clone(),
                     event: TimelineDetails::Ready(Box::new(replied_to_event)),
@@ -725,7 +698,7 @@ impl<'a> TimelineEventHandler<'a> {
                 let content = TimelineItemContent::Message(message.with_in_reply_to(in_reply_to));
                 let new_item = entry.with_kind(event_item.with_content(content, None));
 
-                ObservableVectorEntry::set(&mut entry, new_item);
+                ObservableVectorTransactionEntry::set(&mut entry, new_item);
             }
         });
     }
@@ -738,7 +711,7 @@ impl<'a> TimelineEventHandler<'a> {
         _content: RoomRedactionEventContent,
     ) {
         let id = EventItemIdentifier::TransactionId(redacts);
-        if let Some((_, rel)) = self.state.reactions.map.remove(&id) {
+        if let Some((_, rel)) = self.meta.reactions.map.remove(&id) {
             update_timeline_item!(self, &rel.event_id, "redaction", |event_item| {
                 let Some(remote_event_item) = event_item.as_remote() else {
                     error!("inconsistent state: redaction received on a non-remote event item");
@@ -808,7 +781,7 @@ impl<'a> TimelineEventHandler<'a> {
                     TimelineItemPosition::End { from_cache: true } => RemoteEventOrigin::Cache,
                     TimelineItemPosition::End { from_cache: false } => RemoteEventOrigin::Sync,
                     #[cfg(feature = "e2e-encryption")]
-                    TimelineItemPosition::Update(idx) => self.state.items[*idx]
+                    TimelineItemPosition::Update(idx) => self.items[*idx]
                         .as_event()
                         .and_then(|ev| Some(ev.as_remote()?.origin))
                         .unwrap_or_else(|| {
@@ -839,32 +812,30 @@ impl<'a> TimelineEventHandler<'a> {
                 trace!("Adding new local timeline item");
 
                 // Check if the latest event has the same date as this event.
-                if let Some(latest_event) =
-                    self.state.items.iter().rev().find_map(|item| item.as_event())
+                if let Some(latest_event) = self.items.iter().rev().find_map(|item| item.as_event())
                 {
                     let old_ts = latest_event.timestamp();
 
                     if let Some(day_divider_item) =
-                        self.state.maybe_create_day_divider_from_timestamps(old_ts, timestamp)
+                        self.meta.maybe_create_day_divider_from_timestamps(old_ts, timestamp)
                     {
                         trace!("Adding day divider (local)");
-                        self.state.items.push_back(day_divider_item);
+                        self.items.push_back(day_divider_item);
                     }
                 } else {
                     // If there is no event item, there is no day divider yet.
                     trace!("Adding first day divider (local)");
                     let day_divider =
-                        self.state.new_timeline_item(VirtualTimelineItem::DayDivider(timestamp));
-                    self.state.items.push_back(day_divider);
+                        self.meta.new_timeline_item(VirtualTimelineItem::DayDivider(timestamp));
+                    self.items.push_back(day_divider);
                 }
 
-                let item = self.state.new_timeline_item(item);
-                self.state.items.push_back(item);
+                let item = self.meta.new_timeline_item(item);
+                self.items.push_back(item);
             }
 
             Flow::Remote { position: TimelineItemPosition::Start, event_id, .. } => {
                 if self
-                    .state
                     .items
                     .iter()
                     .filter_map(|ev| ev.as_event()?.event_id())
@@ -878,38 +849,29 @@ impl<'a> TimelineEventHandler<'a> {
 
                 // Check if the earliest day divider has the same date as this event.
                 if let Some(VirtualTimelineItem::DayDivider(divider_ts)) =
-                    self.state.items.front().and_then(|item| item.as_virtual())
+                    self.items.front().and_then(|item| item.as_virtual())
                 {
+                    let divider_ts = *divider_ts;
                     if let Some(day_divider_item) =
-                        self.state.maybe_create_day_divider_from_timestamps(*divider_ts, timestamp)
+                        self.meta.maybe_create_day_divider_from_timestamps(divider_ts, timestamp)
                     {
-                        self.state.items.push_front(day_divider_item);
+                        self.items.push_front(day_divider_item);
                     }
                 } else {
                     // The list must always start with a day divider.
                     let day_divider =
-                        self.state.new_timeline_item(VirtualTimelineItem::DayDivider(timestamp));
-                    self.state.items.push_front(day_divider);
+                        self.meta.new_timeline_item(VirtualTimelineItem::DayDivider(timestamp));
+                    self.items.push_front(day_divider);
                 }
 
-                if self.track_read_receipts {
-                    maybe_add_implicit_read_receipt(
-                        0,
-                        &mut item,
-                        self.ctx.is_own_event,
-                        &mut self.state.items,
-                        &mut self.state.users_read_receipts,
-                    );
-                }
-
-                let item = self.state.new_timeline_item(item);
-                self.state.items.insert(1, item);
+                let item = self.meta.new_timeline_item(item);
+                self.items.insert(1, item);
             }
 
             Flow::Remote {
                 position: TimelineItemPosition::End { .. }, txn_id, event_id, ..
             } => {
-                let result = rfind_event_item(&self.state.items, |it| {
+                let result = rfind_event_item(self.items, |it| {
                     txn_id.is_some() && it.transaction_id() == txn_id.as_deref()
                         || it.event_id() == Some(event_id)
                 });
@@ -925,7 +887,7 @@ impl<'a> TimelineEventHandler<'a> {
 
                         if old_item.content.is_redacted() && !item.content.is_redacted() {
                             warn!("Got original form of an event that was previously redacted");
-                            item.content = item.content.redact(&self.state.room_version);
+                            item.content = item.content.redact(&self.meta.room_version);
                             item.as_remote_mut()
                                 .expect("Can't have a local item when flow == Remote")
                                 .reactions
@@ -940,31 +902,21 @@ impl<'a> TimelineEventHandler<'a> {
 
                     let old_item_id = old_item.internal_id;
 
-                    if idx == self.state.items.len() - 1
+                    if idx == self.items.len() - 1
                         && timestamp_to_date(old_item.timestamp()) == timestamp_to_date(timestamp)
                     {
                         // If the old item is the last one and no day divider
                         // changes need to happen, replace and return early.
 
-                        if self.track_read_receipts {
-                            maybe_add_implicit_read_receipt(
-                                idx,
-                                &mut item,
-                                self.ctx.is_own_event,
-                                &mut self.state.items,
-                                &mut self.state.users_read_receipts,
-                            );
-                        }
-
                         trace!(idx, "Replacing existing event");
-                        self.state.items.set(idx, timeline_item(item, old_item_id));
+                        self.items.set(idx, timeline_item(item, old_item_id));
                         return;
                     }
 
                     // In more complex cases, remove the item and day
                     // divider (if necessary) before re-adding the item.
                     trace!("Removing local echo or duplicate timeline item");
-                    removed_event_item_id = Some(self.state.items.remove(idx).internal_id);
+                    removed_event_item_id = Some(self.items.remove(idx).internal_id);
 
                     assert_ne!(
                         idx, 0,
@@ -974,16 +926,16 @@ impl<'a> TimelineEventHandler<'a> {
 
                     // Pre-requisites for removing the day divider:
                     // 1. there is one preceding the old item at all
-                    if self.state.items[idx - 1].is_day_divider()
+                    if self.items[idx - 1].is_day_divider()
                         // 2. the item after the old one that was removed is virtual (it should be
                         //    impossible for this to be a read marker)
-                        && self.state
+                        && self
                             .items
                             .get(idx)
                             .map_or(true, |item| item.is_virtual())
                     {
                         trace!("Removing day divider");
-                        removed_day_divider_id = Some(self.state.items.remove(idx - 1).internal_id);
+                        removed_day_divider_id = Some(self.items.remove(idx - 1).internal_id);
                     }
 
                     // no return here, below code for adding a new event
@@ -997,34 +949,26 @@ impl<'a> TimelineEventHandler<'a> {
 
                 // Local echoes that are pending should stick to the bottom,
                 // find the latest event that isn't that.
-                let mut latest_event_stream = self
-                    .state
+                let (latest_event_idx, latest_event) = self
                     .items
                     .iter()
                     .enumerate()
                     .rev()
-                    .filter_map(|(idx, item)| Some((idx, item.as_event()?)));
-
-                // Find the latest event, independently of success or failure status.
-                let latest_event = latest_event_stream.clone().next().unzip().1;
-
-                // Find the index of the latest non-failure event.
-                let latest_nonfailed_event_idx = latest_event_stream
-                    .find(|(_, evt)| {
+                    .filter_map(|(idx, item)| Some((idx, item.as_event()?)))
+                    .find(|(_, item)| {
                         !matches!(
-                            evt.send_state(),
+                            item.send_state(),
                             Some(EventSendState::NotSentYet | EventSendState::Sent { .. })
                         )
                     })
-                    .unzip()
-                    .0;
+                    .unzip();
 
-                // Insert the next item after the latest non-failed event item,
-                // or at the start if there is no such item.
-                let mut insert_idx = latest_nonfailed_event_idx.map_or(0, |idx| idx + 1);
+                // Insert the next item after the latest event item that's not a
+                // pending local echo, or at the start if there is no such item.
+                let mut insert_idx = latest_event_idx.map_or(0, |idx| idx + 1);
 
                 // Keep push semantics, if we're inserting at the end.
-                let should_push = insert_idx == self.state.items.len();
+                let should_push = insert_idx == self.items.len();
 
                 if let Some(latest_event) = latest_event {
                     // Check if that event has the same date as the new one.
@@ -1037,16 +981,16 @@ impl<'a> TimelineEventHandler<'a> {
                             // If a day divider was removed for an item about to be moved and we
                             // now need to add a new one, reuse the previous one's ID.
                             Some(day_divider_id) => day_divider_id,
-                            None => self.state.next_internal_id(),
+                            None => self.meta.next_internal_id(),
                         };
 
                         let day_divider_item =
                             timeline_item(VirtualTimelineItem::DayDivider(timestamp), id);
 
                         if should_push {
-                            self.state.items.push_back(day_divider_item);
+                            self.items.push_back(day_divider_item);
                         } else {
-                            self.state.items.insert(insert_idx, day_divider_item);
+                            self.items.insert(insert_idx, day_divider_item);
                             insert_idx += 1;
                         }
                     }
@@ -1054,23 +998,13 @@ impl<'a> TimelineEventHandler<'a> {
                     // If there is no event item, there is no day divider yet.
                     trace!("Adding first day divider (remote)");
                     let new_day_divider =
-                        self.state.new_timeline_item(VirtualTimelineItem::DayDivider(timestamp));
+                        self.meta.new_timeline_item(VirtualTimelineItem::DayDivider(timestamp));
                     if should_push {
-                        self.state.items.push_back(new_day_divider);
+                        self.items.push_back(new_day_divider);
                     } else {
-                        self.state.items.insert(insert_idx, new_day_divider);
+                        self.items.insert(insert_idx, new_day_divider);
                         insert_idx += 1;
                     }
-                }
-
-                if self.track_read_receipts {
-                    maybe_add_implicit_read_receipt(
-                        insert_idx,
-                        &mut item,
-                        self.ctx.is_own_event,
-                        &mut self.state.items,
-                        &mut self.state.users_read_receipts,
-                    );
                 }
 
                 let id = match removed_event_item_id {
@@ -1078,33 +1012,29 @@ impl<'a> TimelineEventHandler<'a> {
                     // echo) was removed and we now need to add it again, reuse
                     // the previous item's ID.
                     Some(id) => id,
-                    None => self.state.next_internal_id(),
+                    None => self.meta.next_internal_id(),
                 };
 
                 trace!("Adding new remote timeline item after all non-pending events");
                 let new_item = timeline_item(item, id);
                 if should_push {
-                    self.state.items.push_back(new_item);
+                    self.items.push_back(new_item);
                 } else {
-                    self.state.items.insert(insert_idx, new_item);
+                    self.items.insert(insert_idx, new_item);
                 }
             }
 
             #[cfg(feature = "e2e-encryption")]
             Flow::Remote { position: TimelineItemPosition::Update(idx), .. } => {
                 trace!("Updating timeline item at position {idx}");
-                let id = self.state.items[*idx].internal_id;
-                self.state.items.set(*idx, timeline_item(item, id));
+                let id = self.items[*idx].internal_id;
+                self.items.set(*idx, timeline_item(item, id));
             }
         }
 
         // See if we can update the read marker.
-        if self.state.event_should_update_fully_read_marker {
-            update_read_marker(
-                &mut self.state.items,
-                self.state.fully_read_event.as_deref(),
-                &mut self.state.event_should_update_fully_read_marker,
-            );
+        if self.meta.event_should_update_fully_read_marker {
+            self.meta.update_read_marker(self.items);
         }
     }
 
@@ -1112,13 +1042,13 @@ impl<'a> TimelineEventHandler<'a> {
         match &self.ctx.flow {
             Flow::Local { .. } => None,
             Flow::Remote { event_id, .. } => {
-                let reactions = self.state.reactions.pending.remove(event_id)?;
+                let reactions = self.meta.reactions.pending.remove(event_id)?;
                 let mut bundled = IndexMap::new();
 
                 for reaction_event_id in reactions {
                     let reaction_id = EventItemIdentifier::EventId(reaction_event_id);
                     let Some((reaction_sender_data, annotation)) =
-                        self.state.reactions.map.get(&reaction_id)
+                        self.meta.reactions.map.get(&reaction_id)
                     else {
                         error!(
                             "inconsistent state: reaction from pending_reactions not in reaction_map"
@@ -1155,59 +1085,8 @@ fn transfer_details(item: &mut EventTimelineItem, old_item: &EventTimelineItem) 
     }
 }
 
-pub(crate) fn update_read_marker(
-    items: &mut ObservableVector<Arc<TimelineItem>>,
-    fully_read_event: Option<&EventId>,
-    event_should_update_fully_read_marker: &mut bool,
-) {
-    let Some(fully_read_event) = fully_read_event else { return };
-    trace!(?fully_read_event, "Updating read marker");
-
-    let read_marker_idx = find_read_marker(items);
-    let fully_read_event_idx = rfind_event_by_id(items, fully_read_event).map(|(idx, _)| idx);
-
-    match (read_marker_idx, fully_read_event_idx) {
-        (None, None) => {
-            *event_should_update_fully_read_marker = true;
-        }
-        (None, Some(idx)) => {
-            // We don't want to insert the read marker if it is at the end of the timeline.
-            if idx + 1 < items.len() {
-                *event_should_update_fully_read_marker = false;
-                items.insert(idx + 1, TimelineItem::read_marker());
-            } else {
-                *event_should_update_fully_read_marker = true;
-            }
-        }
-        (Some(_), None) => {
-            // Keep the current position of the read marker, hopefully we
-            // should have a new position later.
-            *event_should_update_fully_read_marker = true;
-        }
-        (Some(from), Some(to)) => {
-            *event_should_update_fully_read_marker = false;
-
-            // The read marker can't move backwards.
-            if from < to {
-                let item = items.remove(from);
-
-                // We don't want to re-insert the read marker if it is at the end of the
-                // timeline.
-                if to < items.len() {
-                    // Since the fully-read event's index was shifted to the left
-                    // by one position by the remove call above, insert the fully-
-                    // read marker at its previous position, rather than that + 1
-                    items.insert(to, item);
-                } else {
-                    *event_should_update_fully_read_marker = true;
-                }
-            }
-        }
-    }
-}
-
 fn _update_timeline_item(
-    items: &mut ObservableVector<Arc<TimelineItem>>,
+    items: &mut ObservableVectorTransaction<'_, Arc<TimelineItem>>,
     items_updated: &mut u16,
     event_id: &EventId,
     update: impl FnOnce(&EventTimelineItem) -> Option<EventTimelineItem>,

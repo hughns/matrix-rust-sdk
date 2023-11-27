@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use as_variant::as_variant;
 use eyeball::{ObservableWriteGuard, SharedObservable};
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -154,6 +155,7 @@ pub struct QrVerification {
     we_started: bool,
 }
 
+#[cfg(not(tarpaulin_include))]
 impl std::fmt::Debug for QrVerification {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QrVerification")
@@ -202,11 +204,9 @@ impl QrVerification {
     /// Get info about the cancellation if the verification flow has been
     /// cancelled.
     pub fn cancel_info(&self) -> Option<CancelInfo> {
-        if let InnerState::Cancelled(c) = &*self.state.read() {
-            Some(c.state.clone().into())
-        } else {
-            None
-        }
+        as_variant!(&*self.state.read(), InnerState::Cancelled(c) => {
+            c.state.clone().into()
+        })
     }
 
     /// Has the verification flow completed.
@@ -219,7 +219,7 @@ impl QrVerification {
         matches!(*self.state.read(), InnerState::Cancelled(_))
     }
 
-    /// Is this a verification that is veryfying one of our own devices
+    /// Is this a verification that is verifying one of our own devices
     pub fn is_self_verification(&self) -> bool {
         self.identities.is_self_verification()
     }
@@ -478,7 +478,7 @@ impl QrVerification {
             };
 
             trace!(
-                sender = sender.as_str(),
+                ?sender,
                 code = content.cancel_code().as_str(),
                 "Cancelling a QR verification, other user has cancelled"
             );
@@ -528,7 +528,7 @@ impl QrVerification {
 
         let inner: QrVerificationData = SelfVerificationNoMasterKey::new(
             flow_id.as_str().to_owned(),
-            store.account.identity_keys().ed25519,
+            store.account.identity_keys.ed25519,
             own_master_key,
             secret,
         )
@@ -581,9 +581,10 @@ impl QrVerification {
 
         let identities = store.get_identities(other_device).await?;
 
-        let own_identity = identities.own_identity.as_ref().ok_or_else(|| {
-            ScanError::MissingCrossSigningIdentity(store.account.user_id().to_owned())
-        })?;
+        let own_identity = identities
+            .own_identity
+            .as_ref()
+            .ok_or_else(|| ScanError::MissingCrossSigningIdentity(store.account.user_id.clone()))?;
 
         let other_identity = identities
             .identity_being_verified
@@ -612,9 +613,9 @@ impl QrVerification {
             }
             QrVerificationData::SelfVerification(_) => {
                 check_master_key(qr_code.first_key(), other_identity)?;
-                if qr_code.second_key() != store.account.identity_keys().ed25519 {
+                if qr_code.second_key() != store.account.identity_keys.ed25519 {
                     return Err(ScanError::KeyMismatch {
-                        expected: store.account.identity_keys().ed25519.to_base64(),
+                        expected: store.account.identity_keys.ed25519.to_base64(),
                         found: qr_code.second_key().to_base64(),
                     });
                 }
@@ -636,7 +637,7 @@ impl QrVerification {
         };
 
         let secret = qr_code.secret().to_owned();
-        let own_device_id = store.account.device_id().to_owned();
+        let own_device_id = store.account.device_id.clone();
 
         Ok(Self {
             flow_id,
@@ -890,7 +891,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::{
-        olm::{PrivateCrossSigningIdentity, ReadOnlyAccount},
+        olm::{Account, PrivateCrossSigningIdentity},
         store::{Changes, CryptoStoreWrapper, MemoryStore},
         verification::{
             event_enums::{DoneContent, OutgoingContent, StartContent},
@@ -913,23 +914,23 @@ mod tests {
 
     #[async_test]
     async fn test_verification_creation() {
-        let account = ReadOnlyAccount::with_device_id(user_id(), device_id());
+        let account = Account::with_device_id(user_id(), device_id());
         let store = memory_store(account.user_id());
 
-        let private_identity = PrivateCrossSigningIdentity::new(user_id().to_owned()).await;
+        let private_identity = PrivateCrossSigningIdentity::new(user_id().to_owned());
         let master_key = private_identity.master_public_key().await.unwrap();
         let master_key = master_key.get_first_key().unwrap().to_owned();
 
         let store = VerificationStore {
-            account: account.clone(),
+            account: account.static_data.clone(),
             inner: store,
             private_identity: Mutex::new(private_identity).into(),
         };
 
         let flow_id = FlowId::ToDevice("test_transaction".into());
 
-        let device_key = account.identity_keys.ed25519;
-        let alice_device = ReadOnlyDevice::from_account(&account).await;
+        let device_key = account.static_data.identity_keys.ed25519;
+        let alice_device = ReadOnlyDevice::from_account(&account);
 
         let identities = store.get_identities(alice_device).await.unwrap();
 
@@ -959,8 +960,7 @@ mod tests {
         assert_eq!(verification.inner.first_key(), master_key);
         assert_eq!(verification.inner.second_key(), device_key);
 
-        let bob_identity =
-            PrivateCrossSigningIdentity::new(user_id!("@bob:example").to_owned()).await;
+        let bob_identity = PrivateCrossSigningIdentity::new(user_id!("@bob:example").to_owned());
         let bob_master_key = bob_identity.master_public_key().await.unwrap();
         let bob_master_key = bob_master_key.get_first_key().unwrap().to_owned();
 
@@ -978,28 +978,28 @@ mod tests {
     #[async_test]
     async fn test_reciprocate_receival() {
         let test = |flow_id: FlowId| async move {
-            let alice_account = ReadOnlyAccount::with_device_id(user_id(), device_id());
+            let alice_account = Account::with_device_id(user_id(), device_id());
             let store = memory_store(alice_account.user_id());
 
-            let private_identity = PrivateCrossSigningIdentity::new(user_id().to_owned()).await;
+            let private_identity = PrivateCrossSigningIdentity::new(user_id().to_owned());
 
             let store = VerificationStore {
-                account: alice_account.clone(),
+                account: alice_account.static_data.clone(),
                 inner: store,
                 private_identity: Mutex::new(private_identity).into(),
             };
 
             let bob_account =
-                ReadOnlyAccount::with_device_id(alice_account.user_id(), device_id!("BOBDEVICE"));
+                Account::with_device_id(alice_account.user_id(), device_id!("BOBDEVICE"));
 
-            let private_identity = PrivateCrossSigningIdentity::new(user_id().to_owned()).await;
+            let private_identity = PrivateCrossSigningIdentity::new(user_id().to_owned());
             let identity = private_identity.to_public_identity().await.unwrap();
 
             let master_key = private_identity.master_public_key().await.unwrap();
             let master_key = master_key.get_first_key().unwrap().to_owned();
 
-            let alice_device = ReadOnlyDevice::from_account(&alice_account).await;
-            let bob_device = ReadOnlyDevice::from_account(&bob_account).await;
+            let alice_device = ReadOnlyDevice::from_account(&alice_account);
+            let bob_device = ReadOnlyDevice::from_account(&bob_account);
 
             let mut changes = Changes::default();
             changes.identities.new.push(identity.clone().into());
@@ -1020,9 +1020,9 @@ mod tests {
 
             let bob_store = memory_store(bob_account.user_id());
 
-            let private_identity = PrivateCrossSigningIdentity::new(user_id().to_owned()).await;
+            let private_identity = PrivateCrossSigningIdentity::new(user_id().to_owned());
             let bob_store = VerificationStore {
-                account: bob_account.clone(),
+                account: bob_account.static_data.clone(),
                 inner: bob_store,
                 private_identity: Mutex::new(private_identity).into(),
             };

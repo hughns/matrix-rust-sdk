@@ -1,6 +1,10 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashMap,
+    mem::ManuallyDrop,
+    sync::{Arc, RwLock},
+};
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, Context as _};
 use matrix_sdk::{
     media::{MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequest, MediaThumbnailSize},
     oidc::{
@@ -10,7 +14,7 @@ use matrix_sdk::{
                 ClientMetadata, ClientMetadataVerificationError, VerifiedClientMetadata,
             },
         },
-        FullSession, RegisteredClientData,
+        OidcAccountManagementAction, OidcSession,
     },
     ruma::{
         api::client::{
@@ -30,11 +34,13 @@ use matrix_sdk::{
         serde::Raw,
         EventEncryptionAlgorithm, TransactionId, UInt, UserId,
     },
-    AuthApi, AuthSession, Client as MatrixClient, SessionChange,
+    AuthApi, AuthSession, Client as MatrixClient, SessionChange, SessionTokens,
 };
 use matrix_sdk_ui::notification_client::NotificationProcessSetup as MatrixNotificationProcessSetup;
+use mime::Mime;
 use ruma::{
     api::client::discovery::discover_homeserver::AuthenticationServerInfo,
+    events::room::power_levels::RoomPowerLevelsEventContent,
     push::{HttpPusherData as RumaHttpPusherData, PushFormat as RumaPushFormat},
 };
 use serde::{Deserialize, Serialize};
@@ -49,6 +55,7 @@ use crate::{
     notification::NotificationClientBuilder,
     notification_settings::NotificationSettings,
     sync_service::{SyncService, SyncServiceBuilder},
+    task_handle::TaskHandle,
     ClientError,
 };
 
@@ -119,6 +126,12 @@ pub trait ClientDelegate: Sync + Send {
 }
 
 #[uniffi::export(callback_interface)]
+pub trait ClientSessionDelegate: Sync + Send {
+    fn retrieve_session_from_keychain(&self, user_id: String) -> Result<Session, ClientError>;
+    fn save_session_in_keychain(&self, session: Session);
+}
+
+#[uniffi::export(callback_interface)]
 pub trait ProgressWatcher: Send + Sync {
     fn transmission_progress(&self, progress: TransmissionProgress);
 }
@@ -140,14 +153,32 @@ impl From<matrix_sdk::TransmissionProgress> for TransmissionProgress {
 
 #[derive(uniffi::Object)]
 pub struct Client {
-    pub(crate) inner: MatrixClient,
+    pub(crate) inner: ManuallyDrop<MatrixClient>,
     delegate: RwLock<Option<Arc<dyn ClientDelegate>>>,
     session_verification_controller:
         Arc<tokio::sync::RwLock<Option<SessionVerificationController>>>,
 }
 
+impl Drop for Client {
+    fn drop(&mut self) {
+        // Dropping the inner OlmMachine must happen within a tokio context
+        // because deadpool drops sqlite connections in the DB pool on tokio's
+        // blocking threadpool to avoid blocking async worker threads.
+        let _guard = RUNTIME.enter();
+        // SAFETY: self.inner is never used again, which is the only requirement
+        //         for ManuallyDrop::drop to be used safely.
+        unsafe {
+            ManuallyDrop::drop(&mut self.inner);
+        }
+    }
+}
+
 impl Client {
-    pub fn new(sdk_client: MatrixClient) -> Arc<Self> {
+    pub fn new(
+        sdk_client: MatrixClient,
+        cross_process_refresh_lock_id: Option<String>,
+        session_delegate: Option<Arc<dyn ClientSessionDelegate>>,
+    ) -> Result<Arc<Self>, ClientError> {
         let session_verification_controller: Arc<
             tokio::sync::RwLock<Option<SessionVerificationController>>,
         > = Default::default();
@@ -162,27 +193,45 @@ impl Client {
         });
 
         let client = Arc::new(Client {
-            inner: sdk_client,
+            inner: ManuallyDrop::new(sdk_client),
             delegate: RwLock::new(None),
             session_verification_controller,
         });
 
-        let mut session_change_receiver = client.inner.subscribe_to_session_changes();
-        let client_clone = client.clone();
-        RUNTIME.spawn(async move {
-            loop {
-                match session_change_receiver.recv().await {
-                    Ok(session_change) => client_clone.process_session_change(session_change),
-                    Err(receive_error) => {
-                        if let RecvError::Closed = receive_error {
-                            break;
-                        }
-                    }
-                }
+        if let Some(process_id) = cross_process_refresh_lock_id {
+            if session_delegate.is_none() {
+                return Err(anyhow::anyhow!(
+                    "missing session delegates when enabling the cross-process lock"
+                ))?;
             }
-        });
+            RUNTIME.block_on(async {
+                client.inner.oidc().enable_cross_process_refresh_lock(process_id.clone()).await
+            })?;
+        }
 
-        client
+        if let Some(session_delegate) = session_delegate {
+            client.inner.set_session_callbacks(
+                {
+                    let session_delegate = session_delegate.clone();
+                    Box::new(move |client| {
+                        let session_delegate = session_delegate.clone();
+                        let user_id = client.user_id().context("user isn't logged in")?;
+                        Ok(Self::retrieve_session(session_delegate, user_id)?)
+                    })
+                },
+                {
+                    let session_delegate = session_delegate.clone();
+                    Box::new(move |client| {
+                        let session_delegate = session_delegate.clone();
+                        Box::pin(
+                            async move { Ok(Self::save_session(session_delegate, client).await?) },
+                        )
+                    })
+                },
+            )?;
+        }
+
+        Ok(client)
     }
 }
 
@@ -214,6 +263,7 @@ impl Client {
         media_source: Arc<MediaSource>,
         body: Option<String>,
         mime_type: String,
+        use_cache: bool,
         temp_dir: Option<String>,
     ) -> Result<Arc<MediaFileHandle>, ClientError> {
         let client = self.inner.clone();
@@ -227,72 +277,21 @@ impl Client {
                     &MediaRequest { source, format: MediaFormat::File },
                     body,
                     &mime_type,
-                    true,
+                    use_cache,
                     temp_dir,
                 )
                 .await?;
 
-            Ok(Arc::new(MediaFileHandle { inner: handle }))
+            Ok(Arc::new(MediaFileHandle::new(handle)))
         })
     }
 
     /// Restores the client from a `Session`.
     pub fn restore_session(&self, session: Session) -> Result<(), ClientError> {
-        let Session {
-            access_token,
-            refresh_token,
-            user_id,
-            device_id,
-            homeserver_url: _,
-            oidc_data,
-            sliding_sync_proxy,
-        } = session;
+        let sliding_sync_proxy = session.sliding_sync_proxy.clone();
+        let auth_session: AuthSession = session.try_into()?;
 
-        if let Some(oidc_data) = oidc_data {
-            // Restore using an OIDC FullSession.
-            let oidc_data = serde_json::from_str::<OidcUnvalidatedSessionData>(&oidc_data)?
-                .validate()
-                .context("OIDC metadata validation failed.")?;
-            let latest_id_token = oidc_data
-                .latest_id_token
-                .map(TryInto::try_into)
-                .transpose()
-                .context("OIDC latest_id_token is invalid.")?;
-
-            let user_session = matrix_sdk::oidc::UserSession {
-                meta: matrix_sdk::SessionMeta {
-                    user_id: user_id.try_into()?,
-                    device_id: device_id.into(),
-                },
-                tokens: matrix_sdk::oidc::SessionTokens {
-                    access_token,
-                    refresh_token,
-                    latest_id_token,
-                },
-                issuer_info: oidc_data.issuer_info,
-            };
-
-            let session = FullSession {
-                client: RegisteredClientData {
-                    credentials: ClientCredentials::None { client_id: oidc_data.client_id },
-                    metadata: oidc_data.client_metadata,
-                },
-                user: user_session,
-            };
-
-            self.restore_session_inner(session)?;
-        } else {
-            // Restore using a regular Matrix Session.
-            let session = matrix_sdk::matrix_auth::Session {
-                meta: matrix_sdk::SessionMeta {
-                    user_id: user_id.try_into()?,
-                    device_id: device_id.into(),
-                },
-                tokens: matrix_sdk::matrix_auth::SessionTokens { access_token, refresh_token },
-            };
-
-            self.restore_session_inner(session)?;
-        }
+        self.restore_session_inner(auth_session)?;
 
         if let Some(sliding_sync_proxy) = sliding_sync_proxy {
             let sliding_sync_proxy = Url::parse(&sliding_sync_proxy)
@@ -317,10 +316,6 @@ impl Client {
         })
     }
 
-    pub(crate) async fn async_homeserver(&self) -> String {
-        self.inner.homeserver().await.to_string()
-    }
-
     /// The homeserver's trusted OIDC Provider that was discovered in the
     /// well-known.
     ///
@@ -328,7 +323,7 @@ impl Client {
     /// OpenID Connect and this `Client` was constructed using auto-discovery by
     /// setting the homeserver with [`ClientBuilder::server_name()`].
     pub(crate) fn discovered_authentication_server(&self) -> Option<AuthenticationServerInfo> {
-        self.inner.authentication_server_info().cloned()
+        self.inner.oidc().authentication_server_info().cloned()
     }
 
     /// The sliding sync proxy that is trusted by the homeserver. `None` when
@@ -356,81 +351,46 @@ impl Client {
 
 #[uniffi::export]
 impl Client {
-    pub fn set_delegate(&self, delegate: Option<Box<dyn ClientDelegate>>) {
-        *self.delegate.write().unwrap() = delegate.map(Arc::from);
-    }
-
-    pub fn session(&self) -> Result<Session, ClientError> {
-        RUNTIME.block_on(async move {
-            let auth_api = self.inner.auth_api().context("Missing authentication API")?;
-
-            let homeserver_url = self.inner.homeserver().await.into();
-            let sliding_sync_proxy =
-                self.discovered_sliding_sync_proxy().map(|url| url.to_string());
-
-            match auth_api {
-                // Build the session from the regular Matrix Auth Session.
-                AuthApi::Matrix(a) => {
-                    let matrix_sdk::matrix_auth::Session {
-                        meta: matrix_sdk::SessionMeta { user_id, device_id },
-                        tokens:
-                            matrix_sdk::matrix_auth::SessionTokens { access_token, refresh_token },
-                    } = a.session().context("Missing session")?;
-
-                    Ok(Session {
-                        access_token,
-                        refresh_token,
-                        user_id: user_id.to_string(),
-                        device_id: device_id.to_string(),
-                        homeserver_url,
-                        oidc_data: None,
-                        sliding_sync_proxy,
-                    })
+    pub fn set_delegate(
+        self: Arc<Self>,
+        delegate: Option<Box<dyn ClientDelegate>>,
+    ) -> Option<Arc<TaskHandle>> {
+        delegate.map(|delegate| {
+            let mut session_change_receiver = self.inner.subscribe_to_session_changes();
+            let client_clone = self.clone();
+            let session_change_task = RUNTIME.spawn(async move {
+                loop {
+                    match session_change_receiver.recv().await {
+                        Ok(session_change) => client_clone.process_session_change(session_change),
+                        Err(receive_error) => {
+                            if let RecvError::Closed = receive_error {
+                                break;
+                            }
+                        }
+                    }
                 }
-                // Build the session from the OIDC UserSession.
-                AuthApi::Oidc(api) => {
-                    let matrix_sdk::oidc::UserSession {
-                        meta: matrix_sdk::SessionMeta { user_id, device_id },
-                        tokens:
-                            matrix_sdk::oidc::SessionTokens {
-                                access_token,
-                                refresh_token,
-                                latest_id_token,
-                            },
-                        issuer_info,
-                    } = api.user_session().context("Missing session")?;
-                    let client_id = api
-                        .client_credentials()
-                        .context("OIDC client credentials are missing.")?
-                        .client_id()
-                        .to_owned();
-                    let client_metadata =
-                        api.client_metadata().context("OIDC client metadata is missing.")?.clone();
-                    let oidc_data = OidcSessionData {
-                        client_id,
-                        client_metadata,
-                        latest_id_token: latest_id_token.map(|t| t.to_string()),
-                        issuer_info,
-                    };
+            });
 
-                    let oidc_data = serde_json::to_string(&oidc_data).ok();
-                    Ok(Session {
-                        access_token,
-                        refresh_token,
-                        user_id: user_id.to_string(),
-                        device_id: device_id.to_string(),
-                        homeserver_url,
-                        oidc_data,
-                        sliding_sync_proxy,
-                    })
-                }
-                _ => Err(anyhow!("Unknown authentication API").into()),
-            }
+            *self.delegate.write().unwrap() = Some(Arc::from(delegate));
+            Arc::new(TaskHandle::new(session_change_task))
         })
     }
 
-    pub fn account_url(&self) -> Option<String> {
-        self.inner.oidc().account_management_url().ok().flatten().map(|url| url.to_string())
+    pub fn session(&self) -> Result<Session, ClientError> {
+        RUNTIME.block_on(async move { Self::session_inner((*self.inner).clone()).await })
+    }
+
+    pub fn account_url(
+        &self,
+        action: Option<AccountManagementAction>,
+    ) -> Result<Option<String>, ClientError> {
+        match self.inner.oidc().account_management_url(action.map(Into::into)) {
+            Ok(url) => Ok(url.map(|u| u.to_string())),
+            Err(e) => {
+                tracing::error!("Failed retrieving account management URL: {e}");
+                Err(e.into())
+            }
+        }
     }
 
     pub fn user_id(&self) -> Result<String, ClientError> {
@@ -454,6 +414,23 @@ impl Client {
                 .set_display_name(Some(name.as_str()))
                 .await
                 .context("Unable to set display name")?;
+            Ok(())
+        })
+    }
+
+    pub fn upload_avatar(&self, mime_type: String, data: Vec<u8>) -> Result<(), ClientError> {
+        let client = self.inner.clone();
+        RUNTIME.block_on(async move {
+            let mime: Mime = mime_type.parse()?;
+            client.account().upload_avatar(&mime, data).await?;
+            Ok(())
+        })
+    }
+
+    pub fn remove_avatar(&self) -> Result<(), ClientError> {
+        let client = self.inner.clone();
+        RUNTIME.block_on(async move {
+            client.account().set_avatar_url(None).await?;
             Ok(())
         })
     }
@@ -658,7 +635,7 @@ impl Client {
 
     /// The homeserver this client is configured to use.
     pub fn homeserver(&self) -> String {
-        RUNTIME.block_on(self.async_homeserver())
+        self.inner.homeserver().to_string()
     }
 
     pub fn rooms(&self) -> Vec<Arc<Room>> {
@@ -715,20 +692,20 @@ impl Client {
     }
 
     pub fn notification_client(
-        &self,
+        self: Arc<Self>,
         process_setup: NotificationProcessSetup,
     ) -> Result<Arc<NotificationClientBuilder>, ClientError> {
-        NotificationClientBuilder::new(self.inner.clone(), process_setup.into())
+        NotificationClientBuilder::new(self.clone(), process_setup.into())
     }
 
     pub fn sync_service(&self) -> Arc<SyncServiceBuilder> {
-        SyncServiceBuilder::new(self.inner.clone())
+        SyncServiceBuilder::new((*self.inner).clone())
     }
 
     pub fn get_notification_settings(&self) -> Arc<NotificationSettings> {
         RUNTIME.block_on(async move {
             Arc::new(NotificationSettings::new(
-                self.inner.clone(),
+                (*self.inner).clone(),
                 self.inner.notification_settings().await,
             ))
         })
@@ -799,6 +776,117 @@ impl Client {
             });
         }
     }
+
+    fn retrieve_session(
+        session_delegate: Arc<dyn ClientSessionDelegate>,
+        user_id: &UserId,
+    ) -> anyhow::Result<SessionTokens> {
+        let session = session_delegate.retrieve_session_from_keychain(user_id.to_string())?;
+        let auth_session = TryInto::<AuthSession>::try_into(session)?;
+        match auth_session {
+            AuthSession::Oidc(session) => Ok(SessionTokens::Oidc(session.user.tokens)),
+            AuthSession::Matrix(session) => Ok(SessionTokens::Matrix(session.tokens)),
+            _ => anyhow::bail!("Unexpected session kind."),
+        }
+    }
+
+    async fn session_inner(client: matrix_sdk::Client) -> Result<Session, ClientError> {
+        let auth_api = client.auth_api().context("Missing authentication API")?;
+
+        let homeserver_url = client.homeserver().into();
+        let sliding_sync_proxy = client.sliding_sync_proxy().map(|url| url.to_string());
+
+        Session::new(auth_api, homeserver_url, sliding_sync_proxy)
+    }
+
+    async fn save_session(
+        session_delegate: Arc<dyn ClientSessionDelegate>,
+        client: matrix_sdk::Client,
+    ) -> anyhow::Result<()> {
+        let session = Self::session_inner(client).await?;
+        session_delegate.save_session_in_keychain(session);
+        Ok(())
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct NotificationPowerLevels {
+    pub room: i32,
+}
+
+impl From<NotificationPowerLevels> for ruma::power_levels::NotificationPowerLevels {
+    fn from(value: NotificationPowerLevels) -> Self {
+        let mut notification_power_levels = Self::new();
+        notification_power_levels.room = value.room.into();
+        notification_power_levels
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct PowerLevels {
+    pub users_default: Option<i32>,
+    pub events_default: Option<i32>,
+    pub state_default: Option<i32>,
+    pub ban: Option<i32>,
+    pub kick: Option<i32>,
+    pub redact: Option<i32>,
+    pub invite: Option<i32>,
+    pub notifications: Option<NotificationPowerLevels>,
+    pub users: HashMap<String, i32>,
+    pub events: HashMap<String, i32>,
+}
+
+impl From<PowerLevels> for RoomPowerLevelsEventContent {
+    fn from(value: PowerLevels) -> Self {
+        let mut power_levels = RoomPowerLevelsEventContent::new();
+
+        if let Some(users_default) = value.users_default {
+            power_levels.users_default = users_default.into();
+        }
+        if let Some(state_default) = value.state_default {
+            power_levels.state_default = state_default.into();
+        }
+        if let Some(events_default) = value.events_default {
+            power_levels.events_default = events_default.into();
+        }
+        if let Some(ban) = value.ban {
+            power_levels.ban = ban.into();
+        }
+        if let Some(kick) = value.kick {
+            power_levels.kick = kick.into();
+        }
+        if let Some(redact) = value.redact {
+            power_levels.redact = redact.into();
+        }
+        if let Some(invite) = value.invite {
+            power_levels.invite = invite.into();
+        }
+        if let Some(notifications) = value.notifications {
+            power_levels.notifications = notifications.into()
+        }
+        power_levels.users = value
+            .users
+            .iter()
+            .filter_map(|(user_id, power_level)| match UserId::parse(user_id) {
+                Ok(id) => Some((id, (*power_level).into())),
+                Err(e) => {
+                    error!(user_id, "Skipping invalid user ID, error: {e}");
+                    None
+                }
+            })
+            .collect();
+
+        power_levels.events = value
+            .events
+            .iter()
+            .map(|(event_type, power_level)| {
+                let event_type: ruma::events::TimelineEventType = event_type.as_str().into();
+                (event_type, (*power_level).into())
+            })
+            .collect();
+
+        power_levels
+    }
 }
 
 #[derive(uniffi::Record)]
@@ -815,6 +903,8 @@ pub struct CreateRoomParameters {
     pub invite: Option<Vec<String>>,
     #[uniffi(default = None)]
     pub avatar: Option<String>,
+    #[uniffi(default = None)]
+    pub power_level_content_override: Option<PowerLevels>,
 }
 
 impl From<CreateRoomParameters> for create_room::v3::Request {
@@ -852,8 +942,18 @@ impl From<CreateRoomParameters> for create_room::v3::Request {
             content.url = Some(url.into());
             initial_state.push(InitialStateEvent::new(content).to_raw_any());
         }
-
         request.initial_state = initial_state;
+
+        if let Some(power_levels) = value.power_level_content_override {
+            match Raw::new(&power_levels.into()) {
+                Ok(power_levels) => {
+                    request.power_level_content_override = Some(power_levels);
+                }
+                Err(e) => {
+                    error!("Failed to serialize power levels, error: {e}");
+                }
+            }
+        }
 
         request
     }
@@ -927,6 +1027,135 @@ pub struct Session {
     pub sliding_sync_proxy: Option<String>,
 }
 
+impl Session {
+    fn new(
+        auth_api: AuthApi,
+        homeserver_url: String,
+        sliding_sync_proxy: Option<String>,
+    ) -> Result<Session, ClientError> {
+        match auth_api {
+            // Build the session from the regular Matrix Auth Session.
+            AuthApi::Matrix(a) => {
+                let matrix_sdk::matrix_auth::MatrixSession {
+                    meta: matrix_sdk::SessionMeta { user_id, device_id },
+                    tokens:
+                        matrix_sdk::matrix_auth::MatrixSessionTokens { access_token, refresh_token },
+                } = a.session().context("Missing session")?;
+
+                Ok(Session {
+                    access_token,
+                    refresh_token,
+                    user_id: user_id.to_string(),
+                    device_id: device_id.to_string(),
+                    homeserver_url,
+                    oidc_data: None,
+                    sliding_sync_proxy,
+                })
+            }
+            // Build the session from the OIDC UserSession.
+            AuthApi::Oidc(api) => {
+                let matrix_sdk::oidc::UserSession {
+                    meta: matrix_sdk::SessionMeta { user_id, device_id },
+                    tokens:
+                        matrix_sdk::oidc::OidcSessionTokens {
+                            access_token,
+                            refresh_token,
+                            latest_id_token,
+                        },
+                    issuer_info,
+                } = api.user_session().context("Missing session")?;
+                let client_id = api
+                    .client_credentials()
+                    .context("OIDC client credentials are missing.")?
+                    .client_id()
+                    .to_owned();
+                let client_metadata =
+                    api.client_metadata().context("OIDC client metadata is missing.")?.clone();
+                let oidc_data = OidcSessionData {
+                    client_id,
+                    client_metadata,
+                    latest_id_token: latest_id_token.map(|t| t.to_string()),
+                    issuer_info,
+                };
+
+                let oidc_data = serde_json::to_string(&oidc_data).ok();
+                Ok(Session {
+                    access_token,
+                    refresh_token,
+                    user_id: user_id.to_string(),
+                    device_id: device_id.to_string(),
+                    homeserver_url,
+                    oidc_data,
+                    sliding_sync_proxy,
+                })
+            }
+            _ => Err(anyhow!("Unknown authentication API").into()),
+        }
+    }
+}
+
+impl TryFrom<Session> for AuthSession {
+    type Error = ClientError;
+    fn try_from(value: Session) -> Result<Self, Self::Error> {
+        let Session {
+            access_token,
+            refresh_token,
+            user_id,
+            device_id,
+            homeserver_url: _,
+            oidc_data,
+            sliding_sync_proxy: _,
+        } = value;
+
+        if let Some(oidc_data) = oidc_data {
+            // Create an OidcSession.
+            let oidc_data = serde_json::from_str::<OidcUnvalidatedSessionData>(&oidc_data)?
+                .validate()
+                .context("OIDC metadata validation failed.")?;
+            let latest_id_token = oidc_data
+                .latest_id_token
+                .map(TryInto::try_into)
+                .transpose()
+                .context("OIDC latest_id_token is invalid.")?;
+
+            let user_session = matrix_sdk::oidc::UserSession {
+                meta: matrix_sdk::SessionMeta {
+                    user_id: user_id.try_into()?,
+                    device_id: device_id.into(),
+                },
+                tokens: matrix_sdk::oidc::OidcSessionTokens {
+                    access_token,
+                    refresh_token,
+                    latest_id_token,
+                },
+                issuer_info: oidc_data.issuer_info,
+            };
+
+            let session = OidcSession {
+                credentials: ClientCredentials::None { client_id: oidc_data.client_id },
+                metadata: oidc_data.client_metadata,
+                user: user_session,
+            };
+
+            Ok(AuthSession::Oidc(session))
+        } else {
+            // Create a regular Matrix Session.
+            let session = matrix_sdk::matrix_auth::MatrixSession {
+                meta: matrix_sdk::SessionMeta {
+                    user_id: user_id.try_into()?,
+                    device_id: device_id.into(),
+                },
+                tokens: matrix_sdk::matrix_auth::MatrixSessionTokens {
+                    access_token,
+                    refresh_token,
+                },
+            };
+
+            Ok(AuthSession::Matrix(session))
+        }
+    }
+}
+
 /// Represents a client registration against an OpenID Connect authentication
 /// issuer.
 #[derive(Serialize)]
@@ -959,6 +1188,29 @@ impl OidcUnvalidatedSessionData {
     }
 }
 
+#[derive(uniffi::Enum)]
+pub enum AccountManagementAction {
+    Profile,
+    SessionsList,
+    SessionView { device_id: String },
+    SessionEnd { device_id: String },
+}
+
+impl From<AccountManagementAction> for OidcAccountManagementAction {
+    fn from(value: AccountManagementAction) -> Self {
+        match value {
+            AccountManagementAction::Profile => Self::Profile,
+            AccountManagementAction::SessionsList => Self::SessionsList,
+            AccountManagementAction::SessionView { device_id } => {
+                Self::SessionView { device_id: device_id.into() }
+            }
+            AccountManagementAction::SessionEnd { device_id } => {
+                Self::SessionEnd { device_id: device_id.into() }
+            }
+        }
+    }
+}
+
 #[uniffi::export]
 fn gen_transaction_id() -> String {
     TransactionId::new().to_string()
@@ -968,13 +1220,45 @@ fn gen_transaction_id() -> String {
 /// is dropped, the file will be removed from the disk.
 #[derive(uniffi::Object)]
 pub struct MediaFileHandle {
-    inner: SdkMediaFileHandle,
+    inner: RwLock<Option<SdkMediaFileHandle>>,
+}
+
+impl MediaFileHandle {
+    fn new(handle: SdkMediaFileHandle) -> Self {
+        Self { inner: RwLock::new(Some(handle)) }
+    }
 }
 
 #[uniffi::export]
 impl MediaFileHandle {
     /// Get the media file's path.
-    pub fn path(&self) -> String {
-        self.inner.path().to_str().unwrap().to_owned()
+    pub fn path(&self) -> Result<String, ClientError> {
+        Ok(self
+            .inner
+            .read()
+            .unwrap()
+            .as_ref()
+            .context("MediaFileHandle must not be used after calling persist")?
+            .path()
+            .to_str()
+            .unwrap()
+            .to_owned())
+    }
+
+    pub fn persist(&self, path: String) -> Result<bool, ClientError> {
+        let mut guard = self.inner.write().unwrap();
+        Ok(
+            match guard
+                .take()
+                .context("MediaFileHandle was already persisted")?
+                .persist(path.as_ref())
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    *guard = Some(e.file);
+                    false
+                }
+            },
+        )
     }
 }
