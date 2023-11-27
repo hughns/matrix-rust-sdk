@@ -20,24 +20,28 @@ pub struct NoisyArc<T: ?Sized + Debug> {
 impl<T: ?Sized + Debug> Clone for NoisyArc<T> {
     fn clone(&self) -> Self {
         let res = Self { ptr: self.ptr.clone(), id: self.ptr.get_next_id() };
-        info!(
-            "NoisyArc::clone {:?} -> {}. Refcount now {}",
-            self.ptr.inner,
-            res.id,
-            Arc::strong_count(&self.ptr)
-        );
+        if self.ptr.noisy {
+            info!(
+                "NoisyArc::clone({}) {:?}. Refcount now {}",
+                res.id,
+                self.ptr.inner,
+                Arc::strong_count(&self.ptr)
+            );
+        }
         res
     }
 }
 
 impl<T: ?Sized + Debug> Drop for NoisyArc<T> {
     fn drop(&mut self) {
-        info!(
-            "NoisyArc::drop({}) {:?}. Refcount before drop {}",
-            self.id,
-            self.ptr.inner,
-            Arc::strong_count(&self.ptr)
-        );
+        if self.ptr.noisy {
+            info!(
+                "NoisyArc::drop({}) {:?}. Refcount before drop {}",
+                self.id,
+                self.ptr.inner,
+                Arc::strong_count(&self.ptr)
+            );
+        }
     }
 }
 
@@ -50,18 +54,28 @@ impl<T: ?Sized + Debug> Deref for NoisyArc<T> {
 }
 
 impl<T: Debug + ?Sized> NoisyArc<T> {
+    /// Wrap the given object in a silent NoisyArc
     pub fn new(data: T) -> NoisyArc<T>
     where
         T: Sized,
     {
-        Self::from_box(Box::new(data))
+        Self::from_box(Box::new(data), false)
     }
 
-    pub fn from_box(inner: Box<T>) -> NoisyArc<T> {
+    /// Wrap the given object in a noisy NoisyArc
+    pub fn new_noisy(data: T) -> NoisyArc<T>
+    where
+        T: Sized,
+    {
+        Self::from_box(Box::new(data), true)
+    }
+
+    pub fn from_box(inner: Box<T>, noisy: bool) -> NoisyArc<T> {
         use uuid::Uuid;
 
         Self {
             ptr: Arc::new(NoisyArcInner {
+                noisy,
                 inner,
                 next_id: AtomicU64::new(1),
                 base_id: Uuid::new_v4().to_string(),
@@ -99,6 +113,7 @@ impl<T: Debug + ?Sized> NoisyArc<T> {
 #[derive(Debug)]
 #[repr(C)]
 pub struct NoisyArcInner<T: ?Sized> {
+    noisy: bool,
     inner: Box<T>,
     base_id: String,
     next_id: AtomicU64,

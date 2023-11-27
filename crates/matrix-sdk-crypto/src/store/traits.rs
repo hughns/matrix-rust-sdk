@@ -467,7 +467,7 @@ where
     T: CryptoStore + 'static,
 {
     fn into_crypto_store(self) -> NoisyArc<DynCryptoStore> {
-        NoisyArc::from_box(Box::new(EraseCryptoStoreError(self)))
+        NoisyArc::from_box(Box::new(EraseCryptoStoreError(self)), false)
     }
 }
 
