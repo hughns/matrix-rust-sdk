@@ -3149,6 +3149,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "ulid",
+ "uuid",
  "vodozemac",
  "zeroize",
 ]

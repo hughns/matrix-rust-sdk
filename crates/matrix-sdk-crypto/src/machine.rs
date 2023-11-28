@@ -134,6 +134,12 @@ pub struct OlmMachineInner {
     backup_machine: BackupMachine,
 }
 
+impl Drop for OlmMachineInner {
+    fn drop(&mut self) {
+        info!("OlmMachineInner::drop");
+    }
+}
+
 #[cfg(not(tarpaulin_include))]
 impl std::fmt::Debug for OlmMachine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -187,7 +193,13 @@ impl OlmMachine {
     ) -> Self {
         let verification_machine =
             VerificationMachine::new(account.clone(), user_identity.clone(), store.clone());
-        let store = Store::new(account, user_identity.clone(), store, verification_machine.clone());
+
+        let store = {
+            info!("new_helper:10");
+            let vm = verification_machine.clone();
+            info!("new_helper:20");
+            Store::new(account, user_identity.clone(), store, vm)
+        };
 
         let group_session_manager = GroupSessionManager::new(store.clone());
 
@@ -310,7 +322,7 @@ impl OlmMachine {
         };
 
         let identity = Arc::new(Mutex::new(identity));
-        let store = NoisyArc::new(CryptoStoreWrapper::new(user_id, store));
+        let store = NoisyArc::new_noisy(CryptoStoreWrapper::new(user_id, store));
         Ok(OlmMachine::new_helper(device_id, store, static_account, identity))
     }
 
@@ -1638,15 +1650,21 @@ impl OlmMachine {
     /// println!("{:?}", device);
     /// # });
     /// ```
-    #[instrument(skip(self))]
+    #[instrument(skip(self), fields(uuid))]
     pub async fn get_device(
         &self,
         user_id: &UserId,
         device_id: &DeviceId,
         timeout: Option<Duration>,
     ) -> StoreResult<Option<Device>> {
+        let uuid = uuid::Uuid::new_v4();
+        tracing::Span::current().record("uuid", &uuid.to_string());
+        tracing::info!("get_device 10");
         self.wait_if_user_pending(user_id, timeout).await?;
-        self.store().get_device(user_id, device_id).await
+        tracing::info!("get_device 20");
+        let r = self.store().get_device(user_id, device_id).await;
+        tracing::info!("get_device 30");
+        r
     }
 
     /// Get the cross signing user identity of a user.
@@ -1662,14 +1680,20 @@ impl OlmMachine {
     ///
     /// Returns a `UserIdentities` enum if one is found and the crypto store
     /// didn't throw an error.
-    #[instrument(skip(self))]
+    #[instrument(skip(self), fields(uuid))]
     pub async fn get_identity(
         &self,
         user_id: &UserId,
         timeout: Option<Duration>,
     ) -> StoreResult<Option<UserIdentities>> {
+        let uuid = uuid::Uuid::new_v4();
+        tracing::Span::current().record("uuid", &uuid.to_string());
+        tracing::info!("get_identity 10");
         self.wait_if_user_pending(user_id, timeout).await?;
-        self.store().get_identity(user_id).await
+        tracing::info!("get_identity 20");
+        let r = self.store().get_identity(user_id).await;
+        tracing::info!("get_identity 30");
+        r
     }
 
     /// Get a map holding all the devices of an user.

@@ -40,7 +40,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    fmt::Debug,
+    fmt::{Debug, Formatter},
     ops::Deref,
     pin::pin,
     sync::{atomic::Ordering, Arc, RwLock as StdRwLock},
@@ -102,7 +102,7 @@ pub use crate::gossiping::{GossipRequest, SecretInfo};
 /// adds the generic interface on top.
 #[derive(Debug, Clone)]
 pub struct Store {
-    inner: Arc<StoreInner>,
+    inner: NoisyArc<StoreInner>,
 }
 
 #[derive(Debug, Default)]
@@ -468,7 +468,6 @@ impl StoreTransaction {
     }
 }
 
-#[derive(Debug)]
 struct StoreInner {
     identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
     store: NoisyArc<CryptoStoreWrapper>,
@@ -483,6 +482,18 @@ struct StoreInner {
     /// Static account data that never changes (and thus can be loaded once and
     /// for all when creating the store).
     static_account: StaticAccountData,
+}
+
+impl Debug for StoreInner {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreInner").finish_non_exhaustive()
+    }
+}
+
+impl Drop for StoreInner {
+    fn drop(&mut self) {
+        info!("StoreInner::drop");
+    }
 }
 
 /// Aggregated changes to be saved in the database.
@@ -886,7 +897,7 @@ impl Store {
         verification_machine: VerificationMachine,
     ) -> Self {
         Self {
-            inner: Arc::new(StoreInner {
+            inner: NoisyArc::new_noisy(StoreInner {
                 static_account: account,
                 identity,
                 store: store.clone(),
