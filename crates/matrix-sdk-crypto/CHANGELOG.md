@@ -25,6 +25,9 @@ Breaking changes:
 
 Additions:
 
+- Expose new method `BackupMachine::backup_version`.
+  ([#3320](https://github.com/matrix-org/matrix-rust-sdk/pull/3320))
+
 - Expose new method `OlmMachine::device_creation_time`.
   ([#3275](https://github.com/matrix-org/matrix-rust-sdk/pull/3275))
 
