@@ -22,7 +22,10 @@ use matrix_sdk::attachment::{
     AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
     BaseThumbnailInfo, BaseVideoInfo, Thumbnail,
 };
-use matrix_sdk_ui::timeline::{BackPaginationStatus, EventItemOrigin, Profile, TimelineDetails};
+use matrix_sdk_ui::timeline::{
+    BackPaginationStatus, EventItemOrigin, Profile, TimelineDetails,
+    TimelineFocus as SdkTimelineFocus,
+};
 use mime::Mime;
 use ruma::{
     events::{
@@ -179,8 +182,46 @@ impl Timeline {
     /// Loads older messages into the timeline.
     ///
     /// Raises an exception if there are no timeline listeners.
-    pub fn paginate_backwards(&self, opts: PaginationOptions) -> Result<(), ClientError> {
-        RUNTIME.block_on(async { Ok(self.inner.paginate_backwards(opts.into()).await?) })
+    ///
+    /// NOTE: as a temporary shortcut, this can be used only if the timeline is
+    /// in live mode.
+    pub async fn paginate_backwards(&self, opts: PaginationOptions) -> Result<(), ClientError> {
+        Ok(self.inner.paginate_backwards(opts.into()).await?)
+    }
+
+    /// Switches the timeline focus to the one given as a parameter.
+    ///
+    /// Returns whether the timeline did change focus, or if an error occurred.
+    ///
+    /// TODO: this API is bad: the apps can't tell that an event hasn't been
+    /// found??
+    pub async fn switch_focus(&self, focus: TimelineFocus) -> Result<bool, ClientError> {
+        Ok(match focus {
+            TimelineFocus::Live => self.inner.switch_focus(SdkTimelineFocus::Live).await,
+
+            TimelineFocus::Event { event_id } => {
+                let event_id = EventId::parse(event_id)?;
+                self.inner.switch_focus(SdkTimelineFocus::Event(event_id)).await
+            }
+        })
+    }
+
+    /// Paginate backwards, when in focused mode.
+    ///
+    /// TODO: this should just be `paginate_backwards` lol.
+    ///
+    /// Returns whether we hit the end of the timeline or not.
+    pub async fn permalink_paginate_backwards(&self) -> Result<bool, ClientError> {
+        Ok(self.inner.paginate_backward_focused().await?)
+    }
+
+    /// Paginate forwards, when in focused mode.
+    ///
+    /// TODO: this should just be `paginate_backwards` lol.
+    ///
+    /// Returns whether we hit the end of the timeline or not.
+    pub async fn permalink_paginate_forwards(&self) -> Result<bool, ClientError> {
+        Ok(self.inner.paginate_forward_focused().await?)
     }
 
     pub fn send_read_receipt(
@@ -1032,4 +1073,14 @@ impl From<ReceiptType> for ruma::api::client::receipt::create_receipt::v3::Recei
             ReceiptType::FullyRead => Self::FullyRead,
         }
     }
+}
+
+#[derive(uniffi::Enum)]
+pub enum TimelineFocus {
+    /// Receive events from live sync.
+    Live,
+
+    /// Focus on the given event, and allow paginating backwards/forwards from
+    /// there.
+    Event { event_id: String },
 }

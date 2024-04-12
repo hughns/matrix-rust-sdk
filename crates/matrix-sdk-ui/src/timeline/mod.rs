@@ -196,6 +196,8 @@ impl Timeline {
     /// event.
     ///
     /// Returns whether switching to the desired mode worked.
+    ///
+    /// TODO: change to return a result instead.
     pub async fn switch_focus(&self, new_focus: TimelineFocus) -> bool {
         match self.inner.switch_focus(new_focus, &self.event_cache).await {
             Err(err) => {
