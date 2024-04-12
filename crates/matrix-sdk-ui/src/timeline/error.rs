@@ -59,7 +59,7 @@ pub enum Error {
 
     /// Something went wrong with the room event cache.
     #[error("Something went wrong with the room event cache.")]
-    EventCacheError(#[source] EventCacheError),
+    EventCacheError(#[from] EventCacheError),
 
     /// The timeline isn't in the event focus mode.
     #[error("The timeline isn't in the event focus mode")]

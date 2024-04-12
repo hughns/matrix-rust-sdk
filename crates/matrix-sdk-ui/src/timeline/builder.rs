@@ -15,11 +15,7 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use futures_util::{pin_mut, StreamExt};
-use matrix_sdk::{
-    event_cache::{self, RoomEventCacheUpdate},
-    executor::spawn,
-    Room,
-};
+use matrix_sdk::{event_cache::RoomEventCacheUpdate, executor::spawn, Room};
 use ruma::{
     events::{receipt::ReceiptType, AnySyncTimelineEvent},
     RoomVersionId,
@@ -32,7 +28,7 @@ use super::to_device::{handle_forwarded_room_key_event, handle_room_key_event};
 use super::{
     inner::{TimelineInner, TimelineInnerSettings},
     queue::send_queued_messages,
-    Timeline, TimelineDropHandle, TimelineFocus,
+    Error, Timeline, TimelineDropHandle, TimelineFocus,
 };
 use crate::{timeline::inner::TimelineEnd, unable_to_decrypt_hook::UtdHookManager};
 
@@ -133,7 +129,7 @@ impl TimelineBuilder {
             track_read_receipts = self.settings.track_read_receipts,
         )
     )]
-    pub async fn build(self) -> event_cache::Result<Timeline> {
+    pub async fn build(self) -> Result<Timeline, Error> {
         let Self { room, settings, unable_to_decrypt_hook, focus } = self;
 
         let client = room.client();
@@ -151,7 +147,7 @@ impl TimelineBuilder {
         let mut inner = TimelineInner::new(room, unable_to_decrypt_hook).with_settings(settings);
 
         let is_live_focus = matches!(focus, TimelineFocus::Live);
-        inner.switch_focus(focus, &room_event_cache).await;
+        inner.switch_focus(focus, &room_event_cache).await?;
 
         if track_read_marker_and_receipts {
             inner.populate_initial_user_receipt(ReceiptType::Read).await;

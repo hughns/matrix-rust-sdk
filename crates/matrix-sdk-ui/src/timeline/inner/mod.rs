@@ -346,7 +346,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
                 self.focus.switch_to_live().await;
 
                 // Note: only clear events if we suspect there could be a hole, aka a previous
-                // pagination didn't have a next-batch token.
+                // pagination didn't have a prev-batch token.
                 // TODO(bnjbvr): implement the above behavior ^
 
                 self.clear().await;
