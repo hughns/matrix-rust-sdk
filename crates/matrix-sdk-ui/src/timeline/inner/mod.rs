@@ -326,7 +326,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
 
     /// Switches the focus to the live mode.
     pub(super) async fn focus_live(&self, event_cache: &RoomEventCache) -> Result<(), Error> {
-        if matches!(*self.focus.data.read().await, TimelineFocusData::Live) {
+        if self.focus.is_live().await {
             // No-op: don't do anything.
             return Ok(());
         }

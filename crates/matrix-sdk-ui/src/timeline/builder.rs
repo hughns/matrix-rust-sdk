@@ -152,7 +152,17 @@ impl TimelineBuilder {
         }
 
         match focus {
-            TimelineFocus::Live => inner.focus_live(&room_event_cache).await?,
+            TimelineFocus::Live => {
+                inner.focus_live(&room_event_cache).await?;
+                // Add the initial events.
+                inner
+                    .add_events_at(
+                        initial_events,
+                        crate::timeline::inner::TimelineEnd::Back { from_cache: true },
+                    )
+                    .await;
+            }
+
             TimelineFocus::Event(event) => inner.focus_event(event).await?,
         }
 
