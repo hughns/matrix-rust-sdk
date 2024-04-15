@@ -63,13 +63,14 @@ use tracing::{field, info_span, Instrument as _};
 #[cfg(feature = "e2e-encryption")]
 use super::traits::Decryptor;
 use super::{
+    error::PaginationError,
     event_item::EventItemIdentifier,
     reactions::ReactionToggleResult,
     traits::RoomDataProvider,
     util::{rfind_event_by_id, rfind_event_item, RelativePosition},
-    AnnotationKey, BackPaginationStatus, Error, EventSendState, EventTimelineItem,
-    InReplyToDetails, Message, Profile, RepliedToEvent, TimelineDetails, TimelineFocus,
-    TimelineItem, TimelineItemContent, TimelineItemKind,
+    AnnotationKey, Error, EventSendState, EventTimelineItem, InReplyToDetails, Message,
+    PaginationStatus, Profile, RepliedToEvent, TimelineDetails, TimelineItem, TimelineItemContent,
+    TimelineItemKind,
 };
 use crate::{
     timeline::{day_dividers::DayDividerAdjuster, TimelineEventFilterFn},
@@ -91,21 +92,21 @@ enum TimelineFocusData {
 
     /// The timeline is focused on a single event, and it can expand in one
     /// direction or another.
-    Event { paginator: Paginator },
+    Event {
+        /// The event id we've started to focus on.
+        event_id: OwnedEventId,
+        /// The paginator instance.
+        paginator: Paginator,
+    },
 }
 
 #[derive(Debug)]
 pub(crate) struct Focus {
-    /// Observable for whether a pagination is currently running.
-    ///
-    /// Only set in [`TimelineFocus::Live`] mode. It exists for all the focus
-    /// modes, so that we never re-create a new observable (which would be
-    /// confused, as callers would need to re-subscribe after switching
-    /// mode).
-    pub(crate) back_pagination_status: SharedObservable<BackPaginationStatus>,
+    /// Observable for whether a backward pagination is currently running.
+    pub(crate) back_pagination_status: SharedObservable<PaginationStatus>,
 
-    /// Current focus of this timeline.
-    pub(crate) kind: SharedObservable<TimelineFocus>,
+    /// Observable for whether a forward pagination is currently running.
+    pub(crate) forward_pagination_status: SharedObservable<PaginationStatus>,
 
     data: RwLock<TimelineFocusData>,
 }
@@ -114,8 +115,8 @@ impl Default for Focus {
     fn default() -> Self {
         // By default, the [`Focus`] goes into live mode.
         Self {
-            back_pagination_status: SharedObservable::new(BackPaginationStatus::Idle),
-            kind: SharedObservable::new(TimelineFocus::Live),
+            back_pagination_status: SharedObservable::new(PaginationStatus::Idle),
+            forward_pagination_status: SharedObservable::new(PaginationStatus::Idle),
             data: RwLock::new(TimelineFocusData::Live),
         }
     }
@@ -124,8 +125,6 @@ impl Default for Focus {
 impl Focus {
     async fn switch_to_live(&self) {
         *self.data.write().await = TimelineFocusData::Live;
-
-        self.kind.set(TimelineFocus::Live);
     }
 
     async fn switch_to_event(
@@ -134,32 +133,31 @@ impl Focus {
         room: Box<dyn PaginableRoom>,
     ) -> Result<StartFromResult, PaginatorError> {
         let paginator = Paginator::new(room);
-
         let result = paginator.start_from(&event).await?;
-
-        *self.data.write().await = TimelineFocusData::Event { paginator };
-
-        self.kind.set(TimelineFocus::Event(event));
-
+        *self.data.write().await = TimelineFocusData::Event { paginator, event_id: event };
         Ok(result)
     }
 
-    async fn paginate_backward(&self) -> Result<PaginationResult, Error> {
+    async fn paginate_backward(&self) -> Result<PaginationResult, PaginationError> {
         match &*self.data.read().await {
-            TimelineFocusData::Live => Err(Error::NotEventFocusMode),
-            TimelineFocusData::Event { paginator } => {
-                Ok(paginator.paginate_backward().await.map_err(Error::PaginationError)?)
+            TimelineFocusData::Live => Err(PaginationError::NotEventFocusMode),
+            TimelineFocusData::Event { paginator, .. } => {
+                Ok(paginator.paginate_backward().await.map_err(PaginationError::Paginator)?)
             }
         }
     }
 
-    async fn paginate_forward(&self) -> Result<PaginationResult, Error> {
+    async fn paginate_forward(&self) -> Result<PaginationResult, PaginationError> {
         match &*self.data.read().await {
-            TimelineFocusData::Live => Err(Error::NotEventFocusMode),
-            TimelineFocusData::Event { paginator } => {
-                Ok(paginator.paginate_forward().await.map_err(Error::PaginationError)?)
+            TimelineFocusData::Live => Err(PaginationError::NotEventFocusMode),
+            TimelineFocusData::Event { paginator, .. } => {
+                Ok(paginator.paginate_forward().await.map_err(PaginationError::Paginator)?)
             }
         }
+    }
+
+    pub async fn is_live(&self) -> bool {
+        matches!(*self.data.read().await, TimelineFocusData::Live)
     }
 }
 
@@ -326,65 +324,107 @@ impl<P: RoomDataProvider> TimelineInner<P> {
         self
     }
 
-    /// Switches the focus of the timeline to the new given one.
-    ///
-    /// May start requests in the background.
-    ///
-    /// Returns whether switching to the desired mode worked.
-    pub(super) async fn switch_focus(
-        &self,
-        focus: TimelineFocus,
-        event_cache: &RoomEventCache,
-    ) -> Result<(), Error> {
-        if focus == self.focus.kind.get() {
+    /// Switches the focus to the live mode.
+    pub(super) async fn focus_live(&self, event_cache: &RoomEventCache) -> Result<(), Error> {
+        if matches!(*self.focus.data.read().await, TimelineFocusData::Live) {
             // No-op: don't do anything.
             return Ok(());
         }
 
-        match focus {
-            TimelineFocus::Live => {
-                self.focus.switch_to_live().await;
+        self.focus.switch_to_live().await;
 
-                // Note: only clear events if we suspect there could be a hole, aka a previous
-                // pagination didn't have a prev-batch token.
-                // TODO(bnjbvr): implement the above behavior ^
+        // TODO: Ideally, we'd only clear events if we suspect there could be a hole,
+        // aka a previous pagination didn't have a prev-batch token.
 
-                self.clear().await;
-                let (events, _) = event_cache.subscribe().await.map_err(Error::EventCacheError)?;
-                self.add_events_at(events, TimelineEnd::Back { from_cache: true }).await;
-            }
-
-            TimelineFocus::Event(ev) => {
-                let paginable_room = Box::new(self.room_data_provider.clone());
-                let response = self
-                    .focus
-                    .switch_to_event(ev, paginable_room)
-                    .await
-                    .map_err(Error::PaginationError)?;
-                self.clear().await;
-                self.add_events_at(response.events, TimelineEnd::Back { from_cache: false }).await;
-            }
-        }
+        self.clear().await;
+        let (events, _) = event_cache.subscribe().await.map_err(Error::EventCacheError)?;
+        self.add_events_at(events, TimelineEnd::Back { from_cache: true }).await;
 
         Ok(())
     }
 
-    /// Runs a back-pagination, in focused mode.
-    ///
-    /// Returns whether we hit the start of the timeline.
-    pub(super) async fn paginate_backward_focused(&self) -> Result<bool, Error> {
-        let result = self.focus.paginate_backward().await?;
-        self.add_events_at(result.events, TimelineEnd::Front).await;
-        Ok(result.hit_end_of_timeline)
+    pub(super) async fn focus_event(&self, target: OwnedEventId) -> Result<(), Error> {
+        if let TimelineFocusData::Event { event_id, .. } = &*self.focus.data.read().await {
+            if *event_id == target {
+                return Ok(());
+            }
+        }
+
+        let paginable_room = Box::new(self.room_data_provider.clone());
+        let response = self
+            .focus
+            .switch_to_event(target, paginable_room)
+            .await
+            .map_err(PaginationError::Paginator)?;
+
+        self.clear().await;
+        self.add_events_at(response.events, TimelineEnd::Back { from_cache: false }).await;
+
+        Ok(())
     }
 
-    /// Runs a forward-pagination, in focused mode.
+    /// Runs a back-pagination, if the timeline is focused on an event.
+    ///
+    /// Returns whether we hit the start of the timeline.
+    pub(super) async fn paginate_backward_focused(&self) -> Result<bool, PaginationError> {
+        let status = &self.focus.back_pagination_status;
+        if status.get() == PaginationStatus::TimelineEndReached {
+            return Ok(true);
+        }
+
+        status.set(PaginationStatus::Paginating);
+
+        let outcome_result = self.focus.paginate_backward().await;
+
+        let outcome = match outcome_result {
+            Ok(result) => result,
+            Err(err) => {
+                status.set(PaginationStatus::Idle);
+                return Err(err);
+            }
+        };
+
+        self.add_events_at(outcome.events, TimelineEnd::Front).await;
+
+        status.set(if outcome.hit_end_of_timeline {
+            PaginationStatus::TimelineEndReached
+        } else {
+            PaginationStatus::Idle
+        });
+
+        Ok(outcome.hit_end_of_timeline)
+    }
+
+    /// Runs a forward-pagination, if the timeline is focused on an event.
     ///
     /// Returns whether we hit the end of the timeline.
-    pub(super) async fn paginate_forward_focused(&self) -> Result<bool, Error> {
-        let result = self.focus.paginate_forward().await?;
-        self.add_events_at(result.events, TimelineEnd::Back { from_cache: false }).await;
-        Ok(result.hit_end_of_timeline)
+    pub(super) async fn paginate_forward_focused(&self) -> Result<bool, PaginationError> {
+        let status = &self.focus.forward_pagination_status;
+        if status.get() == PaginationStatus::TimelineEndReached {
+            return Ok(true);
+        }
+
+        status.set(PaginationStatus::Paginating);
+
+        let outcome_result = self.focus.paginate_forward().await;
+
+        let outcome = match outcome_result {
+            Ok(result) => result,
+            Err(err) => {
+                status.set(PaginationStatus::Idle);
+                return Err(err);
+            }
+        };
+
+        self.add_events_at(outcome.events, TimelineEnd::Back { from_cache: false }).await;
+
+        status.set(if outcome.hit_end_of_timeline {
+            PaginationStatus::TimelineEndReached
+        } else {
+            PaginationStatus::Idle
+        });
+
+        Ok(outcome.hit_end_of_timeline)
     }
 
     /// Get a copy of the current items in the list.

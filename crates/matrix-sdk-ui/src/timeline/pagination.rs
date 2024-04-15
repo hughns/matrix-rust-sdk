@@ -14,37 +14,61 @@
 
 use std::{fmt, ops::ControlFlow, sync::Arc, time::Duration};
 
+use eyeball::Subscriber;
 use matrix_sdk::event_cache::{self, BackPaginationOutcome};
+use ruma::OwnedEventId;
 use tracing::{instrument, trace, warn};
 
+use super::Error;
 use crate::timeline::inner::TimelineEnd;
 
-#[derive(Debug, thiserror::Error)]
-enum TimelineBackpaginationError {
-    #[error("The timeline isn't in live mode")]
-    NonLiveMode,
-
-    #[error("Error in event cache: {0}")]
-    EventCache(#[source] event_cache::EventCacheError),
-}
-
 impl super::Timeline {
+    /// Assuming the timeline is focused on an event, starts a forwards
+    /// pagination.
+    ///
+    /// Returns whether we hit the end of the timeline.
+    #[instrument(skip_all)]
+    pub async fn paginate_forwards(&self) -> Result<bool, Error> {
+        Ok(self.inner.paginate_forward_focused().await?)
+    }
+
     /// Add more events to the start of the timeline.
+    ///
+    /// Returns whether we hit the start of the timeline.
+    #[instrument(skip_all, fields(room_id = ?self.room().room_id()))]
+    pub async fn paginate_backwards(&self) -> Result<bool, Error> {
+        // TODO: the pagination options are ignored when focused on an event, consider
+        // not ignoring those?
+        if self.inner.focus.is_live().await {
+            Ok(self
+                .live_paginate_backwards_with_options(PaginationOptions::until_num_items(50, 20))
+                .await?)
+        } else {
+            Ok(self.inner.paginate_backward_focused().await?)
+        }
+    }
+
+    /// Paginate backwards in live mode.
+    ///
+    /// This can only be called when the timeline is in live mode, not focused
+    /// on a specific event.
+    ///
+    /// Returns whether we hit the start of the timeline.
     #[instrument(skip_all, fields(room_id = ?self.room().room_id(), ?options))]
-    pub async fn paginate_backwards(
+    pub async fn live_paginate_backwards_with_options(
         &self,
         mut options: PaginationOptions<'_>,
-    ) -> event_cache::Result<()> {
+    ) -> event_cache::Result<bool> {
         let back_pagination_status = &self.inner.focus.back_pagination_status;
 
-        if back_pagination_status.get() == BackPaginationStatus::TimelineStartReached {
+        if back_pagination_status.get() == PaginationStatus::TimelineEndReached {
             warn!("Start of timeline reached, ignoring backwards-pagination request");
-            return Ok(());
+            return Ok(true);
         }
 
-        if back_pagination_status.set_if_not_eq(BackPaginationStatus::Paginating).is_none() {
+        if back_pagination_status.set_if_not_eq(PaginationStatus::Paginating).is_none() {
             warn!("Another back-pagination is already running in the background");
-            return Ok(());
+            return Ok(false);
         }
 
         // The first time, we allow to wait a bit for *a* back-pagination token to come
@@ -69,8 +93,8 @@ impl super::Timeline {
 
                         if reached_start {
                             back_pagination_status
-                                .set_if_not_eq(BackPaginationStatus::TimelineStartReached);
-                            return Ok(());
+                                .set_if_not_eq(PaginationStatus::TimelineEndReached);
+                            return Ok(true);
                         }
 
                         outcome.events_received = num_events as u64;
@@ -106,8 +130,35 @@ impl super::Timeline {
             }
         }
 
-        back_pagination_status.set_if_not_eq(BackPaginationStatus::Idle);
-        Ok(())
+        back_pagination_status.set_if_not_eq(PaginationStatus::Idle);
+        Ok(false)
+    }
+
+    /// Subscribe to the back-pagination status of the timeline.
+    pub fn back_pagination_status(&self) -> Subscriber<PaginationStatus> {
+        self.inner.focus.back_pagination_status.subscribe()
+    }
+
+    /// Subscribe to the forward-pagination status of the timeline.
+    pub fn forward_pagination_status(&self) -> Subscriber<PaginationStatus> {
+        self.inner.focus.forward_pagination_status.subscribe()
+    }
+
+    /// Switches the focus of the timeline to the live mode, that is, events are
+    /// appended from the sync in real-time.
+    ///
+    /// If the timeline was focusing on an event before, then it'll forget about
+    /// all the previous events it contained.
+    pub async fn focus_live(&self) -> Result<(), Error> {
+        self.inner.focus_live(&self.event_cache).await
+    }
+
+    /// Switches the focus of the timeline to a precise event and its
+    /// surrounding context.
+    ///
+    /// This enables use of the [`Self::paginate_forwards`] method.
+    pub async fn focus_event(&self, event: OwnedEventId) -> Result<(), Error> {
+        self.inner.focus_event(event).await
     }
 }
 
@@ -259,12 +310,17 @@ pub struct PaginationOutcome {
     pub total_items_updated: u64,
 }
 
+/// The status of a pagination.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
-pub enum BackPaginationStatus {
+pub enum PaginationStatus {
+    /// No pagination happening.
     Idle,
+    /// Timeline is paginating for this end.
     Paginating,
-    TimelineStartReached,
+    /// An end of the timeline (front or back) has been reached by this
+    /// pagination.
+    TimelineEndReached,
 }
 
 #[cfg(test)]

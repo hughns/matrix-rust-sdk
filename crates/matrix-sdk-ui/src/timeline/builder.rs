@@ -30,7 +30,7 @@ use super::{
     queue::send_queued_messages,
     Error, Timeline, TimelineDropHandle, TimelineFocus,
 };
-use crate::{timeline::inner::TimelineEnd, unable_to_decrypt_hook::UtdHookManager};
+use crate::unable_to_decrypt_hook::UtdHookManager;
 
 /// Builder that allows creating and configuring various parts of a
 /// [`Timeline`].
@@ -146,16 +146,14 @@ impl TimelineBuilder {
 
         let mut inner = TimelineInner::new(room, unable_to_decrypt_hook).with_settings(settings);
 
-        let is_live_focus = matches!(focus, TimelineFocus::Live);
-        inner.switch_focus(focus, &room_event_cache).await?;
-
         if track_read_marker_and_receipts {
             inner.populate_initial_user_receipt(ReceiptType::Read).await;
             inner.populate_initial_user_receipt(ReceiptType::ReadPrivate).await;
         }
 
-        if is_live_focus && has_initial_events {
-            inner.add_events_at(initial_events, TimelineEnd::Back { from_cache: true }).await;
+        match focus {
+            TimelineFocus::Live => inner.focus_live(&room_event_cache).await?,
+            TimelineFocus::Event(event) => inner.focus_event(event).await?,
         }
 
         if track_read_marker_and_receipts {
@@ -200,7 +198,7 @@ impl TimelineBuilder {
                         }
 
                         RoomEventCacheUpdate::Clear => {
-                            if inner.focus.kind.get() != TimelineFocus::Live {
+                            if !inner.focus.is_live().await {
                                 // Ignore live updates for a timeline not in live mode.
                                 continue;
                             }
@@ -210,7 +208,7 @@ impl TimelineBuilder {
                         }
 
                         RoomEventCacheUpdate::Append { events, ephemeral, ambiguity_changes } => {
-                            if inner.focus.kind.get() != TimelineFocus::Live {
+                            if !inner.focus.is_live().await {
                                 // Ignore live updates for a timeline not in live mode.
                                 continue;
                             }

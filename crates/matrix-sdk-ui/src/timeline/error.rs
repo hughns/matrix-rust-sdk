@@ -61,13 +61,20 @@ pub enum Error {
     #[error("Something went wrong with the room event cache.")]
     EventCacheError(#[from] EventCacheError),
 
+    /// An error happened during pagination.
+    #[error("An error happened during pagination.")]
+    PaginationError(#[from] PaginationError),
+}
+
+#[derive(Error, Debug)]
+pub enum PaginationError {
     /// The timeline isn't in the event focus mode.
     #[error("The timeline isn't in the event focus mode")]
     NotEventFocusMode,
 
     /// An error occurred while paginating.
     #[error("Error when paginating.")]
-    PaginationError(#[source] PaginatorError),
+    Paginator(#[source] PaginatorError),
 }
 
 #[derive(Error)]

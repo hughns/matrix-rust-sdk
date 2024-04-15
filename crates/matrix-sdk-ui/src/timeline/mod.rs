@@ -18,7 +18,6 @@
 
 use std::{pin::Pin, sync::Arc, task::Poll};
 
-use eyeball::Subscriber;
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
 use imbl::Vector;
@@ -86,7 +85,7 @@ mod virtual_item;
 
 pub use self::{
     builder::TimelineBuilder,
-    error::{Error, UnsupportedEditItem, UnsupportedReplyItem},
+    error::{Error, PaginationError, UnsupportedEditItem, UnsupportedReplyItem},
     event_item::{
         AnyOtherFullStateEventContent, BundledReactions, EncryptedMessage, EventItemOrigin,
         EventSendState, EventTimelineItem, InReplyToDetails, MemberProfileChange, MembershipChange,
@@ -96,7 +95,7 @@ pub use self::{
     event_type_filter::TimelineEventTypeFilter,
     inner::default_event_filter,
     item::{TimelineItem, TimelineItemKind},
-    pagination::{BackPaginationStatus, PaginationOptions, PaginationOutcome},
+    pagination::{PaginationOptions, PaginationOutcome, PaginationStatus},
     polls::PollResult,
     reactions::ReactionSenderData,
     sliding_sync_ext::SlidingSyncRoomExt,
@@ -172,51 +171,6 @@ impl Timeline {
         self.inner.clear().await;
     }
 
-    /// Subscribe to the back-pagination status of the timeline.
-    ///
-    /// This only emits notifications when the timeline is set to a
-    /// [`TimelineFocus::Live`] mode.
-    pub fn back_pagination_status(&self) -> Subscriber<BackPaginationStatus> {
-        self.inner.focus.back_pagination_status.subscribe()
-    }
-
-    /// Subscribe to the focus of the timeline.
-    ///
-    /// The timeline focus automatically updates from [`TimelineFocus::Event`]
-    /// to [`TimelineFocus::Sync`] when all forward paginations have ended.
-    ///
-    /// It's thus necessary to observe the focus to figure that out.
-    pub fn focus(&self) -> Subscriber<TimelineFocus> {
-        self.inner.focus.kind.subscribe()
-    }
-
-    /// Switches the focus of the timeline to the new given [`TimelineFocus`].
-    ///
-    /// This may send server queries if the new requested focus is on a specific
-    /// event.
-    ///
-    /// Returns whether switching to the desired mode worked.
-    ///
-    /// TODO: change to return a result instead.
-    pub async fn switch_focus(&self, new_focus: TimelineFocus) -> bool {
-        match self.inner.switch_focus(new_focus, &self.event_cache).await {
-            Err(err) => {
-                warn!("error when switching focus: {err}");
-                false
-            }
-            Ok(()) => true,
-        }
-    }
-
-    pub async fn paginate_backward_focused(&self) -> Result<bool, Error> {
-        // TODO: unify with Self::paginate_backward()
-        self.inner.paginate_backward_focused().await
-    }
-
-    pub async fn paginate_forward_focused(&self) -> Result<bool, Error> {
-        self.inner.paginate_forward_focused().await
-    }
-
     /// Retry decryption of previously un-decryptable events given a list of
     /// session IDs whose keys have been imported.
     ///
@@ -273,9 +227,10 @@ impl Timeline {
 
     /// Get the latest of the timeline's event items.
     pub async fn latest_event(&self) -> Option<EventTimelineItem> {
-        match self.inner.focus.kind.get() {
-            TimelineFocus::Live => self.inner.items().await.last()?.as_event().cloned(),
-            TimelineFocus::Event(_) => None,
+        if self.inner.focus.is_live().await {
+            self.inner.items().await.last()?.as_event().cloned()
+        } else {
+            None
         }
     }
 

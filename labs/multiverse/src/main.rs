@@ -30,8 +30,7 @@ use matrix_sdk_ui::{
     room_list_service,
     sync_service::{self, SyncService},
     timeline::{
-        PaginationOptions, TimelineFocus, TimelineItem, TimelineItemContent, TimelineItemKind,
-        VirtualTimelineItem,
+        PaginationOptions, TimelineItem, TimelineItemContent, TimelineItemKind, VirtualTimelineItem,
     },
     Timeline as SdkTimeline,
 };
@@ -342,9 +341,9 @@ impl App {
         // Start a new one, request batches of 20 events, stop after 10 timeline items
         // have been added.
         *pagination = Some(spawn(async move {
-            if !sdk_timeline.switch_focus(TimelineFocus::Live).await {
+            if let Err(err) = sdk_timeline.focus_live().await {
                 //self.set_status_message("couldn't switch focus back to live".to_owned());
-                error!("didn't switch back to live");
+                error!("didn't switch back to live: {err}");
             } else {
                 //self.set_status_message("switched back to live!".to_owned());
             }
@@ -385,7 +384,8 @@ impl App {
         // Start a new one, request batches of 20 events, stop after 10 timeline items
         // have been added.
         *pagination = Some(spawn(async move {
-            if !sdk_timeline.switch_focus(TimelineFocus::Event(target)).await {
+            if let Err(err) = sdk_timeline.focus_event(target).await {
+                error!("when focusing to event: {err}");
                 return;
             }
 
@@ -397,7 +397,7 @@ impl App {
                 i -= 1;
 
                 if has_prev {
-                    has_prev = match sdk_timeline.paginate_backward_focused().await {
+                    has_prev = match sdk_timeline.paginate_backwards().await {
                         Ok(has_prev) => has_prev,
                         Err(err) => {
                             error!("when focus-back-paginating: {err}");
@@ -407,7 +407,7 @@ impl App {
                 }
 
                 if has_next {
-                    has_next = match sdk_timeline.paginate_forward_focused().await {
+                    has_next = match sdk_timeline.paginate_forwards().await {
                         Ok(has_next) => has_next,
                         Err(err) => {
                             error!("when focus-forward-paginating: {err}");
@@ -439,8 +439,9 @@ impl App {
         // Start a new one, request batches of 20 events, stop after 10 timeline items
         // have been added.
         *pagination = Some(spawn(async move {
-            if let Err(err) =
-                sdk_timeline.paginate_backwards(PaginationOptions::until_num_items(20, 10)).await
+            if let Err(err) = sdk_timeline
+                .live_paginate_backwards_with_options(PaginationOptions::until_num_items(20, 10))
+                .await
             {
                 // TODO: would be nice to be able to set the status
                 // message remotely?

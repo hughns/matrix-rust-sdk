@@ -293,7 +293,7 @@ impl TestRoomDataProvider {
 impl PaginableRoom for TestRoomDataProvider {
     async fn event_with_context(
         &self,
-        event_id: &EventId,
+        _event_id: &EventId,
         _lazy_load_members: bool,
     ) -> Result<EventWithContextResponse, PaginatorError> {
         unimplemented!();
