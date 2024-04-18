@@ -12,30 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{future::IntoFuture, pin::Pin};
+use std::future::IntoFuture;
 
 use eyeball::SharedObservable;
-use futures_core::{Future, Stream};
+use futures_core::Stream;
 use mas_oidc_client::types::{
     client_credentials::ClientCredentials,
     registration::VerifiedClientMetadata,
     scope::{MatrixApiScopeToken, ScopeToken},
 };
 use matrix_sdk_base::{
+    boxed_into_future,
     crypto::qr_login::{QrCodeData, QrCodeMode},
     SessionMeta,
 };
 use openidconnect::{
     core::{
-        CoreAuthDisplay, CoreClaimName, CoreClaimType, CoreClient, CoreClientAuthMethod,
-        CoreDeviceAuthorizationResponse, CoreGrantType, CoreJsonWebKey, CoreJsonWebKeyType,
-        CoreJsonWebKeyUse, CoreJweContentEncryptionAlgorithm, CoreJweKeyManagementAlgorithm,
-        CoreJwsSigningAlgorithm, CoreResponseMode, CoreResponseType, CoreSubjectIdentifierType,
+        CoreAuthDisplay, CoreAuthPrompt, CoreClaimName, CoreClaimType, CoreClient,
+        CoreClientAuthMethod, CoreDeviceAuthorizationResponse, CoreErrorResponseType,
+        CoreGenderClaim, CoreGrantType, CoreJsonWebKey, CoreJweContentEncryptionAlgorithm,
+        CoreJweKeyManagementAlgorithm, CoreResponseMode, CoreResponseType, CoreRevocableToken,
+        CoreRevocationErrorResponse, CoreSubjectIdentifierType, CoreTokenIntrospectionResponse,
+        CoreTokenResponse,
     },
     reqwest::Proxy,
     AdditionalProviderMetadata, AuthType, ClientId, ClientSecret, DeviceAuthorizationUrl,
-    EndpointMaybeSet, EndpointNotSet, EndpointSet, IssuerUrl, OAuth2TokenResponse,
-    ProviderMetadata, Scope,
+    EmptyAdditionalClaims, EndpointMaybeSet, EndpointNotSet, EndpointSet, IssuerUrl,
+    OAuth2TokenResponse, ProviderMetadata, Scope, StandardErrorResponse,
 };
 use ruma::{api::client::discovery::discover_homeserver::AuthenticationServerInfo, OwnedDeviceId};
 use vodozemac::{secure_channel::CheckCode, Curve25519PublicKey, Curve25519SecretKey};
@@ -64,16 +67,14 @@ type DeviceProviderMetadata = ProviderMetadata<
     CoreGrantType,
     CoreJweContentEncryptionAlgorithm,
     CoreJweKeyManagementAlgorithm,
-    CoreJwsSigningAlgorithm,
-    CoreJsonWebKeyType,
-    CoreJsonWebKeyUse,
     CoreJsonWebKey,
     CoreResponseMode,
     CoreResponseType,
     CoreSubjectIdentifierType,
 >;
 
-type OidcClientInner<
+/// OpenID Connect Core client.
+pub type OidcClientInner<
     HasAuthUrl = EndpointSet,
     HasDeviceAuthUrl = EndpointSet,
     HasIntrospectionUrl = EndpointNotSet,
@@ -81,21 +82,17 @@ type OidcClientInner<
     HasTokenUrl = EndpointMaybeSet,
     HasUserInfoUrl = EndpointMaybeSet,
 > = openidconnect::Client<
-    openidconnect::EmptyAdditionalClaims,
+    EmptyAdditionalClaims,
     CoreAuthDisplay,
-    openidconnect::core::CoreGenderClaim,
+    CoreGenderClaim,
     CoreJweContentEncryptionAlgorithm,
-    CoreJwsSigningAlgorithm,
-    CoreJsonWebKeyType,
-    CoreJsonWebKeyUse,
     CoreJsonWebKey,
-    openidconnect::core::CoreAuthPrompt,
-    openidconnect::StandardErrorResponse<openidconnect::core::CoreErrorResponseType>,
-    openidconnect::core::CoreTokenResponse,
-    openidconnect::core::CoreTokenType,
-    openidconnect::core::CoreTokenIntrospectionResponse,
-    openidconnect::core::CoreRevocableToken,
-    openidconnect::core::CoreRevocationErrorResponse,
+    CoreAuthPrompt,
+    StandardErrorResponse<CoreErrorResponseType>,
+    CoreTokenResponse,
+    CoreTokenIntrospectionResponse,
+    CoreRevocableToken,
+    CoreRevocationErrorResponse,
     HasAuthUrl,
     HasDeviceAuthUrl,
     HasIntrospectionUrl,
@@ -187,7 +184,7 @@ impl<'a> LoginWithQrCode<'a> {
 
 impl<'a> IntoFuture for LoginWithQrCode<'a> {
     type Output = Result<(), Error>;
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + 'a>>;
+    boxed_into_future!(extra_bounds: 'a);
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {

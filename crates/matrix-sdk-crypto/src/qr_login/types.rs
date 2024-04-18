@@ -27,7 +27,7 @@ const PREFIX: &[u8] = b"MATRIX";
 
 #[derive(Debug, Error)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Error), uniffi(flat_error))]
-pub enum QrCodeDecodeError {
+pub enum CryptoQrCodeDecodeError {
     #[error("The QR code data is missing some fields.")]
     NotEnoughData(#[from] std::io::Error),
     #[error("One of the URLs in the QR code data is not a valid UTF-8 string")]
@@ -85,7 +85,7 @@ pub struct QrCodeData {
 }
 
 impl QrCodeData {
-    pub fn from_base64(data: &str) -> Result<Self, QrCodeDecodeError> {
+    pub fn from_base64(data: &str) -> Result<Self, CryptoQrCodeDecodeError> {
         Self::from_bytes(&base64_decode(data)?)
     }
 
@@ -93,7 +93,7 @@ impl QrCodeData {
         base64_encode(self.to_bytes())
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, QrCodeDecodeError> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoQrCodeDecodeError> {
         let mut reader = Cursor::new(bytes);
 
         let mut prefix = [0u8; PREFIX.len()];
@@ -111,8 +111,8 @@ impl QrCodeData {
 
             reader.read_exact(&mut rendezvous_url)?;
 
-            let mode =
-                QrCodeMode::try_from(mode).map_err(|_| QrCodeDecodeError::InvalidMode(mode))?;
+            let mode = QrCodeMode::try_from(mode)
+                .map_err(|_| CryptoQrCodeDecodeError::InvalidMode(mode))?;
 
             let mode = match mode {
                 QrCodeMode::Login => QrCodeModeData::Login,
@@ -133,7 +133,7 @@ impl QrCodeData {
 
             Ok(Self { public_key, rendezvous_url: rendezvous_url, mode })
         } else {
-            Err(QrCodeDecodeError::InvalidVersion(version))
+            Err(CryptoQrCodeDecodeError::InvalidVersion(version))
         }
     }
 

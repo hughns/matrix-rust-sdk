@@ -49,7 +49,7 @@ impl SecureChannel {
         mode: QrCodeModeData,
     ) -> Result<Self, Error> {
         let channel = RendezvousChannel::create_outbound(client, &rendezvous_server).await?;
-        let rendezvous_url = channel.rendezvous_url();
+        let rendezvous_url = channel.rendezvous_url().to_owned();
 
         let ecies = Ecies::new();
         let public_key = ecies.public_key();
@@ -228,21 +228,9 @@ impl EstablishedSecureChannel {
         let ecies = Ecies::new();
         let ecies = ecies.create_outbound_channel(qr_code_data.public_key)?;
 
-        let rendezvous_location =
-            if let Some(segments) = qr_code_data.rendezvous_url.path_segments() {
-                segments.last().ok_or_else(|| url::ParseError::EmptyHost)?.to_owned()
-            } else {
-                todo!()
-            };
-
-        let mut rendezvous_server = qr_code_data.rendezvous_url.clone();
-        rendezvous_server.set_path("");
-        rendezvous_server.set_query(None);
-
         // The initial response will have an empty body, so we can just drop it.
         let InboundChannelCreationResult { channel, initial_message: _ } =
-            RendezvousChannel::create_inbound(client, &rendezvous_server, &rendezvous_location)
-                .await?;
+            RendezvousChannel::create_inbound(client, &qr_code_data.rendezvous_url).await?;
 
         let mut ret = Self { channel, ecies };
 
@@ -323,6 +311,6 @@ mod test {
         .await
         .expect("We should be able to create a Qr auth object from QR code data");
 
-        assert_eq!(bob.channel.rendezvous_server(), &homeserver);
+        assert_eq!(bob.channel.rendezvous_url(), &homeserver);
     }
 }

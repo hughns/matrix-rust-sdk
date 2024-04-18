@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use http::StatusCode;
+use http::{
+    header::{CONTENT_TYPE, ETAG, EXPIRES, IF_MATCH, IF_NONE_MATCH, LAST_MODIFIED},
+    Method, StatusCode,
+};
 use url::Url;
 
 use super::requests;
@@ -22,14 +25,22 @@ pub type Etag = String;
 
 pub(super) struct RendezvousChannel {
     client: HttpClient,
-    rendezvous_server: Url,
-    rendezvous_location: String,
+    rendezvous_url: Url,
     etag: Etag,
 }
 
 pub struct InboundChannelCreationResult {
     pub channel: RendezvousChannel,
     pub initial_message: RendezvousMessage,
+}
+
+struct RendezvousGetResponse {
+    pub status_code: StatusCode,
+    pub etag: String,
+    pub expires: String,
+    pub last_modified: String,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
 }
 
 pub struct RendezvousMessage {
@@ -43,100 +54,82 @@ impl RendezvousChannel {
         client: HttpClient,
         rendezvous_server: &Url,
     ) -> Result<Self, HttpError> {
-        let request = self::requests::create_rendezvous::Request::default();
+        let request = self::requests::create_rendezvous::Request::new();
         let response = client
             .send(request, None, rendezvous_server.to_string(), None, &[], Default::default())
             .await?;
 
-        // TODO: FIX THE DISCOVERY HERE.
-        let rendezvous_server = Url::parse("https://rendezvous.lab.element.dev").unwrap();
-        let rendezvous_location = response.location;
+        let rendezvous_url = response.url;
         let etag = response.etag;
 
-        Ok(Self { client, rendezvous_server, rendezvous_location, etag })
+        Ok(Self { client, rendezvous_url, etag })
     }
 
     pub(super) async fn create_inbound(
         client: HttpClient,
-        rendezvous_server: &Url,
-        rendezvous_location: &str,
+        rendezvous_url: &Url,
     ) -> Result<InboundChannelCreationResult, HttpError> {
-        let rendezvous_server = rendezvous_server.to_owned();
-        let rendezvous_location = rendezvous_location.to_owned();
-
         // Receive the initial message, which is empty? But we need the ETAG to fully
         // establish the rendezvous channel.
-        let (status_code, response) = Self::receive_data_helper(
-            &client,
-            None,
-            &rendezvous_server,
-            rendezvous_location.clone(),
-        )
-        .await?;
+        let response = Self::receive_data_helper(&client.inner, None, &rendezvous_url).await?;
 
         let etag = response.etag.clone();
 
         let initial_message = RendezvousMessage {
-            status_code,
+            status_code: response.status_code,
             body: response.body,
             content_type: response.content_type.unwrap_or_else(|| "application/octet".to_owned()),
         };
 
-        let channel = Self { client, rendezvous_server, rendezvous_location, etag };
+        let channel = Self { client, rendezvous_url: rendezvous_url.clone(), etag };
 
         Ok(InboundChannelCreationResult { channel, initial_message })
     }
 
-    pub(super) fn rendezvous_server(&self) -> &Url {
-        &self.rendezvous_server
-    }
-
-    pub(super) fn rendezvous_url(&self) -> Url {
-        let rendezvous_path = self::requests::create_rendezvous::METADATA
-            .make_endpoint_url(&[], self.rendezvous_server.as_str(), &[], "")
-            .expect("We should be able to build the rendezvous path");
-
-        let rendezvous_url = self
-            .rendezvous_server
-            .join(&rendezvous_path)
-            .unwrap()
-            .join(&self.rendezvous_location)
-            .unwrap();
-
-        rendezvous_url
+    pub(super) fn rendezvous_url(&self) -> &Url {
+        &self.rendezvous_url
     }
 
     async fn receive_data_helper(
-        client: &HttpClient,
+        client: &reqwest::Client,
         etag: Option<String>,
-        rendezvous_server: &Url,
-        rendezvous_session: String,
-    ) -> Result<(StatusCode, requests::receive_rendezvous::Response), HttpError> {
-        let request = requests::receive_rendezvous::Request { rendezvous_session, etag };
-        let rendezvous_server = rendezvous_server.to_string();
+        rendezvous_url: &Url,
+    ) -> Result<RendezvousGetResponse, HttpError> {
+        let mut builder = client.request(Method::GET, rendezvous_url.to_owned());
 
-        let ret = client
-            .send_with_status_code(request, None, rendezvous_server, None, &[], Default::default())
-            .await?;
+        if let Some(etag) = etag {
+            builder = builder.header(IF_NONE_MATCH, etag);
+        }
 
-        Ok(ret)
+        let response = builder.send().await?;
+
+        let status_code = response.status();
+
+        let etag = response.headers().get(ETAG).unwrap().to_str().unwrap().to_owned();
+        let expires = response.headers().get(EXPIRES).unwrap().to_str().unwrap().to_owned();
+        let last_modified =
+            response.headers().get(LAST_MODIFIED).unwrap().to_str().unwrap().to_owned();
+        let content_type =
+            response.headers().get(CONTENT_TYPE).map(|c| c.to_str().unwrap().to_owned());
+
+        let body = response.bytes().await?.to_vec();
+
+        let response =
+            RendezvousGetResponse { status_code, etag, expires, last_modified, content_type, body };
+
+        Ok(response)
     }
 
     pub(super) async fn receive_data(&mut self) -> Result<RendezvousMessage, HttpError> {
         let etag = Some(self.etag.clone());
 
-        let (status_code, response) = Self::receive_data_helper(
-            &self.client,
-            etag,
-            &self.rendezvous_server,
-            self.rendezvous_location.to_owned(),
-        )
-        .await?;
+        let response =
+            Self::receive_data_helper(&self.client.inner, etag, &self.rendezvous_url).await?;
 
         self.etag = response.etag.clone();
 
         let message = RendezvousMessage {
-            status_code,
+            status_code: response.status_code,
             body: response.body,
             content_type: response.content_type.unwrap_or_else(|| "application/octet".to_owned()),
         };
@@ -151,23 +144,27 @@ impl RendezvousChannel {
     ) -> Result<(), HttpError> {
         let etag = self.etag.clone();
 
-        let request = requests::send_rendezvous::Request {
-            rendezvous_session: self.rendezvous_location.to_owned(),
-            body,
-            etag,
-            content_type: content_type.map(ToOwned::to_owned),
-        };
-
-        let rendezvous_server = self.rendezvous_server.to_string();
-
-        let response = self
+        let mut request = self
             .client
-            .send(request, None, rendezvous_server, None, &[], Default::default())
-            .await?;
+            .inner
+            .request(Method::PUT, self.rendezvous_url().to_owned())
+            .body(body)
+            .header(IF_MATCH, etag);
 
-        self.etag = response.etag;
+        if let Some(content_type) = content_type {
+            request = request.header(CONTENT_TYPE, content_type);
+        }
 
-        Ok(())
+        let response = request.send().await?;
+
+        if response.status().is_success() {
+            let etag = response.headers().get(ETAG).unwrap().to_str().unwrap().to_owned();
+            self.etag = etag;
+
+            Ok(())
+        } else {
+            todo!()
+        }
     }
 }
 #[cfg(test)]
@@ -229,11 +226,8 @@ mod test {
 
             let client = HttpClient::new(reqwest::Client::new(), RequestConfig::short_retry());
             let InboundChannelCreationResult { channel: bob, initial_message: _ } =
-                RendezvousChannel::create_inbound(client, &url, &alice.rendezvous_location)
-                    .await
-                    .expect("");
+                RendezvousChannel::create_inbound(client, &url).await.expect("");
 
-            assert_eq!(alice.rendezvous_server(), bob.rendezvous_server());
             assert_eq!(alice.rendezvous_url(), bob.rendezvous_url());
 
             bob

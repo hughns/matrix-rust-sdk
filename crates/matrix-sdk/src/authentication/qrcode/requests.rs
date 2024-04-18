@@ -13,72 +13,37 @@
 // limitations under the License.
 
 pub mod create_rendezvous {
-    use http::header::{CONTENT_TYPE, ETAG, EXPIRES, LAST_MODIFIED, LOCATION};
+    use http::header::{CONTENT_TYPE, ETAG, EXPIRES, LAST_MODIFIED};
     use ruma::{
         api::{request, response, Metadata},
         metadata,
     };
+    use url::Url;
 
     pub const METADATA: Metadata = metadata! {
         method: POST,
         rate_limited: true,
         authentication: None,
         history: {
-            // TODO: Once we have a working rendezvous server, switch to the correct MSC.
-            // unstable => "/_matrix/client/unstable/org.matrix.msc4108/rendezvous",
-            unstable => "/_matrix/client/unstable/org.matrix.msc3886/rendezvous",
-        }
-    };
-
-    #[request]
-    #[derive(Default)]
-    pub struct Request {}
-
-    #[response]
-    pub struct Response {
-        #[ruma_api(header = LOCATION)]
-        pub location: String,
-        #[ruma_api(header = ETAG)]
-        pub etag: String,
-        #[ruma_api(header = EXPIRES)]
-        pub expires: String,
-        #[ruma_api(header = LAST_MODIFIED)]
-        pub last_modified: String,
-        #[ruma_api(header = CONTENT_TYPE)]
-        pub content_type: Option<String>,
-    }
-}
-
-pub mod send_rendezvous {
-    use http::header::{CONTENT_TYPE, ETAG, EXPIRES, IF_MATCH, LAST_MODIFIED};
-    use ruma::{
-        api::{request, response, Metadata},
-        metadata,
-    };
-
-    pub const METADATA: Metadata = metadata! {
-        method: PUT,
-        rate_limited: true,
-        authentication: None,
-        history: {
-            unstable => "/:rendezvous_session",
+            unstable => "/_matrix/client/unstable/org.matrix.msc4108/rendezvous",
         }
     };
 
     #[request]
     pub struct Request {
-        #[ruma_api(path)]
-        pub rendezvous_session: String,
-        #[ruma_api(raw_body)]
-        pub body: Vec<u8>,
-        #[ruma_api(header = IF_MATCH)]
-        pub etag: String,
         #[ruma_api(header = CONTENT_TYPE)]
-        pub content_type: Option<String>,
+        pub content_type: String,
+    }
+
+    impl Request {
+        pub fn new() -> Self {
+            Self { content_type: "application/json".to_owned() }
+        }
     }
 
     #[response]
     pub struct Response {
+        pub url: Url,
         #[ruma_api(header = ETAG)]
         pub etag: String,
         #[ruma_api(header = EXPIRES)]
@@ -86,69 +51,4 @@ pub mod send_rendezvous {
         #[ruma_api(header = LAST_MODIFIED)]
         pub last_modified: String,
     }
-}
-
-pub mod receive_rendezvous {
-    use http::header::{CONTENT_TYPE, ETAG, EXPIRES, IF_NONE_MATCH, LAST_MODIFIED};
-    use ruma::{
-        api::{request, response, Metadata},
-        metadata,
-    };
-
-    pub const METADATA: Metadata = metadata! {
-        method: GET,
-        rate_limited: true,
-        authentication: None,
-        history: {
-            unstable => "/:rendezvous_session",
-        }
-    };
-
-    #[request]
-    pub struct Request {
-        #[ruma_api(path)]
-        pub rendezvous_session: String,
-        #[ruma_api(header = IF_NONE_MATCH)]
-        pub etag: Option<String>,
-    }
-
-    #[response]
-    pub struct Response {
-        #[ruma_api(header = ETAG)]
-        pub etag: String,
-        #[ruma_api(header = EXPIRES)]
-        pub expires: String,
-        #[ruma_api(header = LAST_MODIFIED)]
-        pub last_modified: String,
-        #[ruma_api(header = CONTENT_TYPE)]
-        pub content_type: Option<String>,
-        #[ruma_api(raw_body)]
-        pub body: Vec<u8>,
-    }
-}
-
-pub mod delete_rendezvous {
-    use ruma::{
-        api::{request, response, Metadata},
-        metadata,
-    };
-
-    pub const METADATA: Metadata = metadata! {
-        method: DELETE,
-        rate_limited: true,
-        authentication: None,
-        history: {
-            unstable => "/:rendezvous_session",
-        }
-    };
-
-    #[request]
-    #[derive(Default)]
-    pub struct Request {
-        #[ruma_api(path)]
-        pub rendezvous_session: String,
-    }
-
-    #[response]
-    pub struct Response {}
 }
