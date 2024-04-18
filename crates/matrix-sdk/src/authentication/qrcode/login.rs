@@ -207,7 +207,7 @@ impl<'a> IntoFuture for LoginWithQrCode<'a> {
             channel.send_json(&message).await.unwrap();
 
             let message = channel.receive_json().await.unwrap();
-            let QrAuthMessage::LoginProtocolAccepted() = message else { todo!() };
+            let QrAuthMessage::LoginProtocolAccepted {} = message else { todo!() };
 
             self.state.set(LoginProgress::WaitingForToken);
 
@@ -224,7 +224,7 @@ impl<'a> IntoFuture for LoginWithQrCode<'a> {
                 .unwrap();
 
             // Tell the existing device that we're logged in.
-            let message = QrAuthMessage::LoginSuccess();
+            let message = QrAuthMessage::LoginSuccess {};
             channel.send_json(&message).await.unwrap();
 
             let message = channel.receive_json().await.unwrap();
@@ -294,8 +294,8 @@ impl<'a> LoginWithQrCode<'a> {
         // TODO: How do we use our own reqwest client here...
         // let http_client = self.client.inner.http_client.inner.clone();
         let http_client = openidconnect::reqwest::Client::builder()
-            .proxy(Proxy::all("http://localhost:8011").unwrap())
-            .danger_accept_invalid_certs(true)
+            // .proxy(Proxy::all("http://localhost:8011").unwrap())
+            // .danger_accept_invalid_certs(true)
             .build()
             .unwrap();
 

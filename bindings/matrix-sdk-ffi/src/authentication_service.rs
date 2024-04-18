@@ -635,7 +635,11 @@ impl TryInto<VerifiedClientMetadata> for &OidcConfiguration {
         ClientMetadata {
             application_type: Some(ApplicationType::Native),
             redirect_uris: Some(vec![redirect_uri]),
-            grant_types: Some(vec![GrantType::RefreshToken, GrantType::AuthorizationCode]),
+            grant_types: Some(vec![
+                GrantType::RefreshToken,
+                GrantType::AuthorizationCode,
+                GrantType::DeviceCode,
+            ]),
             // A native client shouldn't use authentication as the credentials could be intercepted.
             token_endpoint_auth_method: Some(OAuthClientAuthenticationMethod::None),
             // The server should display the following fields when getting the user's consent.

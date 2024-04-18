@@ -21,9 +21,10 @@ use url::Url;
 use vodozemac::Curve25519PublicKey;
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum QrAuthMessage {
     #[serde(rename = "m.login.protocols")]
-    LoginProtocols { protocols: Vec<u8>, homeserver: Url },
+    LoginProtocols { protocols: Vec<String>, homeserver: Url },
     #[serde(rename = "m.login.protocol")]
     LoginProtocol {
         device_authorization_grant: AuthorizationGrant,
@@ -36,11 +37,11 @@ pub enum QrAuthMessage {
         device_id: Curve25519PublicKey,
     },
     #[serde(rename = "m.login.protocol_accepted")]
-    LoginProtocolAccepted(),
+    LoginProtocolAccepted {},
     #[serde(rename = "m.login.success")]
-    LoginSuccess(),
+    LoginSuccess {},
     #[serde(rename = "m.login.declined")]
-    LoginDeclined(),
+    LoginDeclined {},
     #[serde(rename = "m.login.secrets")]
     LoginSecrets(SecretsBundle),
 }
@@ -91,4 +92,26 @@ where
 {
     let key = key.to_base64();
     s.serialize_str(&key)
+}
+
+#[cfg(test)]
+mod test {
+    use assert_matches::assert_matches;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn deserialize() {
+        let json = json!({
+            "type": "m.login.protocols",
+            "protocols": ["device_authorization_grant"],
+            "homeserver": "https://matrix-client.matrix.org"
+
+        });
+
+        let message: QrAuthMessage = serde_json::from_value(json).unwrap();
+
+        assert_matches!(message, QrAuthMessage::LoginProtocols { .. });
+    }
 }

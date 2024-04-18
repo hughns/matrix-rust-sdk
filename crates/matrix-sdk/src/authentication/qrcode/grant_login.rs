@@ -115,7 +115,7 @@ impl ExistingAuthGrantDings {
             }
 
             // TODO: Check that the device id doesn't exist.
-            let message = QrAuthMessage::LoginProtocolAccepted();
+            let message = QrAuthMessage::LoginProtocolAccepted {};
             let message = serde_json::to_string(&message).unwrap();
             channel.send(&message).await.unwrap();
 
@@ -129,7 +129,7 @@ impl ExistingAuthGrantDings {
             let message = channel.receive().await.unwrap();
             let message: QrAuthMessage = serde_json::from_str(&message).unwrap();
 
-            let QrAuthMessage::LoginSuccess() = message else {
+            let QrAuthMessage::LoginSuccess {} = message else {
                 todo!("Received invalid message {message:?}")
             };
 
