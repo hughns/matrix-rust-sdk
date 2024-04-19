@@ -7054,7 +7054,7 @@ checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
 [[package]]
 name = "vodozemac"
 version = "0.5.1"
-source = "git+https://github.com/hughns/vodozemac/?rev=31b91b2c70030ce6cb584c446bf3e0d250e76866#31b91b2c70030ce6cb584c446bf3e0d250e76866"
+source = "git+https://github.com/hughns/vodozemac/?rev=e70d80579dcb4bfe90386b2ed8b4b04d1f5029a3#e70d80579dcb4bfe90386b2ed8b4b04d1f5029a3"
 dependencies = [
  "aes",
  "arrayvec",
