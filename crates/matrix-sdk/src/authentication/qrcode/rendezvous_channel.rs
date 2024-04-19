@@ -156,14 +156,15 @@ impl RendezvousChannel {
         }
 
         let response = request.send().await?;
+        let status = response.status();
 
-        if response.status().is_success() {
+        if status.is_success() {
             let etag = response.headers().get(ETAG).unwrap().to_str().unwrap().to_owned();
             self.etag = etag;
 
             Ok(())
         } else {
-            todo!()
+            todo!("Received an invalid response {status:?}")
         }
     }
 }
