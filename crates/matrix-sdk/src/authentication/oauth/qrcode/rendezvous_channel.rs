@@ -19,10 +19,10 @@ use http::{
     header::{CONTENT_TYPE, ETAG, EXPIRES, IF_MATCH, IF_NONE_MATCH, LAST_MODIFIED},
 };
 use matrix_sdk_base::sleep;
-use ruma::api::{
+use ruma::{MilliSecondsSinceUnixEpoch, api::{
     EndpointError,
     error::{FromHttpResponseError, HeaderDeserializationError, IntoHttpError, MatrixError},
-};
+}};
 use tracing::{debug, instrument, trace};
 use url::Url;
 
@@ -66,22 +66,18 @@ pub(super) struct InboundChannelCreationResult {
 
 struct RendezvousGetResponse {
     pub status_code: StatusCode,
-    pub etag: String,
+    pub sequence_token: String,
     // TODO: This is currently unused, but will be required once we implement the reciprocation of
     // a login. Left here so we don't forget about it. We should put this into the
     // [`RendezvousChannel`] struct, once we parse it into a [`SystemTime`].
     #[allow(dead_code)]
-    pub expires: String,
-    #[allow(dead_code)]
-    pub last_modified: String,
-    pub content_type: Option<String>,
-    pub body: Vec<u8>,
+    pub expires: MilliSecondsSinceUnixEpoch,
+    pub data: String,
 }
 
 struct RendezvousMessage {
     pub status_code: StatusCode,
-    pub body: Vec<u8>,
-    pub content_type: String,
+    pub data: String,
 }
 
 pub(super) struct RendezvousChannel {
@@ -111,7 +107,7 @@ impl RendezvousChannel {
     /// through the channel.
     pub(super) async fn create_outbound(
         client: HttpClient,
-        rendezvous_server: &Url,
+        homeserver_base_url: &Url,
     ) -> Result<Self, HttpError> {
         use std::borrow::Cow;
 
@@ -122,8 +118,8 @@ impl RendezvousChannel {
             .send(
                 request,
                 None,
-                rendezvous_server.to_string(),
-                None,
+                homeserver_base_url.to_string(),
+                None, // TODO: should also support passing in access token
                 Cow::Owned(SupportedVersions {
                     versions: Default::default(),
                     features: Default::default(),
@@ -154,11 +150,10 @@ impl RendezvousChannel {
 
         let initial_message = RendezvousMessage {
             status_code: response.status_code,
-            body: response.body,
-            content_type: response.content_type.unwrap_or_else(|| "text/plain".to_owned()),
+            data: response.body,
         };
 
-        let channel = Self { client, rendezvous_url: rendezvous_url.clone(), etag };
+        let channel = Self { client, rendezvous_url: rendezvous_url.clone(), sequence_token };
 
         Ok(InboundChannelCreationResult { channel, initial_message: initial_message.body })
     }
@@ -243,36 +238,31 @@ impl RendezvousChannel {
     #[instrument]
     async fn receive_message_impl(
         client: &reqwest::Client,
-        etag: Option<String>,
         rendezvous_url: &Url,
     ) -> Result<RendezvousGetResponse, HttpError> {
         let mut builder = client.request(Method::GET, rendezvous_url.to_owned());
-
-        if let Some(etag) = etag {
-            builder = builder.header(IF_NONE_MATCH, etag);
-        }
 
         let response = builder.send().await?;
 
         debug!("Received data from the rendezvous channel {response:?}");
 
         let status_code = response.status();
-        let headers = response.headers();
 
-        let etag = get_header(headers, &ETAG)?;
-        let expires = get_header(headers, &EXPIRES)?;
-        let last_modified = get_header(headers, &LAST_MODIFIED)?;
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .map(|c| c.to_str().map_err(FromHttpResponseError::<RumaApiError>::from))
-            .transpose()?
-            .map(ToOwned::to_owned);
+        // parse data, expires_ts and sequence_token from JSON response body
+        let json: serde_json::Value = response.json().await?;
 
-        let body = response.bytes().await?.to_vec();
+        let data = json.get("data").and_then(|v| v.as_str());
+        let expires_ts = json.get("expires_ts").and_then(|v| v.as_u64()).map(MilliSecondsSinceUnixEpoch::from);
+        let sequence_token = json.get("sequence_token").and_then(|v| v.as_str()).map(ToOwned::to_owned);
+        if data.is_none() || expires_ts.is_none() || sequence_token.is_none() {
+            return Err(HttpError::InvalidResponse(
+                "Missing `data` or `expires_ts` or `sequence_token` field in rendezvous response".to_owned(),
+            ));
+        }
+
 
         let response =
-            RendezvousGetResponse { status_code, etag, expires, last_modified, content_type, body };
+            RendezvousGetResponse { status_code, sequence_token, expires: expires_ts, data };
 
         Ok(response)
     }

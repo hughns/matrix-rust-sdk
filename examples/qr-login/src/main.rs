@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use matrix_sdk::{
     Client,
     authentication::oauth::{
-        qrcode::{LoginProgress, QrCodeData, QrCodeModeData, QrProgress},
+        qrcode::{LoginProgress, QrCodeData, QrProgress},
         registration::{ApplicationType, ClientMetadata, Localized, OAuthGrantType},
     },
     ruma::serde::Raw,

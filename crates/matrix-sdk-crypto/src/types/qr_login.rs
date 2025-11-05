@@ -23,13 +23,12 @@ use std::{
 
 use byteorder::{BigEndian, ReadBytesExt};
 use thiserror::Error;
-use url::Url;
 use vodozemac::{base64_decode, base64_encode, Curve25519PublicKey};
 
-/// The version of the QR code data, currently only one version is specified.
-const VERSION: u8 = 0x02;
 /// The prefix that is used in the QR code data.
-const PREFIX: &[u8] = b"MATRIX";
+const PREFIX: &[u8] = b"IO_ELEMENT_MSC4108";
+/// The type of the QR code data, used to identify MSC4108.
+const TYPE: u8 = 0x03;
 
 /// Error type for the decoding of the [`QrCodeData`].
 #[derive(Debug, Error)]
@@ -44,15 +43,15 @@ pub enum LoginQrCodeDecodeError {
     /// One of the URLs in the QR code data could not be parsed.
     #[error("One of the URLs in the QR code data could not be parsed: {0:?}")]
     UrlParse(#[from] url::ParseError),
-    /// The QR code data contains an invalid mode, we expect the login (0x03)
-    /// mode or the reciprocate mode (0x04).
+    /// The QR code data contains an invalid intent, we expect the login (0x00)
+    /// intent or the reciprocate intent (0x01).
     #[error(
-        "The QR code data contains an invalid QR code login mode, expected 0x03 or 0x04, got {0}"
+        "The QR code data contains an invalid QR code login intent, expected 0x00 or 0x01, got {0}"
     )]
-    InvalidMode(u8),
-    /// The QR code data contains an unsupported version.
-    #[error("The QR code data contains an unsupported version, expected {VERSION}, got {0}")]
-    InvalidVersion(u8),
+    InvalidIntent(u8),
+    /// The QR code data contains an unsupported type.
+    #[error("The QR code data contains an unsupported type, expected {TYPE}, got {0}")]
+    InvalidType(u8),
     /// The base64 encoded variant of the QR code data is not a valid base64
     /// string.
     #[error("The QR code data could not have been decoded from a base64 string: {0:?}")]
@@ -63,73 +62,35 @@ pub enum LoginQrCodeDecodeError {
         /// The expected prefix.
         expected: &'static [u8],
         /// The prefix we received.
-        got: [u8; 6],
+        got: [u8; 18],
     },
 }
 
-/// The mode-specific data for the QR code.
+/// The intent of the QR code login.
 ///
 /// The QR code login mechanism supports both, the new device, as well as the
 /// existing device to display the QR code.
 ///
-/// Depending on which device is displaying the QR code, additional data will be
-/// attached to the QR code.
+/// The different intents have an explicit one-byte identifier which gets added
+/// to the QR code data.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QrCodeModeData {
+pub enum QrCodeIntent {
     /// Enum variant for the case where the new device is displaying the QR
     /// code.
-    Login,
+    Login = 0x00,
     /// Enum variant for the case where the existing device is displaying the QR
     /// code.
-    Reciprocate {
-        /// The homeserver the existing device is using. This will let the new
-        /// device know which homeserver it should use as well.
-        server_name: String,
-    },
+    Reciprocate = 0x01,
 }
 
-impl QrCodeModeData {
-    /// Get the [`QrCodeMode`] which is associated to this [`QrCodeModeData`]
-    /// instance.
-    pub fn mode(&self) -> QrCodeMode {
-        self.into()
-    }
-}
-
-/// The mode of the QR code login.
-///
-/// The QR code login mechanism supports both, the new device, as well as the
-/// existing device to display the QR code.
-///
-/// The different modes have an explicit one-byte identifier which gets added to
-/// the QR code data.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QrCodeMode {
-    /// Enum variant for the case where the new device is displaying the QR
-    /// code.
-    Login = 0x03,
-    /// Enum variant for the case where the existing device is displaying the QR
-    /// code.
-    Reciprocate = 0x04,
-}
-
-impl TryFrom<u8> for QrCodeMode {
+impl TryFrom<u8> for QrCodeIntent {
     type Error = LoginQrCodeDecodeError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0x03 => Ok(Self::Login),
-            0x04 => Ok(Self::Reciprocate),
-            mode => Err(LoginQrCodeDecodeError::InvalidMode(mode)),
-        }
-    }
-}
-
-impl From<&QrCodeModeData> for QrCodeMode {
-    fn from(value: &QrCodeModeData) -> Self {
-        match value {
-            QrCodeModeData::Login => Self::Login,
-            QrCodeModeData::Reciprocate { .. } => Self::Reciprocate,
+            0x00 => Ok(Self::Login),
+            0x01 => Ok(Self::Reciprocate),
+            intent => Err(LoginQrCodeDecodeError::InvalidIntent(intent)),
         }
     }
 }
@@ -140,14 +101,17 @@ impl From<&QrCodeModeData> for QrCodeMode {
 /// decoded from a QR code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QrCodeData {
+    /// The intent of the QR code.
+    pub intent: QrCodeIntent,
     /// The ephemeral Curve25519 public key. Can be used to establish a shared
     /// secret using the Diffie-Hellman key agreement.
     pub public_key: Curve25519PublicKey,
-    /// The URL of the rendezvous session, can be used to exchange messages with
+    /// The ID of the rendezvous session, can be used to exchange messages with
     /// the other device.
-    pub rendezvous_url: Url,
-    /// Mode specific data, may contain the homeserver URL.
-    pub mode_data: QrCodeModeData,
+    pub rendezvous_id: String,
+    /// The homeserver the existing device is using. This will let the new
+    /// device know which homeserver it should use as well.
+    pub server_name: String,
 }
 
 impl QrCodeData {
@@ -157,16 +121,14 @@ impl QrCodeData {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, LoginQrCodeDecodeError> {
         // The QR data consists of the following values:
         // 1. The ASCII string MATRIX.
-        // 2. One byte version, only 0x02 is supported.
-        // 3. One byte intent/mode, either 0x03 or 0x04.
+        // 2. One byte type, 0x03 is MSC4108.
+        // 3. One byte intent/mode, either 0x00 or 0x01.
         // 4. 32 bytes for the ephemeral Curve25519 key.
-        // 5. Two bytes for the length of the rendezvous URL, a u16 in big-endian
+        // 5. Two bytes for the length of the rendezvous ID, a u16 in big-endian
         //    encoding.
-        // 6. The UTF-8 encoded string containing the rendezvous URL.
-        // 7. If the intent/mode from point 3. is 0x04, then two bytes for the length of
-        //    the homeserver URL, a u16 in big-endian encoding.
-        // 8. If the intent/mode from point 3. is 0x04, then the UTF-8 encoded string
-        //    containing the homeserver URL.
+        // 6. The UTF-8 encoded string containing the rendezvous ID.
+        // 7. Two bytes for the length of the server name, a u16 in big-endian encoding.
+        // 8. The UTF-8 encoded string containing the server name.
         let mut reader = Cursor::new(bytes);
 
         // 1. Let's get the prefix first and double check if this QR code is intended
@@ -179,11 +141,11 @@ impl QrCodeData {
         }
 
         // 2. Next up is the version, we continue only if the version matches.
-        let version = reader.read_u8()?;
-        if version == VERSION {
-            // 3. The intent/mode is the next one to parse, we return an error imediatelly
-            //    the intent isn't 0x03 or 0x04.
-            let mode = QrCodeMode::try_from(reader.read_u8()?)?;
+        let qr_type = reader.read_u8()?;
+        if qr_type == TYPE {
+            // 3. The intent is the next one to parse, we return an error immediately the
+            //    intent isn't 0x00 or 0x01.
+            let intent = QrCodeIntent::try_from(reader.read_u8()?)?;
 
             // 4. Let's get the public key and convert it to our strongly typed
             // Curve25519PublicKey type.
@@ -191,32 +153,24 @@ impl QrCodeData {
             reader.read_exact(&mut public_key)?;
             let public_key = Curve25519PublicKey::from_bytes(public_key);
 
-            // 5. We read two bytes for the length of the rendezvous URL.
-            let rendezvous_url_len = reader.read_u16::<BigEndian>()?;
-            // 6. We read and parse the rendezvous URL itself.
-            let mut rendezvous_url = vec![0u8; rendezvous_url_len.into()];
-            reader.read_exact(&mut rendezvous_url)?;
-            let rendezvous_url = Url::parse(str::from_utf8(&rendezvous_url)?)?;
+            // 5. We read two bytes for the length of the rendezvous ID.
+            let rendezvous_id_len = reader.read_u16::<BigEndian>()?;
+            // 6. We read the rendezvous ID itself.
+            let mut rendezvous_id = vec![0u8; rendezvous_id_len.into()];
+            reader.read_exact(&mut rendezvous_id)?;
+            let rendezvous_id = String::from_utf8(rendezvous_id).map_err(|e| e.utf8_error())?;
 
-            let mode_data = match mode {
-                QrCodeMode::Login => QrCodeModeData::Login,
-                QrCodeMode::Reciprocate => {
-                    // 7. If the mode is 0x04, we attempt to read the two bytes for the length of
-                    //    the homeserver URL.
-                    let server_name_len = reader.read_u16::<BigEndian>()?;
+            // 7. We read the two bytes for the length of the server nameL.
+            let server_name_len = reader.read_u16::<BigEndian>()?;
 
-                    // 8. We read and parse the homeserver URL.
-                    let mut server_name = vec![0u8; server_name_len.into()];
-                    reader.read_exact(&mut server_name)?;
-                    let server_name = String::from_utf8(server_name).map_err(|e| e.utf8_error())?;
+            // 8. We read and parse the server name.
+            let mut server_name = vec![0u8; server_name_len.into()];
+            reader.read_exact(&mut server_name)?;
+            let server_name = String::from_utf8(server_name).map_err(|e| e.utf8_error())?;
 
-                    QrCodeModeData::Reciprocate { server_name }
-                }
-            };
-
-            Ok(Self { public_key, rendezvous_url, mode_data })
+            Ok(Self { public_key, rendezvous_id, server_name, intent })
         } else {
-            Err(LoginQrCodeDecodeError::InvalidVersion(version))
+            Err(LoginQrCodeDecodeError::InvalidType(qr_type))
         }
     }
 
@@ -225,25 +179,22 @@ impl QrCodeData {
     /// The list of bytes can be used by a QR code generator to create an image
     /// containing a QR code.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let rendezvous_url_len = (self.rendezvous_url.as_str().len() as u16).to_be_bytes();
+        let rendezvous_id_len = (self.rendezvous_id.as_str().len() as u16).to_be_bytes();
+        let server_name_len = (self.server_name.as_str().len() as u16).to_be_bytes();
 
         let encoded = [
             PREFIX,
-            &[VERSION],
-            &[self.mode_data.mode() as u8],
+            &[TYPE],
+            &[self.intent.clone() as u8],
             self.public_key.as_bytes().as_slice(),
-            &rendezvous_url_len,
-            self.rendezvous_url.as_str().as_bytes(),
+            &rendezvous_id_len,
+            self.rendezvous_id.as_bytes(),
+            &server_name_len,
+            self.server_name.as_bytes(),
         ]
         .concat();
 
-        if let QrCodeModeData::Reciprocate { server_name } = &self.mode_data {
-            let server_name_len = (server_name.as_str().len() as u16).to_be_bytes();
-
-            [encoded.as_slice(), &server_name_len, server_name.as_str().as_bytes()].concat()
-        } else {
-            encoded
-        }
+        encoded
     }
 
     /// Attempt to decode a base64 encoded string into a [`QrCodeData`] object.
@@ -258,52 +209,39 @@ impl QrCodeData {
     pub fn to_base64(&self) -> String {
         base64_encode(self.to_bytes())
     }
-
-    /// Get the mode of this [`QrCodeData`] instance.
-    pub fn mode(&self) -> QrCodeMode {
-        self.mode_data.mode()
-    }
 }
 
 #[cfg(test)]
 mod test {
-    use assert_matches2::assert_let;
     use similar_asserts::assert_eq;
 
     use super::*;
 
-    // Test vector for the QR code data, copied from the MSC.
-    const QR_CODE_DATA: &[u8] = &[
-        0x4D, 0x41, 0x54, 0x52, 0x49, 0x58, 0x02, 0x03, 0xd8, 0x86, 0x68, 0x6a, 0xb2, 0x19, 0x7b,
-        0x78, 0x0e, 0x30, 0x0a, 0x9d, 0x4a, 0x21, 0x47, 0x48, 0x07, 0x00, 0xd7, 0x92, 0x9f, 0x39,
-        0xab, 0x31, 0xb9, 0xe5, 0x14, 0x37, 0x02, 0x48, 0xed, 0x6b, 0x00, 0x47, 0x68, 0x74, 0x74,
-        0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x72, 0x65, 0x6e, 0x64, 0x65, 0x7a, 0x76, 0x6f, 0x75, 0x73,
-        0x2e, 0x6c, 0x61, 0x62, 0x2e, 0x65, 0x6c, 0x65, 0x6d, 0x65, 0x6e, 0x74, 0x2e, 0x64, 0x65,
-        0x76, 0x2f, 0x65, 0x38, 0x64, 0x61, 0x36, 0x33, 0x35, 0x35, 0x2d, 0x35, 0x35, 0x30, 0x62,
-        0x2d, 0x34, 0x61, 0x33, 0x32, 0x2d, 0x61, 0x31, 0x39, 0x33, 0x2d, 0x31, 0x36, 0x31, 0x39,
-        0x64, 0x39, 0x38, 0x33, 0x30, 0x36, 0x36, 0x38,
+    // Test vector for the unstable QR code data, copied from the MSC.
+    const QR_CODE_DATA_RECIPROCATE: &[u8] = &[
+        0x49, 0x4F, 0x5F, 0x45, 0x4C, 0x45, 0x4D, 0x45, 0x4E, 0x54, 0x5F, 0x4D, 0x53, 0x43, 0x34,
+        0x31, 0x30, 0x38, 0x03, 0x01, 0xd8, 0x86, 0x68, 0x6a, 0xb2, 0x19, 0x7b, 0x78, 0x0e, 0x30,
+        0x0a, 0x9d, 0x4a, 0x21, 0x47, 0x48, 0x07, 0x00, 0xd7, 0x92, 0x9f, 0x39, 0xab, 0x31, 0xb9,
+        0xe5, 0x14, 0x37, 0x02, 0x48, 0xed, 0x6b, 0x00, 0x24, 0x65, 0x38, 0x64, 0x61, 0x36, 0x33,
+        0x35, 0x35, 0x2D, 0x35, 0x35, 0x30, 0x62, 0x2D, 0x34, 0x61, 0x33, 0x32, 0x2D, 0x61, 0x31,
+        0x39, 0x33, 0x2D, 0x31, 0x36, 0x31, 0x39, 0x64, 0x39, 0x38, 0x33, 0x30, 0x36, 0x36, 0x38,
+        0x00, 0x0A, 0x6d, 0x61, 0x74, 0x72, 0x69, 0x78, 0x2e, 0x6f, 0x72, 0x67,
     ];
 
-    // Test vector for the QR code data, copied from the MSC, with the mode set to
-    // reciprocate.
-    const QR_CODE_DATA_RECIPROCATE: &[u8] = &[
-        0x4D, 0x41, 0x54, 0x52, 0x49, 0x58, 0x02, 0x04, 0xd8, 0x86, 0x68, 0x6a, 0xb2, 0x19, 0x7b,
-        0x78, 0x0e, 0x30, 0x0a, 0x9d, 0x4a, 0x21, 0x47, 0x48, 0x07, 0x00, 0xd7, 0x92, 0x9f, 0x39,
-        0xab, 0x31, 0xb9, 0xe5, 0x14, 0x37, 0x02, 0x48, 0xed, 0x6b, 0x00, 0x47, 0x68, 0x74, 0x74,
-        0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x72, 0x65, 0x6e, 0x64, 0x65, 0x7a, 0x76, 0x6f, 0x75, 0x73,
-        0x2e, 0x6c, 0x61, 0x62, 0x2e, 0x65, 0x6c, 0x65, 0x6d, 0x65, 0x6e, 0x74, 0x2e, 0x64, 0x65,
-        0x76, 0x2f, 0x65, 0x38, 0x64, 0x61, 0x36, 0x33, 0x35, 0x35, 0x2d, 0x35, 0x35, 0x30, 0x62,
-        0x2d, 0x34, 0x61, 0x33, 0x32, 0x2d, 0x61, 0x31, 0x39, 0x33, 0x2d, 0x31, 0x36, 0x31, 0x39,
-        0x64, 0x39, 0x38, 0x33, 0x30, 0x36, 0x36, 0x38, 0x00, 0x0A, 0x6d, 0x61, 0x74, 0x72, 0x69,
-        0x78, 0x2e, 0x6f, 0x72, 0x67,
+    // Test vector for the QR code data, copied from the MSC, with the intent set to
+    // login
+    const QR_CODE_DATA_LOGIN: &[u8] = &[
+        0x49, 0x4F, 0x5F, 0x45, 0x4C, 0x45, 0x4D, 0x45, 0x4E, 0x54, 0x5F, 0x4D, 0x53, 0x43, 0x34,
+        0x31, 0x30, 0x38, 0x03, 0x00, 0xd8, 0x86, 0x68, 0x6a, 0xb2, 0x19, 0x7b, 0x78, 0x0e, 0x30,
+        0x0a, 0x9d, 0x4a, 0x21, 0x47, 0x48, 0x07, 0x00, 0xd7, 0x92, 0x9f, 0x39, 0xab, 0x31, 0xb9,
+        0xe5, 0x14, 0x37, 0x02, 0x48, 0xed, 0x6b, 0x00, 0x24, 0x65, 0x38, 0x64, 0x61, 0x36, 0x33,
+        0x35, 0x35, 0x2D, 0x35, 0x35, 0x30, 0x62, 0x2D, 0x34, 0x61, 0x33, 0x32, 0x2D, 0x61, 0x31,
+        0x39, 0x33, 0x2D, 0x31, 0x36, 0x31, 0x39, 0x64, 0x39, 0x38, 0x33, 0x30, 0x36, 0x36, 0x38,
+        0x00, 0x0A, 0x6d, 0x61, 0x74, 0x72, 0x69, 0x78, 0x2e, 0x6f, 0x72, 0x67,
     ];
 
     // Test vector for the QR code data in base64 format, self-generated.
-    const QR_CODE_DATA_BASE64: &str = "\
-        TUFUUklYAgS0yzZ1QVpQ1jlnoxWX3d5jrWRFfELxjS2gN7pz9y+3PABaaHR0\
-        cHM6Ly9zeW5hcHNlLW9pZGMubGFiLmVsZW1lbnQuZGV2L19zeW5hcHNlL2Ns\
-        aWVudC9yZW5kZXp2b3VzLzAxSFg5SzAwUTFINktQRDQ3RUc0RzFUM1hHACVo\
-        dHRwczovL3N5bmFwc2Utb2lkYy5sYWIuZWxlbWVudC5kZXYv";
+    const QR_CODE_DATA_BASE64: &str = "SU9fRUxFTUVOVF9NU0M0MTA4AwG0yzZ1QVpQ1jlnoxWX3d5jrWRFfELxjS2gN7pz9y+3PAAaMDFIWDlLMDBRMUg2S1BENDdFRzRHMVQzWEcAHHN5bmFwc2Utb2lkYy5sYWIuZWxlbWVudC5kZXY";
 
     #[test]
     fn parse_qr_data() {
@@ -311,12 +249,14 @@ mod test {
             Curve25519PublicKey::from_base64("2IZoarIZe3gOMAqdSiFHSAcA15KfOasxueUUNwJI7Ws")
                 .unwrap();
 
-        let expected_rendezvous =
-            Url::parse("https://rendezvous.lab.element.dev/e8da6355-550b-4a32-a193-1619d9830668")
-                .unwrap();
-
-        let data = QrCodeData::from_bytes(QR_CODE_DATA)
+        let data = QrCodeData::from_bytes(QR_CODE_DATA_LOGIN)
             .expect("We should be able to parse the QR code data");
+
+        assert_eq!(
+            QrCodeIntent::Login,
+            data.intent,
+            "The intent in the test bytes vector should be Login"
+        );
 
         assert_eq!(
             expected_curve_key, data.public_key,
@@ -324,20 +264,13 @@ mod test {
         );
 
         assert_eq!(
-            expected_rendezvous, data.rendezvous_url,
-            "The parsed rendezvous URL should match expected one",
+            "e8da6355-550b-4a32-a193-1619d9830668", data.rendezvous_id,
+            "The parsed rendezvous ID should match expected one",
         );
 
         assert_eq!(
-            data.mode(),
-            QrCodeMode::Login,
-            "The mode in the test bytes vector should be Login"
-        );
-
-        assert_eq!(
-            QrCodeModeData::Login,
-            data.mode_data,
-            "The parsed QR code mode should match expected one",
+            "matrix.org", data.server_name,
+            "We should have correctly found the matrix.org server name in the QR code data"
         );
     }
 
@@ -345,10 +278,6 @@ mod test {
     fn parse_qr_data_reciprocate() {
         let expected_curve_key =
             Curve25519PublicKey::from_base64("2IZoarIZe3gOMAqdSiFHSAcA15KfOasxueUUNwJI7Ws")
-                .unwrap();
-
-        let expected_rendezvous =
-            Url::parse("https://rendezvous.lab.element.dev/e8da6355-550b-4a32-a193-1619d9830668")
                 .unwrap();
 
         let data = QrCodeData::from_bytes(QR_CODE_DATA_RECIPROCATE)
@@ -360,23 +289,18 @@ mod test {
         );
 
         assert_eq!(
-            expected_rendezvous, data.rendezvous_url,
+            "e8da6355-550b-4a32-a193-1619d9830668", data.rendezvous_id,
             "The parsed rendezvous URL should match expected one",
         );
 
         assert_eq!(
-            data.mode(),
-            QrCodeMode::Reciprocate,
-            "The mode in the test bytes vector should be Reciprocate"
-        );
-
-        assert_let!(
-            QrCodeModeData::Reciprocate { server_name } = data.mode_data,
-            "The parsed QR code mode should match the expected one",
+            QrCodeIntent::Reciprocate,
+            data.intent,
+            "The intent in the test bytes vector should be Reciprocate"
         );
 
         assert_eq!(
-            server_name, "matrix.org",
+            data.server_name, "matrix.org",
             "We should have correctly found the matrix.org homeserver in the QR code data"
         );
     }
@@ -387,12 +311,6 @@ mod test {
             Curve25519PublicKey::from_base64("tMs2dUFaUNY5Z6MVl93eY61kRXxC8Y0toDe6c/cvtzw")
                 .unwrap();
 
-        let expected_rendezvous =
-            Url::parse("https://synapse-oidc.lab.element.dev/_synapse/client/rendezvous/01HX9K00Q1H6KPD47EG4G1T3XG")
-                .unwrap();
-
-        let expected_server_name = "https://synapse-oidc.lab.element.dev/";
-
         let data = QrCodeData::from_base64(QR_CODE_DATA_BASE64)
             .expect("We should be able to parse the QR code data");
 
@@ -402,33 +320,31 @@ mod test {
         );
 
         assert_eq!(
-            data.mode(),
-            QrCodeMode::Reciprocate,
-            "The mode in the test bytes vector should be Reciprocate"
+            QrCodeIntent::Reciprocate,
+            data.intent,
+            "The intent in the test bytes vector should be Reciprocate"
         );
 
         assert_eq!(
-            expected_rendezvous, data.rendezvous_url,
+            "01HX9K00Q1H6KPD47EG4G1T3XG", data.rendezvous_id,
             "The parsed rendezvous URL should match the expected one",
         );
 
-        assert_let!(QrCodeModeData::Reciprocate { server_name } = data.mode_data);
-
         assert_eq!(
-            server_name, expected_server_name,
+            "synapse-oidc.lab.element.dev", data.server_name,
             "The parsed server name should match the expected one"
         );
     }
 
     #[test]
     fn qr_code_encoding_roundtrip() {
-        let data = QrCodeData::from_bytes(QR_CODE_DATA)
+        let data = QrCodeData::from_bytes(QR_CODE_DATA_LOGIN)
             .expect("We should be able to parse the QR code data");
 
         let encoded = data.to_bytes();
 
         assert_eq!(
-            QR_CODE_DATA, &encoded,
+            QR_CODE_DATA_LOGIN, &encoded,
             "Decoding and re-encoding the QR code data should yield the same bytes"
         );
 

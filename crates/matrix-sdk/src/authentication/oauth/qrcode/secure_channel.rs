@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use matrix_sdk_base::crypto::types::qr_login::{QrCodeData, QrCodeMode, QrCodeModeData};
+use matrix_sdk_base::crypto::types::qr_login::{QrCodeData, QrCodeIntent};
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::{instrument, trace};
 use url::Url;
@@ -44,12 +44,12 @@ impl SecureChannel {
     ) -> Result<Self, Error> {
         let channel = RendezvousChannel::create_outbound(http_client, homeserver_url).await?;
         let rendezvous_url = channel.rendezvous_url().to_owned();
-        let mode_data = QrCodeModeData::Login;
+        let intent = QrCodeIntent::Login;
 
         let ecies = Ecies::new();
         let public_key = ecies.public_key();
 
-        let qr_code_data = QrCodeData { public_key, rendezvous_url, mode_data };
+        let qr_code_data = QrCodeData { public_key, rendezvous_id, server_name };
 
         Ok(Self { channel, qr_code_data, ecies })
     }
@@ -60,8 +60,7 @@ impl SecureChannel {
         homeserver_url: &Url,
     ) -> Result<Self, Error> {
         let mut channel = SecureChannel::login(http_client, homeserver_url).await?;
-        channel.qr_code_data.mode_data =
-            QrCodeModeData::Reciprocate { server_name: homeserver_url.to_string() };
+        channel.qr_code_data.server_name = homeserver_url.to_string();
         Ok(channel)
     }
 
@@ -131,9 +130,9 @@ impl EstablishedSecureChannel {
     pub(super) async fn from_qr_code(
         client: reqwest::Client,
         qr_code_data: &QrCodeData,
-        expected_mode: QrCodeMode,
+        expected_intent: QrCodeIntent,
     ) -> Result<Self, Error> {
-        if qr_code_data.mode() == expected_mode {
+        if qr_code_data.intent() == expected_intent {
             Err(Error::InvalidIntent)
         } else {
             trace!("Attempting to create a new inbound secure channel from a QR code.");
@@ -234,7 +233,7 @@ pub(super) mod test {
         atomic::{AtomicU8, Ordering},
     };
 
-    use matrix_sdk_base::crypto::types::qr_login::QrCodeMode;
+    use matrix_sdk_base::crypto::types::qr_login::QrCodeIntent;
     use matrix_sdk_common::executor::spawn;
     use matrix_sdk_test::async_test;
     use serde_json::json;
@@ -364,7 +363,7 @@ pub(super) mod test {
             EstablishedSecureChannel::from_qr_code(
                 reqwest::Client::new(),
                 &qr_code_data,
-                QrCodeMode::Login,
+                QrCodeIntent::Login,
             )
             .await
             .expect("Bob should be able to fully establish the secure channel.")
