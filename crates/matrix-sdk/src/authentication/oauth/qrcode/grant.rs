@@ -264,7 +264,7 @@ impl<'a> IntoFuture for GrantLoginWithScannedQrCode<'a> {
             // -- MSC4108 OAuth 2.0 login step 1
             let message = QrAuthMessage::LoginProtocols {
                 protocols: vec![LoginProtocolType::DeviceAuthorizationGrant],
-                homeserver: self.client.homeserver(),
+                base_url: self.client.homeserver(),
             };
             channel.send_json(message).await?;
 
@@ -534,7 +534,7 @@ mod test {
         channel: SecureChannel,
         check_code_rx: oneshot::Receiver<u8>,
         server: MatrixMockServer,
-        homeserver: Url,
+        base_url: Url,
         device_authorization_grant: Option<AuthorizationGrant>,
         secrets_bundle: Option<SecretsBundle>,
     ) {
@@ -554,10 +554,10 @@ mod test {
             .await
             .expect("Bob should receive the LoginProtocolAccepted message from Alice");
         assert_let!(
-            QrAuthMessage::LoginProtocols { protocols, homeserver: alice_homeserver } = message
+            QrAuthMessage::LoginProtocols { protocols, base_url: alice_base_url } = message
         );
         assert_eq!(protocols, vec![LoginProtocolType::DeviceAuthorizationGrant]);
-        assert_eq!(alice_homeserver, homeserver);
+        assert_eq!(alice_base_url, base_url);
 
         match behaviour {
             BobBehaviour::UnexpectedMessageInsteadOfLoginProtocol => {
@@ -664,7 +664,7 @@ mod test {
     async fn test_grant_login_with_generated_qr_code() {
         let server = MatrixMockServer::new().await;
         let rendezvous_server = MockedRendezvousServer::new(server.server(), "abcdEFG12345").await;
-        debug!("Set up rendezvous server mock at {}", rendezvous_server.rendezvous_url);
+        debug!("Set up rendezvous server mock at {}", rendezvous_server.base_url);
 
         let device_authorization_grant = AuthorizationGrant {
             verification_uri_complete: Some(VerificationUriComplete::new(
@@ -808,7 +808,7 @@ mod test {
     async fn test_grant_login_with_scanned_qr_code() {
         let server = MatrixMockServer::new().await;
         let rendezvous_server = MockedRendezvousServer::new(server.server(), "abcdEFG12345").await;
-        debug!("Set up rendezvous server mock at {}", rendezvous_server.rendezvous_url);
+        debug!("Set up rendezvous server mock at {}", rendezvous_server.base_url);
 
         let device_authorization_grant = AuthorizationGrant {
             verification_uri_complete: Some(VerificationUriComplete::new(
@@ -838,7 +838,7 @@ mod test {
 
         // Create a secure channel on the new client (Bob) and extract the QR code.
         let client = HttpClient::new(reqwest::Client::new(), Default::default());
-        let channel = SecureChannel::login(client, &rendezvous_server.homeserver_url)
+        let channel = SecureChannel::login(client, &rendezvous_server.base_url)
             .await
             .expect("Bob should be able to create a secure channel.");
         let qr_code_data = channel.qr_code_data().clone();
@@ -935,7 +935,7 @@ mod test {
     async fn test_grant_login_with_scanned_qr_code_with_homeserver_swap() {
         let server = MatrixMockServer::new().await;
         let rendezvous_server = MockedRendezvousServer::new(server.server(), "abcdEFG12345").await;
-        debug!("Set up rendezvous server mock at {}", rendezvous_server.rendezvous_url);
+        debug!("Set up rendezvous server mock at {}", rendezvous_server.base_url);
 
         let device_authorization_grant = AuthorizationGrant {
             verification_uri_complete: Some(VerificationUriComplete::new(
@@ -967,7 +967,7 @@ mod test {
 
         // Create a secure channel on the new client (Bob) and extract the QR code.
         let client = HttpClient::new(reqwest::Client::new(), Default::default());
-        let channel = SecureChannel::login(client, &rendezvous_server.homeserver_url)
+        let channel = SecureChannel::login(client, &rendezvous_server.base_url)
             .await
             .expect("Bob should be able to create a secure channel.");
         let qr_code_data = channel.qr_code_data().clone();
@@ -1065,7 +1065,7 @@ mod test {
     {
         let server = MatrixMockServer::new().await;
         let rendezvous_server = MockedRendezvousServer::new(server.server(), "abcdEFG12345").await;
-        debug!("Set up rendezvous server mock at {}", rendezvous_server.rendezvous_url);
+        debug!("Set up rendezvous server mock at {}", rendezvous_server.base_url);
 
         server.mock_upload_keys().ok().expect(1).named("upload_keys").mount().await;
         server
@@ -1182,7 +1182,7 @@ mod test {
     async fn test_grant_login_with_scanned_qr_code_unexpected_message_instead_of_login_protocol() {
         let server = MatrixMockServer::new().await;
         let rendezvous_server = MockedRendezvousServer::new(server.server(), "abcdEFG12345").await;
-        debug!("Set up rendezvous server mock at {}", rendezvous_server.rendezvous_url);
+        debug!("Set up rendezvous server mock at {}", rendezvous_server.base_url);
 
         server.mock_upload_keys().ok().expect(1).named("upload_keys").mount().await;
         server
@@ -1202,7 +1202,7 @@ mod test {
 
         // Create a secure channel on the new client (Bob) and extract the QR code.
         let client = HttpClient::new(reqwest::Client::new(), Default::default());
-        let channel = SecureChannel::login(client, &rendezvous_server.homeserver_url)
+        let channel = SecureChannel::login(client, &rendezvous_server.base_url)
             .await
             .expect("Bob should be able to create a secure channel.");
         let qr_code_data = channel.qr_code_data().clone();
@@ -1284,7 +1284,7 @@ mod test {
     async fn test_grant_login_with_generated_qr_code_device_already_exists() {
         let server = MatrixMockServer::new().await;
         let rendezvous_server = MockedRendezvousServer::new(server.server(), "abcdEFG12345").await;
-        debug!("Set up rendezvous server mock at {}", rendezvous_server.rendezvous_url);
+        debug!("Set up rendezvous server mock at {}", rendezvous_server.base_url);
 
         let device_authorization_grant = AuthorizationGrant {
             verification_uri_complete: Some(VerificationUriComplete::new(
@@ -1410,7 +1410,7 @@ mod test {
     async fn test_grant_login_with_scanned_qr_code_device_already_exists() {
         let server = MatrixMockServer::new().await;
         let rendezvous_server = MockedRendezvousServer::new(server.server(), "abcdEFG12345").await;
-        debug!("Set up rendezvous server mock at {}", rendezvous_server.rendezvous_url);
+        debug!("Set up rendezvous server mock at {}", rendezvous_server.base_url);
 
         let device_authorization_grant = AuthorizationGrant {
             verification_uri_complete: Some(VerificationUriComplete::new(
@@ -1440,7 +1440,7 @@ mod test {
 
         // Create a secure channel on the new client (Bob) and extract the QR code.
         let client = HttpClient::new(reqwest::Client::new(), Default::default());
-        let channel = SecureChannel::login(client, &rendezvous_server.homeserver_url)
+        let channel = SecureChannel::login(client, &rendezvous_server.base_url)
             .await
             .expect("Bob should be able to create a secure channel.");
         let qr_code_data = channel.qr_code_data().clone();
@@ -1521,7 +1521,7 @@ mod test {
     async fn test_grant_login_with_generated_qr_code_device_not_created() {
         let server = MatrixMockServer::new().await;
         let rendezvous_server = MockedRendezvousServer::new(server.server(), "abcdEFG12345").await;
-        debug!("Set up rendezvous server mock at {}", rendezvous_server.rendezvous_url);
+        debug!("Set up rendezvous server mock at {}", rendezvous_server.base_url);
 
         let device_authorization_grant = AuthorizationGrant {
             verification_uri_complete: Some(VerificationUriComplete::new(
@@ -1658,7 +1658,7 @@ mod test {
     async fn test_grant_login_with_scanned_qr_code_device_not_created() {
         let server = MatrixMockServer::new().await;
         let rendezvous_server = MockedRendezvousServer::new(server.server(), "abcdEFG12345").await;
-        debug!("Set up rendezvous server mock at {}", rendezvous_server.rendezvous_url);
+        debug!("Set up rendezvous server mock at {}", rendezvous_server.base_url);
 
         let device_authorization_grant = AuthorizationGrant {
             verification_uri_complete: Some(VerificationUriComplete::new(
@@ -1688,7 +1688,7 @@ mod test {
 
         // Create a secure channel on the new client (Bob) and extract the QR code.
         let client = HttpClient::new(reqwest::Client::new(), Default::default());
-        let channel = SecureChannel::login(client, &rendezvous_server.homeserver_url)
+        let channel = SecureChannel::login(client, &rendezvous_server.base_url)
             .await
             .expect("Bob should be able to create a secure channel.");
         let qr_code_data = channel.qr_code_data().clone();

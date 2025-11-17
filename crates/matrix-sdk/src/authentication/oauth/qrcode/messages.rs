@@ -36,8 +36,8 @@ pub enum QrAuthMessage {
     LoginProtocols {
         /// The login protocols the existing device supports.
         protocols: Vec<LoginProtocolType>,
-        /// The homeserver we're going to log in to.
-        homeserver: Url,
+        /// The base URL of the homeserver we're going to log in to.
+        base_url: Url,
     },
 
     /// Message declaring which protocols from the previous `m.login.protocols`
@@ -80,8 +80,8 @@ pub enum QrAuthMessage {
     LoginFailure {
         /// The claimed reason for the login failure.
         reason: LoginFailureReason,
-        /// The homeserver that we attempted to log in to.
-        homeserver: Option<Url>,
+        /// The server name of the homeserver that we attempted to log in to.
+        homeserver: Option<String>,
     },
 
     /// Message containing end-to-end encryption related secrets, the new device
@@ -198,7 +198,7 @@ mod test {
         let json = json!({
             "type": "m.login.protocols",
             "protocols": ["device_authorization_grant"],
-            "homeserver": "https://matrix-client.matrix.org/"
+            "base_url": "https://matrix-client.matrix.org/"
 
         });
 
@@ -274,7 +274,7 @@ mod test {
         let json = json!({
             "type": "m.login.failure",
             "reason": "unsupported_protocol",
-            "homeserver": "https://matrix-client.matrix.org/"
+            "homeserver": "matrix.org"
         });
 
         let message: QrAuthMessage = serde_json::from_value(json.clone()).unwrap();

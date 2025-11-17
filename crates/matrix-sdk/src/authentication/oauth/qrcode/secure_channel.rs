@@ -43,13 +43,14 @@ impl SecureChannel {
         homeserver_url: &Url,
     ) -> Result<Self, Error> {
         let channel = RendezvousChannel::create_outbound(http_client, homeserver_url).await?;
-        let rendezvous_url = channel.rendezvous_url().to_owned();
+        let rendezvous_id = channel.rendezvous_id().to_owned();
         let intent = QrCodeIntent::Login;
 
         let ecies = Ecies::new();
         let public_key = ecies.public_key();
 
-        let qr_code_data = QrCodeData { public_key, rendezvous_id, server_name };
+        let qr_code_data =
+            QrCodeData { intent, public_key, rendezvous_id, base_url: homeserver_url.to_owned() };
 
         Ok(Self { channel, qr_code_data, ecies })
     }
@@ -60,7 +61,8 @@ impl SecureChannel {
         homeserver_url: &Url,
     ) -> Result<Self, Error> {
         let mut channel = SecureChannel::login(http_client, homeserver_url).await?;
-        channel.qr_code_data.server_name = homeserver_url.to_string();
+        channel.qr_code_data.base_url = homeserver_url.clone();
+        channel.qr_code_data.intent = QrCodeIntent::Reciprocate;
         Ok(channel)
     }
 
@@ -73,8 +75,7 @@ impl SecureChannel {
         trace!("Trying to connect the secure channel.");
 
         let message = self.channel.receive().await?;
-        let message = std::str::from_utf8(&message)?;
-        let message = InitialMessage::decode(message)?;
+        let message = InitialMessage::decode(&message)?;
 
         let InboundCreationResult { ecies, message } =
             self.ecies.establish_inbound_channel(&message)?;
@@ -130,9 +131,13 @@ impl EstablishedSecureChannel {
     pub(super) async fn from_qr_code(
         client: reqwest::Client,
         qr_code_data: &QrCodeData,
-        expected_intent: QrCodeIntent,
+        our_intent: QrCodeIntent,
     ) -> Result<Self, Error> {
-        if qr_code_data.intent() == expected_intent {
+        if qr_code_data.intent == our_intent {
+            println!(
+                "QR code intent {:?} matches our intent {:?}",
+                qr_code_data.intent, our_intent
+            );
             Err(Error::InvalidIntent)
         } else {
             trace!("Attempting to create a new inbound secure channel from a QR code.");
@@ -154,7 +159,12 @@ impl EstablishedSecureChannel {
             // the rendezvous channel will have an empty body, so we can just
             // drop it.
             let InboundChannelCreationResult { mut channel, .. } =
-                RendezvousChannel::create_inbound(client, &qr_code_data.rendezvous_url).await?;
+                RendezvousChannel::create_inbound(
+                    client,
+                    &qr_code_data.base_url,
+                    &qr_code_data.rendezvous_id,
+                )
+                .await?;
 
             trace!(
                 "Received the initial message from the rendezvous channel, sending the LOGIN \
@@ -163,7 +173,7 @@ impl EstablishedSecureChannel {
 
             // Now we're sending the encrypted message through the rendezvous channel to the
             // other side.
-            let encoded_message = message.encode().as_bytes().to_vec();
+            let encoded_message = message.encode();
             channel.send(encoded_message).await?;
 
             trace!("Waiting for the LOGIN OK message");
@@ -212,13 +222,12 @@ impl EstablishedSecureChannel {
         let message = self.ecies.encrypt(message.as_bytes());
         let message = message.encode();
 
-        Ok(self.channel.send(message.as_bytes().to_vec()).await?)
+        Ok(self.channel.send(message).await?)
     }
 
     async fn receive(&mut self) -> Result<String, Error> {
-        let message = self.channel.receive().await?;
-        let ciphertext = std::str::from_utf8(&message)?;
-        let message = Message::decode(ciphertext)?;
+        let ciphertext = self.channel.receive().await?;
+        let message = Message::decode(&ciphertext)?;
 
         let decrypted = self.ecies.decrypt(&message)?;
 
@@ -230,7 +239,7 @@ impl EstablishedSecureChannel {
 pub(super) mod test {
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU32, Ordering},
     };
 
     use matrix_sdk_base::crypto::types::qr_login::QrCodeIntent;
@@ -249,59 +258,88 @@ pub(super) mod test {
 
     #[allow(dead_code)]
     pub struct MockedRendezvousServer {
-        pub homeserver_url: Url,
-        pub rendezvous_url: Url,
-        content: Arc<Mutex<Option<String>>>,
-        etag: Arc<AtomicU8>,
+        pub base_url: Url,
+        pub rendezvous_id: String,
+        data: Arc<Mutex<String>>,
+        sequence_token: Arc<AtomicU32>,
         post_guard: MockGuard,
         put_guard: MockGuard,
         get_guard: MockGuard,
     }
 
-    impl MockedRendezvousServer {
-        pub async fn new(server: &MockServer, location: &str) -> Self {
-            let content: Arc<Mutex<Option<String>>> = Mutex::default().into();
-            let etag = Arc::new(AtomicU8::new(0));
+    const BASE_PATH: &str = "/_matrix/client/unstable/io.element.msc4108/rendezvous";
 
-            let homeserver_url = Url::parse(&server.uri())
+    impl MockedRendezvousServer {
+        pub async fn new(server: &MockServer, rendezvous_id: &str) -> Self {
+            let data: Arc<Mutex<String>> = Mutex::new("".to_owned()).into();
+            let sequence_token = Arc::new(AtomicU32::new(0));
+
+            let base_url = Url::parse(&server.uri())
                 .expect("We should be able to parse the example homeserver");
 
-            let rendezvous_url = homeserver_url
-                .join(location)
-                .expect("We should be able to create a rendezvous URL");
-
             let post_guard = server
-                .register_as_scoped(
-                    Mock::given(method("POST"))
-                        .and(path("/_matrix/client/unstable/org.matrix.msc4108/rendezvous"))
-                        .respond_with(
-                            ResponseTemplate::new(200)
-                                .append_header("X-Max-Bytes", "10240")
-                                .append_header("ETag", "1")
-                                .append_header("Expires", "Wed, 07 Sep 2022 14:28:51 GMT")
-                                .append_header("Last-Modified", "Wed, 07 Sep 2022 14:27:51 GMT")
-                                .set_body_json(json!({
-                                    "url": rendezvous_url,
-                                })),
-                        ),
-                )
+                .register_as_scoped(Mock::given(method("POST")).and(path(BASE_PATH)).respond_with(
+                    {
+                        let data = data.clone();
+                        let sequence_token = sequence_token.clone();
+                        let rendezvous_id = rendezvous_id.to_owned();
+
+                        move |request: &wiremock::Request| {
+                            // parse the JSON request body
+                            let body: serde_json::Value =
+                                serde_json::from_slice(&request.body).unwrap();
+
+                            // store the new data in the Mutex
+                            let new_data = body.get("data").unwrap().to_string();
+                            *data.lock().unwrap() = new_data;
+
+                            // increment the sequence token
+                            sequence_token.fetch_add(1, Ordering::SeqCst);
+
+                            ResponseTemplate::new(200).set_body_json(json!({
+                                "id": rendezvous_id,
+                                "sequence_token": sequence_token.load(Ordering::SeqCst).to_string(),
+                                "expires_ts": 1662560931000_u64,
+                            }))
+                        }
+                    },
+                ))
                 .await;
 
             let put_guard = server
                 .register_as_scoped(
-                    Mock::given(method("PUT")).and(path("/abcdEFG12345")).respond_with({
-                        let content = content.clone();
-                        let etag = etag.clone();
+                    Mock::given(method("PUT")).and(path(format!("{BASE_PATH}/{rendezvous_id}"))).respond_with({
+                        let data = data.clone();
+                        let sequence_token = sequence_token.clone();
 
                         move |request: &wiremock::Request| {
-                            *content.lock().unwrap() =
-                                Some(String::from_utf8(request.body.clone()).unwrap());
-                            let current_etag = etag.fetch_add(1, Ordering::SeqCst);
+                            // parse the JSON request body                        
+                            let body: serde_json::Value =
+                                serde_json::from_slice(&request.body).unwrap();
 
-                            ResponseTemplate::new(200)
-                                .append_header("ETag", (current_etag + 2).to_string())
-                                .append_header("Expires", "Wed, 07 Sep 2022 14:28:51 GMT")
-                                .append_header("Last-Modified", "Wed, 07 Sep 2022 14:27:51 GMT")
+                            // check that the sequence token matches
+                            let expected_sequence_token =
+                                body.get("sequence_token").unwrap().as_str().unwrap();
+
+                            let current_sequence_token: String =
+                                sequence_token.load(Ordering::SeqCst).to_string();
+                            if expected_sequence_token != current_sequence_token {
+                                return ResponseTemplate::new(409).set_body_json(json!({
+                                    "errcode": "IO_ELEMENT_MSC4108_CONCURRENT_WRITE",
+                                    "error": format!("Invalid sequence token: expected {}, got {}", current_sequence_token, expected_sequence_token),
+                                }));
+                            }
+
+                            // store the new data in the Mutex
+                            let new_data = body.get("data").unwrap().as_str().unwrap().to_owned();
+                            *data.lock().unwrap() = new_data;
+
+                            // increment the sequence token
+                            sequence_token.fetch_add(1, Ordering::SeqCst);
+
+                            ResponseTemplate::new(200).set_body_json(json!({
+                                "sequence_token": sequence_token.load(Ordering::SeqCst).to_string()
+                            }))
                         }
                     }),
                 )
@@ -309,41 +347,39 @@ pub(super) mod test {
 
             let get_guard = server
                 .register_as_scoped(
-                    Mock::given(method("GET")).and(path("/abcdEFG12345")).respond_with({
-                        let content = content.clone();
-                        let etag = etag.clone();
+                    Mock::given(method("GET"))
+                        .and(path(format!("{BASE_PATH}/{rendezvous_id}")))
+                        .respond_with({
+                            let data = data.clone();
+                            let sequence_token = sequence_token.clone();
 
-                        move |request: &wiremock::Request| {
-                            let requested_etag = request.headers.get("if-none-match").map(|etag| {
-                                str::parse::<u8>(std::str::from_utf8(etag.as_bytes()).unwrap())
-                                    .unwrap()
-                            });
+                            move |_request: &wiremock::Request| {
+                                if sequence_token.load(Ordering::SeqCst) == 0 {
+                                    // no POST yet, return 404
+                                    return ResponseTemplate::new(404).set_body_json(json!({
+                                        "errcode": "M_NOT_FOUND",
+                                        "error": "The rendezvous hasn't been created yet."
+                                    }));
+                                }
 
-                            let mut content = content.lock().unwrap();
-                            let current_etag = etag.load(Ordering::SeqCst);
-
-                            if requested_etag == Some(current_etag) || requested_etag.is_none() {
-                                let content = content.take();
-
-                                ResponseTemplate::new(200)
-                                    .append_header("ETag", (current_etag).to_string())
-                                    .append_header("Expires", "Wed, 07 Sep 2022 14:28:51 GMT")
-                                    .append_header("Last-Modified", "Wed, 07 Sep 2022 14:27:51 GMT")
-                                    .set_body_string(content.unwrap_or_default())
-                            } else {
-                                let etag = requested_etag.unwrap_or_default();
-
-                                ResponseTemplate::new(304)
-                                    .append_header("ETag", etag.to_string())
-                                    .append_header("Expires", "Wed, 07 Sep 2022 14:28:51 GMT")
-                                    .append_header("Last-Modified", "Wed, 07 Sep 2022 14:27:51 GMT")
+                                ResponseTemplate::new(200).set_body_json(json!({
+                                "data": data.clone().lock().unwrap().to_string(),
+                                "sequence_token": sequence_token.load(Ordering::SeqCst).to_string(),
+                            }))
                             }
-                        }
-                    }),
+                        }),
                 )
                 .await;
 
-            Self { content, etag, post_guard, put_guard, get_guard, homeserver_url, rendezvous_url }
+            Self {
+                data,
+                sequence_token,
+                post_guard,
+                put_guard,
+                get_guard,
+                base_url,
+                rendezvous_id: rendezvous_id.to_owned(),
+            }
         }
     }
 
@@ -353,7 +389,7 @@ pub(super) mod test {
         let rendezvous_server = MockedRendezvousServer::new(&server, "abcdEFG12345").await;
 
         let client = HttpClient::new(reqwest::Client::new(), Default::default());
-        let alice = SecureChannel::reciprocate(client, &rendezvous_server.homeserver_url)
+        let alice = SecureChannel::reciprocate(client, &rendezvous_server.base_url)
             .await
             .expect("Alice should be able to create a secure channel.");
 
@@ -385,6 +421,6 @@ pub(super) mod test {
             .confirm(bob.check_code().to_digit())
             .expect("Alice should be able to confirm the established secure channel.");
 
-        assert_eq!(bob.channel.rendezvous_url(), alice.channel.rendezvous_url());
+        assert_eq!(bob.channel.rendezvous_id(), alice.channel.rendezvous_id());
     }
 }

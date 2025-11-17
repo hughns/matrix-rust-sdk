@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use matrix_sdk::{
     Client,
     authentication::oauth::{
-        qrcode::{LoginProgress, QrCodeData, QrProgress},
+        qrcode::{LoginProgress, QrCodeData, QrCodeIntent, QrProgress},
         registration::{ApplicationType, ClientMetadata, Localized, OAuthGrantType},
     },
     ruma::serde::Raw,
@@ -101,10 +101,12 @@ async fn login(proxy: Option<Url>) -> Result<()> {
 
     let data = QrCodeData::from_base64(input).context("Couldn't parse the base64 QR code data")?;
 
-    let QrCodeModeData::Reciprocate { server_name } = &data.mode_data else {
-        bail!("The QR code is invalid, we did not receive a homeserver in the QR code.");
-    };
-    let mut client = Client::builder().server_name_or_homeserver_url(server_name);
+    if (data.intent) != QrCodeIntent::Reciprocate {
+        bail!("The QR code is invalid, it is not meant for logging in.");
+    }
+
+    let base_url = data.base_url.clone();
+    let mut client = Client::builder().homeserver_url(base_url);
 
     if let Some(proxy) = proxy {
         client = client.proxy(proxy).disable_ssl_verification();

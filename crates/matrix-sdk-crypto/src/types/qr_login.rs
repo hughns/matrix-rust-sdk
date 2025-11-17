@@ -23,6 +23,7 @@ use std::{
 
 use byteorder::{BigEndian, ReadBytesExt};
 use thiserror::Error;
+use url::Url;
 use vodozemac::{base64_decode, base64_encode, Curve25519PublicKey};
 
 /// The prefix that is used in the QR code data.
@@ -109,9 +110,9 @@ pub struct QrCodeData {
     /// The ID of the rendezvous session, can be used to exchange messages with
     /// the other device.
     pub rendezvous_id: String,
-    /// The homeserver the existing device is using. This will let the new
-    /// device know which homeserver it should use as well.
-    pub server_name: String,
+    /// The base URL of the homeserver that the device generating the QR is
+    /// using.
+    pub base_url: Url,
 }
 
 impl QrCodeData {
@@ -127,8 +128,9 @@ impl QrCodeData {
         // 5. Two bytes for the length of the rendezvous ID, a u16 in big-endian
         //    encoding.
         // 6. The UTF-8 encoded string containing the rendezvous ID.
-        // 7. Two bytes for the length of the server name, a u16 in big-endian encoding.
-        // 8. The UTF-8 encoded string containing the server name.
+        // 7. Two bytes for the length of the server base URL, a u16 in big-endian
+        //    encoding.
+        // 8. The UTF-8 encoded string containing the server base URL.
         let mut reader = Cursor::new(bytes);
 
         // 1. Let's get the prefix first and double check if this QR code is intended
@@ -160,15 +162,15 @@ impl QrCodeData {
             reader.read_exact(&mut rendezvous_id)?;
             let rendezvous_id = String::from_utf8(rendezvous_id).map_err(|e| e.utf8_error())?;
 
-            // 7. We read the two bytes for the length of the server nameL.
-            let server_name_len = reader.read_u16::<BigEndian>()?;
+            // 7. We read the two bytes for the length of the server base URL.
+            let base_url_len = reader.read_u16::<BigEndian>()?;
 
-            // 8. We read and parse the server name.
-            let mut server_name = vec![0u8; server_name_len.into()];
-            reader.read_exact(&mut server_name)?;
-            let server_name = String::from_utf8(server_name).map_err(|e| e.utf8_error())?;
+            // 8. We read and parse the server base URL.
+            let mut base_url = vec![0u8; base_url_len.into()];
+            reader.read_exact(&mut base_url)?;
+            let base_url = Url::parse(str::from_utf8(&base_url)?)?;
 
-            Ok(Self { public_key, rendezvous_id, server_name, intent })
+            Ok(Self { public_key, rendezvous_id, base_url, intent })
         } else {
             Err(LoginQrCodeDecodeError::InvalidType(qr_type))
         }
@@ -180,7 +182,14 @@ impl QrCodeData {
     /// containing a QR code.
     pub fn to_bytes(&self) -> Vec<u8> {
         let rendezvous_id_len = (self.rendezvous_id.as_str().len() as u16).to_be_bytes();
-        let server_name_len = (self.server_name.as_str().len() as u16).to_be_bytes();
+
+        // if path is / then don't include the trailing slash
+        let base_url = if self.base_url.path() == "/" {
+            self.base_url.as_str().trim_end_matches('/')
+        } else {
+            self.base_url.as_str()
+        };
+        let base_url_len = (base_url.len() as u16).to_be_bytes();
 
         let encoded = [
             PREFIX,
@@ -189,8 +198,8 @@ impl QrCodeData {
             self.public_key.as_bytes().as_slice(),
             &rendezvous_id_len,
             self.rendezvous_id.as_bytes(),
-            &server_name_len,
-            self.server_name.as_bytes(),
+            &base_url_len,
+            base_url.as_bytes(),
         ]
         .concat();
 
@@ -225,7 +234,9 @@ mod test {
         0xe5, 0x14, 0x37, 0x02, 0x48, 0xed, 0x6b, 0x00, 0x24, 0x65, 0x38, 0x64, 0x61, 0x36, 0x33,
         0x35, 0x35, 0x2D, 0x35, 0x35, 0x30, 0x62, 0x2D, 0x34, 0x61, 0x33, 0x32, 0x2D, 0x61, 0x31,
         0x39, 0x33, 0x2D, 0x31, 0x36, 0x31, 0x39, 0x64, 0x39, 0x38, 0x33, 0x30, 0x36, 0x36, 0x38,
-        0x00, 0x0A, 0x6d, 0x61, 0x74, 0x72, 0x69, 0x78, 0x2e, 0x6f, 0x72, 0x67,
+        0x00, 0x20, 0x68, 0x74, 0x74, 0x70, 0x73, 0x3A, 0x2F, 0x2F, 0x6D, 0x61, 0x74, 0x72, 0x69,
+        0x78, 0x2D, 0x63, 0x6C, 0x69, 0x65, 0x6E, 0x74, 0x2E, 0x6D, 0x61, 0x74, 0x72, 0x69, 0x78,
+        0x2E, 0x6F, 0x72, 0x67,
     ];
 
     // Test vector for the QR code data, copied from the MSC, with the intent set to
@@ -237,11 +248,13 @@ mod test {
         0xe5, 0x14, 0x37, 0x02, 0x48, 0xed, 0x6b, 0x00, 0x24, 0x65, 0x38, 0x64, 0x61, 0x36, 0x33,
         0x35, 0x35, 0x2D, 0x35, 0x35, 0x30, 0x62, 0x2D, 0x34, 0x61, 0x33, 0x32, 0x2D, 0x61, 0x31,
         0x39, 0x33, 0x2D, 0x31, 0x36, 0x31, 0x39, 0x64, 0x39, 0x38, 0x33, 0x30, 0x36, 0x36, 0x38,
-        0x00, 0x0A, 0x6d, 0x61, 0x74, 0x72, 0x69, 0x78, 0x2e, 0x6f, 0x72, 0x67,
+        0x00, 0x20, 0x68, 0x74, 0x74, 0x70, 0x73, 0x3A, 0x2F, 0x2F, 0x6D, 0x61, 0x74, 0x72, 0x69,
+        0x78, 0x2D, 0x63, 0x6C, 0x69, 0x65, 0x6E, 0x74, 0x2E, 0x6D, 0x61, 0x74, 0x72, 0x69, 0x78,
+        0x2E, 0x6F, 0x72, 0x67,
     ];
 
     // Test vector for the QR code data in base64 format, self-generated.
-    const QR_CODE_DATA_BASE64: &str = "SU9fRUxFTUVOVF9NU0M0MTA4AwG0yzZ1QVpQ1jlnoxWX3d5jrWRFfELxjS2gN7pz9y+3PAAaMDFIWDlLMDBRMUg2S1BENDdFRzRHMVQzWEcAHHN5bmFwc2Utb2lkYy5sYWIuZWxlbWVudC5kZXY";
+    const QR_CODE_DATA_BASE64: &str = "SU9fRUxFTUVOVF9NU0M0MTA4AwG0yzZ1QVpQ1jlnoxWX3d5jrWRFfELxjS2gN7pz9y+3PAAaMDFIWDlLMDBRMUg2S1BENDdFRzRHMVQzWEcAJGh0dHBzOi8vc3luYXBzZS1vaWRjLmxhYi5lbGVtZW50LmRldg";
 
     #[test]
     fn parse_qr_data() {
@@ -269,7 +282,8 @@ mod test {
         );
 
         assert_eq!(
-            "matrix.org", data.server_name,
+            "https://matrix-client.matrix.org/",
+            data.base_url.as_str(),
             "We should have correctly found the matrix.org server name in the QR code data"
         );
     }
@@ -300,7 +314,8 @@ mod test {
         );
 
         assert_eq!(
-            data.server_name, "matrix.org",
+            data.base_url.as_str(),
+            "https://matrix-client.matrix.org/",
             "We should have correctly found the matrix.org homeserver in the QR code data"
         );
     }
@@ -331,7 +346,8 @@ mod test {
         );
 
         assert_eq!(
-            "synapse-oidc.lab.element.dev", data.server_name,
+            "https://synapse-oidc.lab.element.dev/",
+            data.base_url.as_str(),
             "The parsed server name should match the expected one"
         );
     }

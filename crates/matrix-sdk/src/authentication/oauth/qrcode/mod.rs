@@ -35,7 +35,6 @@ pub use oauth2::{
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
-use url::Url;
 use vodozemac::ecies::CheckCode;
 pub use vodozemac::ecies::{Error as EciesError, MessageDecodeError};
 
@@ -70,8 +69,8 @@ pub enum QRCodeLoginError {
     LoginFailure {
         /// The reason, as signaled by the other device, for the login failure.
         reason: LoginFailureReason,
-        /// The homeserver that we attempted to log in to.
-        homeserver: Option<Url>,
+        /// The server name of the homeserver that we attempted to log in to.
+        homeserver: Option<String>,
     },
 
     /// An unexpected message was received from the other device.

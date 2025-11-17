@@ -35,7 +35,7 @@ impl LoginWithQrCodeHandler {
     ///
     /// For the login to succeed, the [`Client`] associated with the
     /// [`LoginWithQrCodeHandler`] must have been built with
-    /// [`QrCodeData::server_name`] as the server name.
+    /// [`QrCodeData::base_url`] as the server base URL.
     ///
     /// This method uses the login mechanism described in [MSC4108]. As such,
     /// it requires OAuth 2.0 support as well as Sliding Sync support.
@@ -132,6 +132,21 @@ pub struct QrCodeData {
     pub(crate) inner: qrcode::QrCodeData,
 }
 
+/// The intent of the QR code login.
+///
+/// The QR code login mechanism supports both, the new device, as well as the
+/// existing device to display the QR code.
+///
+/// The different intents have an explicit one-byte identifier which gets added
+/// to the QR code data.
+#[derive(uniffi::Enum)]
+pub enum QrCodeIntent {
+    /// The new device is displaying the QR code.
+    Login,
+    /// The existing device is displaying the QR code.
+    Reciprocate,
+}
+
 #[matrix_sdk_ffi_macros::export]
 impl QrCodeData {
     /// Attempt to decode a slice of bytes into a [`QrCodeData`] object.
@@ -142,9 +157,21 @@ impl QrCodeData {
         Ok(Self { inner: qrcode::QrCodeData::from_bytes(&bytes)? }.into())
     }
 
-    /// The server name contained within the scanned QR code data.
-    pub fn server_name(&self) -> String {
-        self.inner.server_name
+    /// The homeserver base URL contained within the scanned QR code data.
+    pub fn base_url(&self) -> String {
+        self.inner.base_url.to_string()
+    }
+
+    /// The rendezvous ID contained within the scanned QR code data.
+    pub fn rendezvous_id(&self) -> String {
+        self.inner.rendezvous_id.clone()
+    }
+
+    pub fn intent(&self) -> QrCodeIntent {
+        match self.inner.intent {
+            qrcode::QrCodeIntent::Reciprocate => QrCodeIntent::Reciprocate,
+            qrcode::QrCodeIntent::Login => QrCodeIntent::Login,
+        }
     }
 }
 

@@ -1382,7 +1382,7 @@ impl<'a> LoginWithQrCodeBuilder<'a> {
     /// use matrix_sdk::{
     ///     authentication::oauth::{
     ///         registration::ClientMetadata,
-    ///         qrcode::{LoginProgress, QrCodeData, QrCodeModeData, QrProgress},
+    ///         qrcode::{LoginProgress, QrCodeData, QrCodeIntent, QrProgress},
     ///     },
     ///     ruma::serde::Raw,
     ///     Client,
@@ -1395,13 +1395,13 @@ impl<'a> LoginWithQrCodeBuilder<'a> {
     /// let qr_code_data = QrCodeData::from_bytes(bytes)?;
     ///
     /// // Fetch the homeserver out of the parsed QR code data.
-    /// let QrCodeModeData::Reciprocate{ server_name } = qr_code_data.mode_data else {
-    ///     bail!("The QR code is invalid, we did not receive a homeserver in the QR code.");
+    /// if qr_code_data.intent != QrCodeIntent::Reciprocate {
+    ///     bail!("The QR code is not from a logged in device.");
     /// };
     ///
     /// // Build the client as usual.
     /// let client = Client::builder()
-    ///     .server_name_or_homeserver_url(server_name)
+    ///     .homeserver_url(qr_code_data.base_url)
     ///     .handle_refresh_tokens()
     ///     .build()
     ///     .await?;
@@ -1465,7 +1465,7 @@ impl<'a> LoginWithQrCodeBuilder<'a> {
     /// use matrix_sdk::{
     ///     authentication::oauth::{
     ///         registration::ClientMetadata,
-    ///         qrcode::{GeneratedQrProgress, LoginProgress, QrCodeData, QrCodeModeData},
+    ///         qrcode::{GeneratedQrProgress, LoginProgress, QrCodeData, QrCodeIntent},
     ///     },
     ///     ruma::serde::Raw,
     ///     Client,
@@ -1581,7 +1581,7 @@ impl<'a> GrantLoginWithQrCodeBuilder<'a> {
     /// use futures_util::StreamExt;
     /// use matrix_sdk::{
     ///     Client, authentication::oauth::{
-    ///         qrcode::{GrantLoginProgress, QrCodeData, QrCodeModeData, QrProgress},
+    ///         qrcode::{GrantLoginProgress, QrCodeData, QrCodeIntent, QrProgress},
     ///     }
     /// };
     /// use std::{error::Error, io::stdin};

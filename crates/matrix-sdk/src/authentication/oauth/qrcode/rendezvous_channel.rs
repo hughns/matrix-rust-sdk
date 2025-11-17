@@ -12,45 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::Duration;
+use std::{borrow::Cow, time::Duration};
 
-use http::{
-    HeaderMap, HeaderName, Method, StatusCode,
-    header::{CONTENT_TYPE, ETAG, EXPIRES, IF_MATCH, IF_NONE_MATCH, LAST_MODIFIED},
-};
+use http::StatusCode;
 use matrix_sdk_base::sleep;
-use ruma::{MilliSecondsSinceUnixEpoch, api::{
-    EndpointError,
-    error::{FromHttpResponseError, HeaderDeserializationError, IntoHttpError, MatrixError},
-}};
+use ruma::api::{
+    EndpointError, SupportedVersions,
+    client::rendezvous::{
+        create_rendezvous_session, get_rendezvous_session, update_rendezvous_session,
+    },
+    error::{FromHttpResponseError, IntoHttpError, MatrixError},
+};
 use tracing::{debug, instrument, trace};
 use url::Url;
 
 use crate::{HttpError, RumaApiError, http_client::HttpClient};
 
-const TEXT_PLAIN_CONTENT_TYPE: &str = "text/plain";
 #[cfg(test)]
 const POLL_TIMEOUT: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
 const POLL_TIMEOUT: Duration = Duration::from_secs(1);
-
-type Etag = String;
-
-/// Get a header from a [`HeaderMap`] and parse it as a UTF-8 string.
-fn get_header(
-    header_map: &HeaderMap,
-    header_name: &HeaderName,
-) -> Result<String, Box<FromHttpResponseError<RumaApiError>>> {
-    let header = header_map
-        .get(header_name)
-        .ok_or(HeaderDeserializationError::MissingHeader(ETAG.to_string()))
-        .map_err(|error| Box::new(FromHttpResponseError::from(error)))?;
-
-    let header =
-        header.to_str().map_err(|error| Box::new(FromHttpResponseError::from(error)))?.to_owned();
-
-    Ok(header)
-}
 
 /// The result of the [`RendezvousChannel::create_inbound()`] method.
 pub(super) struct InboundChannelCreationResult {
@@ -61,18 +42,7 @@ pub(super) struct InboundChannelCreationResult {
     ///
     /// This is currently unused, but left in for completeness sake.
     #[allow(dead_code)]
-    pub initial_message: Vec<u8>,
-}
-
-struct RendezvousGetResponse {
-    pub status_code: StatusCode,
-    pub sequence_token: String,
-    // TODO: This is currently unused, but will be required once we implement the reciprocation of
-    // a login. Left here so we don't forget about it. We should put this into the
-    // [`RendezvousChannel`] struct, once we parse it into a [`SystemTime`].
-    #[allow(dead_code)]
-    pub expires: MilliSecondsSinceUnixEpoch,
-    pub data: String,
+    pub initial_message: String,
 }
 
 struct RendezvousMessage {
@@ -82,12 +52,13 @@ struct RendezvousMessage {
 
 pub(super) struct RendezvousChannel {
     client: HttpClient,
-    rendezvous_url: Url,
-    etag: Etag,
+    base_url: Url,
+    rendezvous_id: String,
+    sequence_token: String,
 }
 
-fn response_to_error(status: StatusCode, body: Vec<u8>) -> HttpError {
-    match http::Response::builder().status(status).body(body).map_err(IntoHttpError::from) {
+fn response_to_error(status: StatusCode, data: String) -> HttpError {
+    match http::Response::builder().status(status).body(data).map_err(IntoHttpError::from) {
         Ok(response) => {
             let error = FromHttpResponseError::<RumaApiError>::Server(RumaApiError::Other(
                 MatrixError::from_http_response(response),
@@ -107,18 +78,17 @@ impl RendezvousChannel {
     /// through the channel.
     pub(super) async fn create_outbound(
         client: HttpClient,
-        homeserver_base_url: &Url,
+        base_url: &Url,
     ) -> Result<Self, HttpError> {
         use std::borrow::Cow;
 
-        use ruma::api::{SupportedVersions, client::rendezvous::create_rendezvous_session};
+        let request = create_rendezvous_session::unstable::Request::new("".to_owned());
 
-        let request = create_rendezvous_session::unstable::Request::default();
         let response = client
             .send(
                 request,
                 None,
-                homeserver_base_url.to_string(),
+                base_url.to_string(),
                 None, // TODO: should also support passing in access token
                 Cow::Owned(SupportedVersions {
                     versions: Default::default(),
@@ -128,10 +98,10 @@ impl RendezvousChannel {
             )
             .await?;
 
-        let rendezvous_url = response.url;
-        let etag = response.etag;
+        let rendezvous_id = response.id;
+        let sequence_token = response.sequence_token;
 
-        Ok(Self { client, rendezvous_url, etag })
+        Ok(Self { client, base_url: base_url.to_owned(), rendezvous_id, sequence_token })
     }
 
     /// Create a new inbound [`RendezvousChannel`].
@@ -140,66 +110,66 @@ impl RendezvousChannel {
     /// message from the rendezvous session on the given [`rendezvous_url`].
     pub(super) async fn create_inbound(
         client: HttpClient,
-        rendezvous_url: &Url,
+        base_url: &Url,
+        rendezvous_id: &String,
     ) -> Result<InboundChannelCreationResult, HttpError> {
         // Receive the initial message, which should be empty. But we need the ETAG to
         // fully establish the rendezvous channel.
-        let response = Self::receive_message_impl(&client.inner, None, rendezvous_url).await?;
+        let response = Self::receive_message_impl(&client, base_url, rendezvous_id).await?;
 
-        let etag = response.etag.clone();
+        let sequence_token = response.sequence_token.clone();
 
-        let initial_message = RendezvousMessage {
-            status_code: response.status_code,
-            data: response.body,
+        let initial_message =
+            RendezvousMessage { status_code: StatusCode::OK, data: response.data };
+
+        let channel = Self {
+            client,
+            base_url: base_url.to_owned(),
+            rendezvous_id: rendezvous_id.to_owned(),
+            sequence_token,
         };
 
-        let channel = Self { client, rendezvous_url: rendezvous_url.clone(), sequence_token };
-
-        Ok(InboundChannelCreationResult { channel, initial_message: initial_message.body })
+        Ok(InboundChannelCreationResult { channel, initial_message: initial_message.data })
     }
 
-    /// Get the URL of the rendezvous session we're using to exchange messages
+    /// Get the ID of the rendezvous session we're using to exchange messages
     /// through the channel.
-    pub(super) fn rendezvous_url(&self) -> &Url {
-        &self.rendezvous_url
+    pub(super) fn rendezvous_id(&self) -> &String {
+        &self.rendezvous_id
     }
 
     /// Send the given `message` through the [`RendezvousChannel`] to the other
     /// device.
-    ///
-    /// The message must be of the `text/plain` content type.
     #[instrument(skip_all)]
-    pub(super) async fn send(&mut self, message: Vec<u8>) -> Result<(), HttpError> {
-        let etag = self.etag.clone();
+    pub(super) async fn send(&mut self, message: String) -> Result<(), HttpError> {
+        let request = update_rendezvous_session::unstable::Request::new(
+            self.rendezvous_id.clone(),
+            self.sequence_token.clone(),
+            message,
+        );
 
-        let request = self
+        let response = self
             .client
-            .inner
-            .request(Method::PUT, self.rendezvous_url().to_owned())
-            .body(message)
-            .header(IF_MATCH, etag)
-            .header(CONTENT_TYPE, TEXT_PLAIN_CONTENT_TYPE);
-
-        debug!("Sending a request to the rendezvous channel {request:?}");
-
-        let response = request.send().await?;
-        let status = response.status();
+            .send(
+                request,
+                None,
+                self.base_url.to_string(),
+                None,
+                Cow::Owned(SupportedVersions {
+                    versions: Default::default(),
+                    features: Default::default(),
+                }),
+                Default::default(),
+            )
+            .await?;
 
         debug!("Response for the rendezvous sending request {response:?}");
 
-        if status.is_success() {
-            // We successfully send out a message, get the ETAG and update our internal copy
-            // of the ETAG.
-            let etag = get_header(response.headers(), &ETAG)?;
-            self.etag = etag;
+        // We successfully send out a message, get the sequence_token and update our
+        // internal copy of the sequence_token.
+        self.sequence_token = response.sequence_token;
 
-            Ok(())
-        } else {
-            let body = response.bytes().await?;
-            let error = response_to_error(status, body.to_vec());
-
-            return Err(error);
-        }
+        Ok(())
     }
 
     /// Attempt to receive a message from the [`RendezvousChannel`] from the
@@ -210,77 +180,69 @@ impl RendezvousChannel {
     ///
     /// This method will wait in a loop for the channel to give us a new
     /// message.
-    pub(super) async fn receive(&mut self) -> Result<Vec<u8>, HttpError> {
+    pub(super) async fn receive(&mut self) -> Result<String, HttpError> {
         loop {
             let message = self.receive_single_message().await?;
 
             trace!(
                 status_code = %message.status_code,
+                data = %message.data,
                 "Received data from the rendezvous channel"
             );
+            // if sequence token is the same as our current one, it means no new message and
+            // map into not modified HTTP status
 
-            if message.status_code == StatusCode::OK
-                && message.content_type == TEXT_PLAIN_CONTENT_TYPE
-                && !message.body.is_empty()
-            {
-                return Ok(message.body);
+            if message.status_code == StatusCode::OK {
+                return Ok(message.data);
             } else if message.status_code == StatusCode::NOT_MODIFIED {
                 sleep::sleep(POLL_TIMEOUT).await;
                 continue;
             } else {
-                let error = response_to_error(message.status_code, message.body);
+                let error = response_to_error(message.status_code, message.data);
 
                 return Err(error);
             }
         }
     }
 
-    #[instrument]
     async fn receive_message_impl(
-        client: &reqwest::Client,
-        rendezvous_url: &Url,
-    ) -> Result<RendezvousGetResponse, HttpError> {
-        let mut builder = client.request(Method::GET, rendezvous_url.to_owned());
-
-        let response = builder.send().await?;
-
-        debug!("Received data from the rendezvous channel {response:?}");
-
-        let status_code = response.status();
-
-        // parse data, expires_ts and sequence_token from JSON response body
-        let json: serde_json::Value = response.json().await?;
-
-        let data = json.get("data").and_then(|v| v.as_str());
-        let expires_ts = json.get("expires_ts").and_then(|v| v.as_u64()).map(MilliSecondsSinceUnixEpoch::from);
-        let sequence_token = json.get("sequence_token").and_then(|v| v.as_str()).map(ToOwned::to_owned);
-        if data.is_none() || expires_ts.is_none() || sequence_token.is_none() {
-            return Err(HttpError::InvalidResponse(
-                "Missing `data` or `expires_ts` or `sequence_token` field in rendezvous response".to_owned(),
-            ));
-        }
-
-
-        let response =
-            RendezvousGetResponse { status_code, sequence_token, expires: expires_ts, data };
-
-        Ok(response)
+        client: &HttpClient,
+        base_url: &Url,
+        rendezvous_id: &String,
+    ) -> Result<get_rendezvous_session::unstable::Response, HttpError> {
+        let request = get_rendezvous_session::unstable::Request::new(rendezvous_id.to_owned());
+        client
+            .send(
+                request,
+                None,
+                base_url.to_string(),
+                None,
+                Cow::Owned(SupportedVersions {
+                    versions: Default::default(),
+                    features: Default::default(),
+                }),
+                Default::default(),
+            )
+            .await
     }
 
     async fn receive_single_message(&mut self) -> Result<RendezvousMessage, HttpError> {
-        let etag = Some(self.etag.clone());
+        let response =
+            Self::receive_message_impl(&self.client, &self.base_url, &self.rendezvous_id).await?;
 
-        let RendezvousGetResponse { status_code, etag, content_type, body, .. } =
-            Self::receive_message_impl(&self.client.inner, etag, &self.rendezvous_url).await?;
+        // since the rendezvous API has changed it doesn't make sense to use the http
+        // status code at this layer
+        if response.sequence_token == self.sequence_token {
+            return Ok(RendezvousMessage {
+                status_code: StatusCode::NOT_MODIFIED,
+                data: response.data,
+            });
+        }
 
-        // We received a response with an ETAG, put it into the copy of our etag.
-        self.etag = etag;
+        // We received a new sequence_token, put it into the copy of our sequence_token.
+        self.sequence_token = response.sequence_token;
 
-        let message = RendezvousMessage {
-            status_code,
-            body,
-            content_type: content_type.unwrap_or_else(|| "text/plain".to_owned()),
-        };
+        let message = RendezvousMessage { status_code: StatusCode::OK, data: response.data };
 
         Ok(message)
     }
@@ -293,94 +255,118 @@ mod test {
     use similar_asserts::assert_eq;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{header, method, path},
+        matchers::{method, path},
     };
 
     use super::*;
     use crate::config::RequestConfig;
 
-    async fn mock_rendzvous_create(server: &MockServer, rendezvous_url: &Url) {
+    const BASE_PATH: &str = "/_matrix/client/unstable/io.element.msc4108/rendezvous";
+
+    async fn mock_rendezvous_create(
+        server: &MockServer,
+        rendezvous_id: &str,
+    ) -> Result<String, HttpError> {
         server
-            .register(
-                Mock::given(method("POST"))
-                    .and(path("/_matrix/client/unstable/org.matrix.msc4108/rendezvous"))
-                    .respond_with(
-                        ResponseTemplate::new(200)
-                            .append_header("X-Max-Bytes", "10240")
-                            .append_header("ETag", "1")
-                            .append_header("Expires", "Wed, 07 Sep 2022 14:28:51 GMT")
-                            .append_header("Last-Modified", "Wed, 07 Sep 2022 14:27:51 GMT")
-                            .set_body_json(json!({
-                                "url": rendezvous_url,
-                            })),
-                    ),
-            )
+            .register(Mock::given(method("POST")).and(path(BASE_PATH)).respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": rendezvous_id,
+                    "sequence_token": "1",
+                    "expires_ts": 1662560931000_u64,
+                })),
+            ))
             .await;
+
+        Ok(format!("{BASE_PATH}/{rendezvous_id}"))
     }
 
     #[async_test]
     async fn test_creation() {
         let server = MockServer::start().await;
-        let url =
+        let base_url =
             Url::parse(&server.uri()).expect("We should be able to parse the example homeserver");
-        let rendezvous_url =
-            url.join("abcdEFG12345").expect("We should be able to create a rendezvous URL");
+        let rendezvous_id = "abcdEFG12345";
 
-        mock_rendzvous_create(&server, &rendezvous_url).await;
+        let rendezvous_path = mock_rendezvous_create(&server, rendezvous_id)
+            .await
+            .expect("We should be able to create a rendezvous");
 
         let client = HttpClient::new(reqwest::Client::new(), RequestConfig::new().disable_retry());
 
-        let mut alice = RendezvousChannel::create_outbound(client, &url)
+        let mut alice = RendezvousChannel::create_outbound(client, &base_url)
             .await
             .expect("We should be able to create an outbound rendezvous channel");
 
         assert_eq!(
-            alice.rendezvous_url(),
-            &rendezvous_url,
-            "Alice should have configured the rendezvous URL correctly."
+            alice.rendezvous_id(),
+            &rendezvous_id,
+            "Alice should have configured the rendezvous ID correctly."
         );
 
-        assert_eq!(alice.etag, "1", "Alice should have remembered the ETAG the server gave us.");
+        assert_eq!(
+            alice.sequence_token, "1",
+            "Alice should have remembered the sequence_token the server gave us."
+        );
+
+        {
+            let _scope = server
+                .register_as_scoped(
+                    Mock::given(method("GET")).and(path(rendezvous_path.clone())).respond_with(
+                        ResponseTemplate::new(200).set_body_json(json!({
+                            "data": "",
+                            "sequence_token": "1"
+                        })),
+                    ),
+                )
+                .await;
+
+            let response = alice
+                .receive_single_message()
+                .await
+                .expect("Alice should be able to wait for data on the rendezvous channel.");
+            assert_eq!(response.status_code, StatusCode::NOT_MODIFIED);
+        }
 
         let mut bob = {
             let _scope = server
                 .register_as_scoped(
-                    Mock::given(method("GET")).and(path("/abcdEFG12345")).respond_with(
-                        ResponseTemplate::new(200)
-                            .append_header("Content-Type", "text/plain")
-                            .append_header("ETag", "2")
-                            .append_header("Expires", "Wed, 07 Sep 2022 14:28:51 GMT")
-                            .append_header("Last-Modified", "Wed, 07 Sep 2022 14:27:51 GMT"),
+                    Mock::given(method("GET")).and(path(rendezvous_path.clone())).respond_with(
+                        ResponseTemplate::new(200).set_body_json(json!({
+                            "data": "",
+                            "sequence_token": "2",
+                            "expires_ts": 1662560931000_u64,
+                        })),
                     ),
                 )
                 .await;
 
             let client = HttpClient::new(reqwest::Client::new(), RequestConfig::short_retry());
             let InboundChannelCreationResult { channel: bob, initial_message: _ } =
-                RendezvousChannel::create_inbound(client, &rendezvous_url).await.expect(
-                    "We should be able to create a rendezvous channel from a received message",
-                );
+                RendezvousChannel::create_inbound(client, &base_url, &rendezvous_id.to_owned())
+                    .await
+                    .expect(
+                        "We should be able to create a rendezvous channel from a received message",
+                    );
 
-            assert_eq!(alice.rendezvous_url(), bob.rendezvous_url());
+            assert_eq!(alice.rendezvous_id(), bob.rendezvous_id());
 
             bob
         };
 
-        assert_eq!(bob.etag, "2", "Bob should have remembered the ETAG the server gave us.");
+        assert_eq!(
+            bob.sequence_token, "2",
+            "Bob should have remembered the sequence_token the server gave us."
+        );
 
         {
             let _scope = server
                 .register_as_scoped(
-                    Mock::given(method("GET"))
-                        .and(path("/abcdEFG12345"))
-                        .and(header("if-none-match", "1"))
-                        .respond_with(
-                            ResponseTemplate::new(304)
-                                .append_header("ETag", "1")
-                                .append_header("Content-Type", "text/plain")
-                                .append_header("Expires", "Wed, 07 Sep 2022 14:28:51 GMT")
-                                .append_header("Last-Modified", "Wed, 07 Sep 2022 14:27:51 GMT"),
-                        ),
+                    Mock::given(method("GET")).and(path(rendezvous_path.clone())).respond_with(
+                        ResponseTemplate::new(200).set_body_json(json!({
+                            "data": "",
+                            "sequence_token": "2"
+                        })),
+                    ),
                 )
                 .await;
 
@@ -388,43 +374,34 @@ mod test {
                 .receive_single_message()
                 .await
                 .expect("We should be able to wait for data on the rendezvous channel.");
-            assert_eq!(response.status_code, StatusCode::NOT_MODIFIED);
+            assert_eq!(response.status_code, StatusCode::OK);
         }
 
         {
             let _scope = server
                 .register_as_scoped(
-                    Mock::given(method("PUT"))
-                        .and(path("/abcdEFG12345"))
-                        .and(header("Content-Type", "text/plain"))
-                        .respond_with(
-                            ResponseTemplate::new(200)
-                                .append_header("ETag", "1")
-                                .append_header("Expires", "Wed, 07 Sep 2022 14:28:51 GMT")
-                                .append_header("Last-Modified", "Wed, 07 Sep 2022 14:27:51 GMT"),
-                        ),
+                    Mock::given(method("PUT")).and(path(rendezvous_path.clone())).respond_with(
+                        ResponseTemplate::new(200).set_body_json(json!({
+                            "sequence_token": "3"
+                        })),
+                    ),
                 )
                 .await;
 
-            bob.send(b"Hello world".to_vec())
+            bob.send("Hello world".to_owned())
                 .await
-                .expect("We should be able to send data to the rendezouvs server.");
+                .expect("We should be able to send data to the rendezvous server.");
         }
 
         {
             let _scope = server
                 .register_as_scoped(
-                    Mock::given(method("GET"))
-                        .and(path("/abcdEFG12345"))
-                        .and(header("if-none-match", "1"))
-                        .respond_with(
-                            ResponseTemplate::new(200)
-                                .append_header("ETag", "3")
-                                .append_header("Content-Type", "text/plain")
-                                .append_header("Expires", "Wed, 07 Sep 2022 14:28:51 GMT")
-                                .append_header("Last-Modified", "Wed, 07 Sep 2022 14:27:51 GMT")
-                                .set_body_string("Hello world"),
-                        ),
+                    Mock::given(method("GET")).and(path(rendezvous_path.clone())).respond_with(
+                        ResponseTemplate::new(200).set_body_json(json!({
+                            "data": "Hello world",
+                            "sequence_token": "3"
+                        })),
+                    ),
                 )
                 .await;
 
@@ -434,39 +411,34 @@ mod test {
                 .expect("We should be able to wait and get data on the rendezvous channel.");
 
             assert_eq!(response.status_code, StatusCode::OK);
-            assert_eq!(response.body, b"Hello world");
-            assert_eq!(response.content_type, TEXT_PLAIN_CONTENT_TYPE);
+            assert_eq!(response.data, "Hello world");
         }
     }
 
     #[async_test]
     async fn test_retry_mechanism() {
         let server = MockServer::start().await;
-        let url =
+        let base_url =
             Url::parse(&server.uri()).expect("We should be able to parse the example homeserver");
-        let rendezvous_url =
-            url.join("abcdEFG12345").expect("We should be able to create a rendezvous URL");
-        mock_rendzvous_create(&server, &rendezvous_url).await;
+        let rendezvous_path = mock_rendezvous_create(&server, "abcdEFG12345")
+            .await
+            .expect("We should be able to create a rendezvous");
 
         let client = HttpClient::new(reqwest::Client::new(), RequestConfig::new().disable_retry());
 
-        let mut alice = RendezvousChannel::create_outbound(client, &url)
+        let mut alice = RendezvousChannel::create_outbound(client, &base_url)
             .await
             .expect("We should be able to create an outbound rendezvous channel");
 
         server
             .register(
                 Mock::given(method("GET"))
-                    .and(path("/abcdEFG12345"))
-                    .and(header("if-none-match", "1"))
-                    .respond_with(
-                        ResponseTemplate::new(304)
-                            .append_header("ETag", "2")
-                            .append_header("Content-Type", "text/plain")
-                            .append_header("Expires", "Wed, 07 Sep 2022 14:28:51 GMT")
-                            .append_header("Last-Modified", "Wed, 07 Sep 2022 14:27:51 GMT")
-                            .set_body_string(""),
-                    )
+                    .and(path(rendezvous_path.clone()))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "sequence_token": alice.sequence_token,
+                        "data": "old data"
+                    })))
+                    .up_to_n_times(1)
                     .expect(1),
             )
             .await;
@@ -474,16 +446,11 @@ mod test {
         server
             .register(
                 Mock::given(method("GET"))
-                    .and(path("/abcdEFG12345"))
-                    .and(header("if-none-match", "2"))
-                    .respond_with(
-                        ResponseTemplate::new(200)
-                            .append_header("ETag", "3")
-                            .append_header("Content-Type", "text/plain")
-                            .append_header("Expires", "Wed, 07 Sep 2022 14:28:51 GMT")
-                            .append_header("Last-Modified", "Wed, 07 Sep 2022 14:27:51 GMT")
-                            .set_body_string("Hello world"),
-                    )
+                    .and(path(rendezvous_path.clone()))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "sequence_token": "3",
+                        "data": "Hello world"
+                    })))
                     .expect(1),
             )
             .await;
@@ -493,7 +460,7 @@ mod test {
             .await
             .expect("We should be able to wait and get data on the rendezvous channel.");
 
-        assert_eq!(response, b"Hello world");
+        assert_eq!(response, "Hello world");
     }
 
     #[async_test]
@@ -501,9 +468,9 @@ mod test {
         let server = MockServer::start().await;
         let url =
             Url::parse(&server.uri()).expect("We should be able to parse the example homeserver");
-        let rendezvous_url =
-            url.join("abcdEFG12345").expect("We should be able to create a rendezvous URL");
-        mock_rendzvous_create(&server, &rendezvous_url).await;
+        let rendezvous_path = mock_rendezvous_create(&server, "abcdEFG12345")
+            .await
+            .expect("We should be able to create a rendezvous");
 
         let client = HttpClient::new(reqwest::Client::new(), RequestConfig::new().disable_retry());
 
@@ -515,16 +482,11 @@ mod test {
             let _scope = server
                 .register_as_scoped(
                     Mock::given(method("GET"))
-                        .and(path("/abcdEFG12345"))
-                        .and(header("if-none-match", "1"))
-                        .respond_with(
-                            ResponseTemplate::new(404)
-                                .append_header("ETag", "1")
-                                .append_header("Content-Type", "text/plain")
-                                .append_header("Expires", "Wed, 07 Sep 2022 14:28:51 GMT")
-                                .append_header("Last-Modified", "Wed, 07 Sep 2022 14:27:51 GMT")
-                                .set_body_string(""),
-                        )
+                        .and(path(rendezvous_path.clone()))
+                        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                          "errcode": "M_NOT_FOUND",
+                          "error": "No resource was found for this request.",
+                        })))
                         .expect(1),
                 )
                 .await;
@@ -536,19 +498,11 @@ mod test {
             let _scope = server
                 .register_as_scoped(
                     Mock::given(method("GET"))
-                        .and(path("/abcdEFG12345"))
-                        .and(header("if-none-match", "1"))
-                        .respond_with(
-                            ResponseTemplate::new(504)
-                                .append_header("ETag", "1")
-                                .append_header("Content-Type", "text/plain")
-                                .append_header("Expires", "Wed, 07 Sep 2022 14:28:51 GMT")
-                                .append_header("Last-Modified", "Wed, 07 Sep 2022 14:27:51 GMT")
-                                .set_body_json(json!({
-                                  "errcode": "M_NOT_FOUND",
-                                  "error": "No resource was found for this request.",
-                                })),
-                        )
+                        .and(path(rendezvous_path.clone()))
+                        .respond_with(ResponseTemplate::new(504).set_body_json(json!({
+                          "errcode": "M_NOT_FOUND",
+                          "error": "No resource was found for this request.",
+                        })))
                         .expect(1),
                 )
                 .await;
