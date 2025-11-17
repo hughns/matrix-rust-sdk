@@ -375,7 +375,7 @@ impl<'a> IntoFuture for GrantLoginWithGeneratedQrCode<'a> {
 #[cfg(all(test, not(target_family = "wasm")))]
 mod test {
     use assert_matches2::{assert_let, assert_matches};
-    use futures_util::{StreamExt, join};
+    use futures_util::StreamExt;
     use matrix_sdk_base::crypto::types::SecretsBundle;
     use matrix_sdk_common::executor::spawn;
     use matrix_sdk_test::async_test;
@@ -403,11 +403,16 @@ mod test {
         DeviceNotCreated,
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn request_login_with_scanned_qr_code(
         behaviour: BobBehaviour,
         qr_code_rx: oneshot::Receiver<QrCodeData>,
         check_code_tx: oneshot::Sender<u8>,
         server: MatrixMockServer,
+        // The rendezvous server is here because it contains MockGuards that are tied to the
+        // lifetime of the MatrixMockServer. Otherwise we might attempt to drop the
+        // MatrixMockServer before the MockGuards.
+        _rendezvous_server: MockedRendezvousServer,
         device_authorization_grant: Option<AuthorizationGrant>,
         secrets_bundle: Option<SecretsBundle>,
     ) {
@@ -529,11 +534,16 @@ mod test {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn request_login_with_generated_qr_code(
         behaviour: BobBehaviour,
         channel: SecureChannel,
         check_code_rx: oneshot::Receiver<u8>,
         server: MatrixMockServer,
+        // The rendezvous server is here because it contains MockGuards that are tied to the
+        // lifetime of the MatrixMockServer. Otherwise we might attempt to drop the
+        // MatrixMockServer before the MockGuards.
+        _rendezvous_server: MockedRendezvousServer,
         base_url: Url,
         device_authorization_grant: Option<AuthorizationGrant>,
         secrets_bundle: Option<SecretsBundle>,
@@ -790,6 +800,7 @@ mod test {
                 qr_code_rx,
                 checkcode_tx,
                 server,
+                rendezvous_server,
                 Some(device_authorization_grant),
                 Some(secrets_bundle),
             )
@@ -797,11 +808,9 @@ mod test {
         });
 
         // Wait for all tasks to finish.
-        join!(
-            async { updates_task.await.expect("Alice should run through all progress states") },
-            async { grant.await.expect("Alice should be able to grant the login") },
-            async { bob_task.await.expect("Bob's task should finish") }
-        );
+        grant.await.expect("Alice should be able to grant the login");
+        updates_task.await.expect("Alice should run through all progress states");
+        bob_task.await.expect("Bob's task should finish");
     }
 
     #[async_test]
@@ -916,6 +925,7 @@ mod test {
                 channel,
                 checkcode_rx,
                 server,
+                rendezvous_server,
                 alice.homeserver(),
                 Some(device_authorization_grant),
                 Some(secrets_bundle),
@@ -924,11 +934,9 @@ mod test {
         });
 
         // Wait for all tasks to finish.
-        join!(
-            async { updates_task.await.expect("Alice should run through all progress states") },
-            async { grant.await.expect("Alice should be able to grant the login") },
-            async { bob_task.await.expect("Bob's task should finish") }
-        );
+        grant.await.expect("Alice should be able to grant the login");
+        updates_task.await.expect("Alice should run through all progress states");
+        bob_task.await.expect("Bob's task should finish");
     }
 
     #[async_test]
@@ -1045,6 +1053,7 @@ mod test {
                 channel,
                 checkcode_rx,
                 login_server,
+                rendezvous_server,
                 alice.homeserver(),
                 Some(device_authorization_grant),
                 Some(secrets_bundle),
@@ -1053,11 +1062,9 @@ mod test {
         });
 
         // Wait for all tasks to finish.
-        join!(
-            async { updates_task.await.expect("Alice should run through all progress states") },
-            async { grant.await.expect("Alice should be able to grant the login") },
-            async { bob_task.await.expect("Bob's task should finish") }
-        );
+        grant.await.expect("Alice should be able to grant the login");
+        updates_task.await.expect("Alice should run through all progress states");
+        bob_task.await.expect("Bob's task should finish");
     }
 
     #[async_test]
@@ -1164,6 +1171,7 @@ mod test {
                 qr_code_rx,
                 checkcode_tx,
                 server,
+                rendezvous_server,
                 None,
                 None,
             )
@@ -1171,11 +1179,9 @@ mod test {
         });
 
         // Wait for all tasks to finish / fail.
-        join!(
-            async { updates_task.await.expect("Alice should run through all progress states") },
-            async { grant.await.expect_err("Alice should abort the login") },
-            async { bob_task.await.expect("Bob's task should finish") }
-        );
+        grant.await.expect_err("Alice should abort the login");
+        updates_task.await.expect("Alice should run through all progress states");
+        bob_task.await.expect("Bob's task should finish");
     }
 
     #[async_test]
@@ -1265,6 +1271,7 @@ mod test {
                 channel,
                 checkcode_rx,
                 server,
+                rendezvous_server,
                 alice.homeserver(),
                 None,
                 None,
@@ -1272,12 +1279,11 @@ mod test {
             .await;
         });
 
+        grant.await.expect_err("Alice should abort the login");
+
         // Wait for all tasks to finish / fail.
-        join!(
-            async { updates_task.await.expect("Alice should run through all progress states") },
-            async { grant.await.expect_err("Alice should abort the login") },
-            async { bob_task.await.expect("Bob's task should finish") }
-        );
+        updates_task.await.expect("Alice should run through all progress states");
+        bob_task.await.expect("Bob's task should finish");
     }
 
     #[async_test]
@@ -1392,6 +1398,7 @@ mod test {
                 qr_code_rx,
                 checkcode_tx,
                 server,
+                rendezvous_server,
                 Some(device_authorization_grant),
                 None,
             )
@@ -1399,11 +1406,9 @@ mod test {
         });
 
         // Wait for all tasks to finish.
-        join!(
-            async { updates_task.await.expect("Alice should run through all progress states") },
-            async { grant.await.expect_err("Alice should abort the login") },
-            async { bob_task.await.expect("Bob's task should finish") }
-        );
+        grant.await.expect_err("Alice should abort the login");
+        updates_task.await.expect("Alice should run through all progress states");
+        bob_task.await.expect("Bob's task should finish");
     }
 
     #[async_test]
@@ -1502,6 +1507,7 @@ mod test {
                 channel,
                 checkcode_rx,
                 server,
+                rendezvous_server,
                 alice.homeserver(),
                 Some(device_authorization_grant),
                 None,
@@ -1510,11 +1516,9 @@ mod test {
         });
 
         // Wait for all tasks to finish.
-        join!(
-            async { updates_task.await.expect("Alice should run through all progress states") },
-            async { grant.await.expect_err("Alice should abort the login") },
-            async { bob_task.await.expect("Bob's task should finish") }
-        );
+        grant.await.expect_err("Alice should abort the login");
+        updates_task.await.expect("Alice should run through all progress states");
+        bob_task.await.expect("Bob's task should finish");
     }
 
     #[async_test]
@@ -1640,18 +1644,16 @@ mod test {
                 qr_code_rx,
                 checkcode_tx,
                 server,
+                rendezvous_server,
                 Some(device_authorization_grant),
                 None,
             )
             .await;
         });
 
-        // Wait for all tasks to finish.
-        join!(
-            async { updates_task.await.expect("Alice should run through all progress states") },
-            async { grant.await.expect_err("Alice should abort the login") },
-            async { bob_task.await.expect("Bob's task should finish") }
-        );
+        grant.await.expect_err("Alice should abort the login");
+        updates_task.await.expect("Alice should run through all progress states");
+        bob_task.await.expect("Bob's task should finish");
     }
 
     #[async_test]
@@ -1759,6 +1761,7 @@ mod test {
                 channel,
                 checkcode_rx,
                 server,
+                rendezvous_server,
                 alice.homeserver(),
                 Some(device_authorization_grant),
                 None,
@@ -1766,11 +1769,8 @@ mod test {
             .await;
         });
 
-        // Wait for all tasks to finish.
-        join!(
-            async { updates_task.await.expect("Alice should run through all progress states") },
-            async { grant.await.expect_err("Alice should abort the login") },
-            async { bob_task.await.expect("Bob's task should finish") }
-        );
+        grant.await.expect_err("Alice should abort the login");
+        updates_task.await.expect("Alice should run through all progress states");
+        bob_task.await.expect("Bob's task should finish");
     }
 }
