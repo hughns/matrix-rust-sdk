@@ -87,7 +87,7 @@ async fn finish_login_grant<Q>(
 
     // We check that the device ID is still available.
     // -- MSC4108 OAuth 2.0 login step 4 continued
-    if !matches!(client.device_exists(device_id.to_base64().into()).await, Ok(false)) {
+    if !matches!(client.device_exists(device_id.to_owned().into()).await, Ok(false)) {
         channel
             .send_json(QrAuthMessage::LoginFailure {
                 reason: LoginFailureReason::DeviceAlreadyExists,
@@ -135,7 +135,7 @@ async fn finish_login_grant<Q>(
     let deadline = Instant::now() + device_creation_timeout;
 
     loop {
-        if matches!(client.device_exists(device_id.to_base64().into()).await, Ok(true)) {
+        if matches!(client.device_exists(device_id.to_owned().into()).await, Ok(true)) {
             break;
         } else {
             // If the deadline hasn't yet passed, give it some time and retry the request.
@@ -383,7 +383,6 @@ mod test {
     use ruma::{owned_device_id, owned_user_id};
     use tokio::sync::oneshot;
     use tracing::debug;
-    use vodozemac::Curve25519PublicKey;
 
     use super::*;
     use crate::{
@@ -450,10 +449,7 @@ mod test {
                     protocol: LoginProtocolType::DeviceAuthorizationGrant,
                     device_authorization_grant: device_authorization_grant
                         .expect("Bob needs the device authorization grant"),
-                    device_id: Curve25519PublicKey::from_base64(
-                        "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4",
-                    )
-                    .unwrap(),
+                    device_id: "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4".to_owned(),
                 };
                 bob.send_json(message).await.unwrap();
 
@@ -473,10 +469,7 @@ mod test {
                     protocol: LoginProtocolType::DeviceAuthorizationGrant,
                     device_authorization_grant: device_authorization_grant
                         .expect("Bob needs the device authorization grant"),
-                    device_id: Curve25519PublicKey::from_base64(
-                        "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4",
-                    )
-                    .unwrap(),
+                    device_id: "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4".to_owned(),
                 };
                 bob.send_json(message).await.unwrap();
             }
@@ -586,10 +579,7 @@ mod test {
                     protocol: LoginProtocolType::DeviceAuthorizationGrant,
                     device_authorization_grant: device_authorization_grant
                         .expect("Bob needs the device authorization grant"),
-                    device_id: Curve25519PublicKey::from_base64(
-                        "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4",
-                    )
-                    .unwrap(),
+                    device_id: "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4".to_owned(),
                 };
                 bob.send_json(message).await.unwrap();
 
@@ -609,10 +599,7 @@ mod test {
                     protocol: LoginProtocolType::DeviceAuthorizationGrant,
                     device_authorization_grant: device_authorization_grant
                         .expect("Bob needs the device authorization grant"),
-                    device_id: Curve25519PublicKey::from_base64(
-                        "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4",
-                    )
-                    .unwrap(),
+                    device_id: "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4".to_owned(),
                 };
                 bob.send_json(message).await.unwrap();
             }
