@@ -134,10 +134,6 @@ impl EstablishedSecureChannel {
         our_intent: QrCodeIntent,
     ) -> Result<Self, Error> {
         if qr_code_data.intent == our_intent {
-            println!(
-                "QR code intent {:?} matches our intent {:?}",
-                qr_code_data.intent, our_intent
-            );
             Err(Error::InvalidIntent)
         } else {
             trace!("Attempting to create a new inbound secure channel from a QR code.");
