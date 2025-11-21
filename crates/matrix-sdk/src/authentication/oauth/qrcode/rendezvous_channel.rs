@@ -186,7 +186,6 @@ impl RendezvousChannel {
 
             trace!(
                 status_code = %message.status_code,
-                data = %message.data,
                 "Received data from the rendezvous channel"
             );
             // if sequence token is the same as our current one, it means no new message and
