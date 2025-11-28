@@ -251,6 +251,11 @@ impl QrCodeData {
         Ok(Self { inner: qrcode::QrCodeData::from_bytes(&bytes)? }.into())
     }
 
+    /// Serialize the [`QrCodeData`] into a byte vector for encoding as a QR code.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.inner.to_bytes()
+    }
+
     /// The homeserver base URL contained within the scanned QR code data.
     pub fn base_url(&self) -> String {
         self.inner.base_url.to_string()
