@@ -118,6 +118,10 @@ impl AlmostEstablishedSecureChannel {
             Err(Error::InvalidCheckCode)
         }
     }
+
+    pub fn get_check_code(&self) -> u8 {
+        self.secure_channel.check_code().to_digit()
+    }
 }
 
 pub(super) struct EstablishedSecureChannel {

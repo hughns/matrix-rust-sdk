@@ -461,7 +461,7 @@ impl<'a> LoginWithGeneratedQrCode<'a> {
         // Wait for the secure channel to connect. The other device now needs to scan
         // the QR code and send us the LoginInitiateMessage which we respond to
         // with the LoginOkMessage. -- MSC4108 step 4 & 5
-        let channel = secure_channel.connect().await?;
+        let channel: crate::authentication::oauth::qrcode::secure_channel::AlmostEstablishedSecureChannel = secure_channel.connect().await?;
 
         // The other device now verifies our message, computes the checkcode and
         // displays it. We emit a progress update to let the caller prompt the
@@ -470,7 +470,7 @@ impl<'a> LoginWithGeneratedQrCode<'a> {
         trace!("Waiting for checkcode.");
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.state.set(LoginProgress::EstablishingSecureChannel(GeneratedQrProgress::QrScanned(
-            CheckCodeSender::new(tx),
+            CheckCodeSender::new(tx, channel.get_check_code()),
         )));
 
         // Retrieve the entered checkcode and verify it to confirm that the channel is
