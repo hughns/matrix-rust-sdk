@@ -251,7 +251,8 @@ impl QrCodeData {
         Ok(Self { inner: qrcode::QrCodeData::from_bytes(&bytes)? }.into())
     }
 
-    /// Serialize the [`QrCodeData`] into a byte vector for encoding as a QR code.
+    /// Serialize the [`QrCodeData`] into a byte vector for encoding as a QR
+    /// code.
     pub fn to_bytes(&self) -> Vec<u8> {
         self.inner.to_bytes()
     }
