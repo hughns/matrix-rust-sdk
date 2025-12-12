@@ -19,7 +19,7 @@ use matrix_sdk_base::sleep;
 use ruma::api::{
     EndpointError, SupportedVersions,
     client::rendezvous::{
-        create_rendezvous_session, get_rendezvous_session, update_rendezvous_session,
+        unstable_create_rendezvous_session as create_rendezvous_session, get_rendezvous_session, update_rendezvous_session,
     },
     error::{FromHttpResponseError, IntoHttpError, MatrixError},
 };
