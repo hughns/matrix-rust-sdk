@@ -352,6 +352,15 @@ impl<'a> IntoFuture for GrantLoginWithGeneratedQrCode<'a> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
+            // if MSC4388 is enabled and the server supports it, then prefer it
+            let use_msc_4388 = self.msc_4388_support
+                && self
+                    .client
+                    .unstable_features()
+                    .await
+                    .map_err(|e| QRCodeGrantLoginError::Unknown(e.to_string()))?
+                    .contains(&ruma::api::FeatureFlag::Msc4388);
+
             // Create a new ephemeral key pair and a rendezvous session to grant a
             // login with.
             // -- MSC4108 Secure channel setup steps 1 & 2
@@ -359,8 +368,7 @@ impl<'a> IntoFuture for GrantLoginWithGeneratedQrCode<'a> {
             let http_client = self.client.inner.http_client.clone();
             let secrets_bundle = export_secrets_bundle(self.client).await?;
             let channel =
-                SecureChannel::reciprocate(http_client, &homeserver_url, self.msc_4388_support)
-                    .await?;
+                SecureChannel::reciprocate(http_client, &homeserver_url, use_msc_4388).await?;
 
             // Extract the QR code data and emit an update so that the caller can
             // present the QR code for scanning by the new device.

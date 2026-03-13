@@ -457,12 +457,15 @@ impl<'a> LoginWithGeneratedQrCode<'a> {
     ) -> Result<EstablishedSecureChannel, SecureChannelError> {
         let http_client = self.client.inner.http_client.clone();
 
+        // if MSC4388 is enabled and the server supports it, then prefer it
+        let use_msc_4388 = self.msc_4388_support
+            && self.client.unstable_features().await?.contains(&ruma::api::FeatureFlag::Msc4388);
+
         // Create a new ephemeral key pair and a rendezvous session to request a login
         // with.
         // -- MSC4108 Secure channel setup steps 1 & 2
         let secure_channel =
-            SecureChannel::login(http_client, &self.client.homeserver(), self.msc_4388_support)
-                .await?;
+            SecureChannel::login(http_client, &self.client.homeserver(), use_msc_4388).await?;
 
         // Extract the QR code data and emit a progress update so that the caller can
         // present the QR code for scanning by the other device.
