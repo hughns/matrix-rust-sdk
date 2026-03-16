@@ -78,6 +78,7 @@ use ruma::{
         },
         error::ErrorKind,
         profile::{AvatarUrl, DisplayName},
+        rendezvous::discover_rendezvous,
         room::create_room::{v3::CreationContent, RoomPowerLevelsContentOverride},
         uiaa::UserIdentifier,
     },
@@ -1979,11 +1980,27 @@ impl Client {
 
     /// Checks if the server supports login using a QR code.
     pub async fn is_login_with_qr_code_supported(&self) -> Result<bool, ClientError> {
-        Ok(matches!(self.inner.auth_api(), Some(AuthApi::OAuth(_)))
-            && (self.inner.unstable_features().await?.iter().any(|feature| {
-                *feature == ruma::api::FeatureFlag::Msc4388
-                    || *feature == ruma::api::FeatureFlag::Msc4108
-            })))
+        // We need to be using OAuth 2.0 API + Device Authorization Grant available
+        // and either MSC4108 or MSC4388 available.
+
+        // We need to be using the OAuth 2.0 API
+        if !matches!(self.inner.auth_api(), Some(AuthApi::OAuth(_))) {
+            return Ok(false);
+        }
+
+        // We need the Device Authorization Grant available
+        if !self.inner.oauth().cached_server_metadata().await.is_ok_and(|metadata| {
+            metadata.grant_types_supported.includes("urn:ietf:params:oauth:grant-type:device_code")
+        }) {
+            return Ok(false);
+        }
+        // We can use MSC4388 (from MSC4108 version 2025) if available:
+        if self.inner.send(discover_rendezvous::unstable::Request::new()).await.is_ok() {
+            return Ok(true);
+        }
+
+        // Otherwise we can use MSC4108 version 2024:
+        Ok(self.inner.unstable_features().await?.contains(&ruma::api::FeatureFlag::Msc4108))
     }
 
     /// Get server vendor information from the federation API.

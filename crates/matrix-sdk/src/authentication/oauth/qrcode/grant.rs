@@ -24,7 +24,7 @@ use matrix_sdk_base::{
     },
 };
 use oauth2::VerificationUriComplete;
-use ruma::time::Instant;
+use ruma::{api::client::rendezvous::discover_rendezvous, time::Instant};
 use url::Url;
 #[cfg(doc)]
 use vodozemac::ecies::CheckCode;
@@ -354,12 +354,7 @@ impl<'a> IntoFuture for GrantLoginWithGeneratedQrCode<'a> {
         Box::pin(async move {
             // if MSC4388 is enabled and the server supports it, then prefer it
             let use_msc_4388 = self.msc_4388_support
-                && self
-                    .client
-                    .unstable_features()
-                    .await
-                    .map_err(|e| QRCodeGrantLoginError::Unknown(e.to_string()))?
-                    .contains(&ruma::api::FeatureFlag::Msc4388);
+                && self.client.send(discover_rendezvous::unstable::Request::new()).await.is_ok();
 
             // Create a new ephemeral key pair and a rendezvous session to grant a
             // login with.

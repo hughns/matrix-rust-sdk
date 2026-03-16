@@ -24,7 +24,10 @@ use matrix_sdk_base::{
 use oauth2::{DeviceCodeErrorResponseType, StandardDeviceAuthorizationResponse};
 use ruma::{
     OwnedDeviceId,
-    api::client::discovery::get_authorization_server_metadata::v1::AuthorizationServerMetadata,
+    api::client::{
+        discovery::get_authorization_server_metadata::v1::AuthorizationServerMetadata,
+        rendezvous::discover_rendezvous,
+    },
 };
 use tracing::trace;
 use vodozemac::Curve25519PublicKey;
@@ -459,7 +462,7 @@ impl<'a> LoginWithGeneratedQrCode<'a> {
 
         // if MSC4388 is enabled and the server supports it, then prefer it
         let use_msc_4388 = self.msc_4388_support
-            && self.client.unstable_features().await?.contains(&ruma::api::FeatureFlag::Msc4388);
+            && self.client.send(discover_rendezvous::unstable::Request::new()).await.is_ok();
 
         // Create a new ephemeral key pair and a rendezvous session to request a login
         // with.
