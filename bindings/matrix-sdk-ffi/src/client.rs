@@ -74,7 +74,7 @@ use ruma::{
     api::client::{
         alias::get_alias,
         discovery::get_authorization_server_metadata::v1::{
-            AccountManagementActionData, DeviceDeleteData, DeviceViewData,
+            AccountManagementActionData, DeviceDeleteData, DeviceViewData, GrantType
         },
         error::ErrorKind,
         profile::{AvatarUrl, DisplayName},
@@ -1990,7 +1990,7 @@ impl Client {
 
         // We need the Device Authorization Grant available
         if !self.inner.oauth().cached_server_metadata().await.is_ok_and(|metadata| {
-            metadata.grant_types_supported.includes("urn:ietf:params:oauth:grant-type:device_code")
+            metadata.grant_types_supported.contains(&GrantType::DeviceCode)
         }) {
             return Ok(false);
         }
