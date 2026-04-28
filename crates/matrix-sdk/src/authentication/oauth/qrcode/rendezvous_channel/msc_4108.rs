@@ -23,7 +23,7 @@ use ruma::api::{
     EndpointError,
     error::{FromHttpResponseError, HeaderDeserializationError, IntoHttpError},
 };
-use tracing::{debug, instrument, trace};
+use tracing::{debug, instrument, trace, warn};
 use url::Url;
 
 use crate::{HttpError, RumaApiError, http_client::HttpClient};
@@ -33,6 +33,44 @@ const TEXT_PLAIN_CONTENT_TYPE: &str = "text/plain";
 const POLL_TIMEOUT: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
 const POLL_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Initial backoff applied after the first transient network failure when
+/// polling the rendezvous channel.
+#[cfg(test)]
+const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(10);
+#[cfg(not(test))]
+const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Cap on the exponential backoff between retries of transient network errors
+/// while polling the rendezvous channel.
+#[cfg(test)]
+const MAX_RETRY_BACKOFF: Duration = Duration::from_millis(40);
+#[cfg(not(test))]
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Maximum number of consecutive transient network errors to tolerate while
+/// polling the rendezvous channel before giving up.
+const MAX_CONSECUTIVE_TRANSIENT_ERRORS: u32 = 10;
+
+/// Returns `true` if the given [`HttpError`] looks like a transient
+/// network-level failure (DNS resolution, TCP connect, idle timeout, etc.) that
+/// is worth retrying when long-polling the rendezvous channel.
+///
+/// This is intentionally conservative: we only retry [`HttpError::Reqwest`]
+/// errors that report themselves as connect / timeout / request errors. HTTP
+/// responses with error status codes are not retried here — they are surfaced
+/// as [`HttpError::Api`] and handled by the caller.
+fn is_transient_network_error(error: &HttpError) -> bool {
+    let HttpError::Reqwest(error) = error else {
+        return false;
+    };
+
+    // `is_connect()` covers DNS failures and TCP connect errors;
+    // `is_timeout()` covers read/connect timeouts;
+    // `is_request()` covers other low-level request building/dispatch failures
+    // such as a connection that was reset before the response arrived.
+    error.is_connect() || error.is_timeout() || error.is_request()
+}
 
 type Etag = String;
 
@@ -212,9 +250,58 @@ impl Channel {
     ///
     /// This method will wait in a loop for the channel to give us a new
     /// message.
+    ///
+    /// Transient network-level failures (DNS errors, dropped connections,
+    /// connect timeouts) are retried internally with exponential backoff. This
+    /// makes the long-poll resilient to brief network blips that are common
+    /// while the user is being sent to a system browser to complete the
+    /// consent step of QR code login (the app may be backgrounded, the device
+    /// may briefly lose connectivity, idle keep-alive connections may be
+    /// dropped, etc.). Errors are only surfaced after
+    /// `MAX_CONSECUTIVE_TRANSIENT_ERRORS` consecutive transient failures, or
+    /// immediately if the failure is not network-transient (e.g. an HTTP
+    /// error response from the rendezvous server).
     pub(super) async fn receive(&mut self) -> Result<Vec<u8>, HttpError> {
+        let mut consecutive_transient_errors: u32 = 0;
+        let mut retry_backoff = INITIAL_RETRY_BACKOFF;
+
         loop {
-            let message = self.receive_single_message().await?;
+            let message = match self.receive_single_message().await {
+                Ok(message) => {
+                    // Got a response from the server, reset the retry state.
+                    consecutive_transient_errors = 0;
+                    retry_backoff = INITIAL_RETRY_BACKOFF;
+                    message
+                }
+                Err(error) => {
+                    if !is_transient_network_error(&error) {
+                        return Err(error);
+                    }
+
+                    consecutive_transient_errors += 1;
+                    if consecutive_transient_errors > MAX_CONSECUTIVE_TRANSIENT_ERRORS {
+                        warn!(
+                            ?error,
+                            attempts = consecutive_transient_errors,
+                            "Giving up on the rendezvous channel after repeated transient \
+                             network errors"
+                        );
+                        return Err(error);
+                    }
+
+                    warn!(
+                        ?error,
+                        attempts = consecutive_transient_errors,
+                        backoff_ms = retry_backoff.as_millis() as u64,
+                        "Transient network error while polling the rendezvous channel, \
+                         retrying after backoff"
+                    );
+
+                    sleep::sleep(retry_backoff).await;
+                    retry_backoff = (retry_backoff * 2).min(MAX_RETRY_BACKOFF);
+                    continue;
+                }
+            };
 
             trace!(
                 status_code = %message.status_code,
@@ -569,5 +656,54 @@ mod test {
                 .await
                 .expect_err("We should return an error if we receive a gateway timeout");
         }
+    }
+
+    /// Builds a [`Channel`] pointed at a URL that nothing is listening on, so
+    /// every HTTP request will fail at the connect layer (which we classify as
+    /// a transient network error).
+    async fn channel_with_unreachable_endpoint() -> Channel {
+        // Bind an OS-assigned port and immediately drop the listener: the port
+        // is then very likely free, and any connection attempt will be
+        // refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Should be able to bind a TCP listener for the test");
+        let addr = listener.local_addr().expect("Should be able to get the local address");
+        drop(listener);
+
+        let rendezvous_url = Url::parse(&format!("http://{addr}/abcdEFG12345"))
+            .expect("Should be able to build a rendezvous URL");
+        let client = HttpClient::new(reqwest::Client::new(), RequestConfig::new().disable_retry());
+
+        Channel { client, rendezvous_url, etag: "1".to_owned() }
+    }
+
+    #[async_test]
+    async fn test_receive_retries_transient_network_errors() {
+        let mut alice = channel_with_unreachable_endpoint().await;
+
+        // The endpoint is unreachable; every poll should fail with a connect
+        // error, which is classified as transient. We should keep retrying up
+        // to `MAX_CONSECUTIVE_TRANSIENT_ERRORS + 1` times and then surface the
+        // error rather than looping forever.
+        let error = alice
+            .receive()
+            .await
+            .expect_err("receive() must give up after repeated transient errors");
+
+        assert!(
+            is_transient_network_error(&error),
+            "The surfaced error should be a transient network error, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_is_transient_network_error_does_not_match_api_errors() {
+        // Build a synthetic Matrix API error response (a 504 Gateway Timeout).
+        let api_error = response_to_error(StatusCode::GATEWAY_TIMEOUT, b"{}".to_vec());
+        assert!(
+            !is_transient_network_error(&api_error),
+            "HTTP-level errors must not be classified as transient network errors"
+        );
     }
 }
