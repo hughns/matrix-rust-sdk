@@ -600,21 +600,26 @@ async fn compute_latest_events(
         registered_rooms: &RegisteredRooms,
         room_id: &OwnedRoomId,
     ) -> ControlFlow<RoomLatestEventsWriteGuard, ()> {
-        let rooms = registered_rooms.rooms.read().await;
+        // Clone the handle and release the map lock BEFORE awaiting the
+        // per-room write lock. Awaiting it under the map guard is one arc of a
+        // lock cycle: a room registration can be queued on `rooms.write()`,
+        // tokio's write-preferring `RwLock` then parks every other
+        // `rooms.read()` behind that queued writer, while this task still
+        // holds its read guard and awaits a room lock owned by one of them.
+        let room_latest_events = {
+            let rooms = registered_rooms.rooms.read().await;
 
-        if let Some(room_latest_events) = rooms.get(room_id) {
-            let room_latest_events = room_latest_events.write().await;
+            match rooms.get(room_id) {
+                Some(room_latest_events) => room_latest_events.clone(),
+                None => {
+                    info!(?room_id, "Failed to find the room");
 
-            // Release the lock on `registered_rooms`. It is possible because
-            // `room_latest_events` is an owned lock guard.
-            drop(rooms);
+                    return ControlFlow::Continue(());
+                }
+            }
+        };
 
-            ControlFlow::Break(room_latest_events)
-        } else {
-            info!(?room_id, "Failed to find the room");
-
-            ControlFlow::Continue(())
-        }
+        ControlFlow::Break(room_latest_events.write().await)
     }
 
     for latest_event_queue_update in latest_event_queue_updates {
