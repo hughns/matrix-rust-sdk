@@ -167,8 +167,15 @@ impl LatestEvents {
         &self,
         room_id: &RoomId,
     ) -> Result<Option<Subscriber<LatestEventValue, AsyncLock>>, LatestEventsError> {
-        let Some(room_latest_events) = self.state.registered_rooms.for_room(room_id).await? else {
-            return Ok(None);
+        // Clone the handle out of the map guard and release it BEFORE awaiting
+        // the per-room lock (see the locking rule on `RegisteredRooms::rooms`).
+        let room_latest_events = {
+            let Some(room_latest_events) = self.state.registered_rooms.for_room(room_id).await?
+            else {
+                return Ok(None);
+            };
+
+            room_latest_events.clone()
         };
 
         let room_latest_events = room_latest_events.read().await;
@@ -199,16 +206,25 @@ impl LatestEvents {
         room_id: &RoomId,
         thread_id: &EventId,
     ) -> Result<Option<Subscriber<LatestEventValue, AsyncLock>>, LatestEventsError> {
-        let Some(room_latest_events) =
-            self.state.registered_rooms.for_thread(room_id, thread_id).await?
-        else {
-            return Ok(None);
+        // Clone the handle out of the map guard and release it BEFORE awaiting
+        // the per-room lock, as in `listen_and_subscribe_to_room`.
+        let room_latest_events = {
+            let Some(room_latest_events) =
+                self.state.registered_rooms.for_thread(room_id, thread_id).await?
+            else {
+                return Ok(None);
+            };
+
+            room_latest_events.clone()
         };
 
         let room_latest_events = room_latest_events.read().await;
-        let latest_event = room_latest_events
-            .for_thread(thread_id)
-            .expect("The `LatestEvent` for the thread must have been created");
+
+        // The thread entry was created by `for_thread` above, but a concurrent
+        // `forget_thread` may have removed it now the map guard is released.
+        let Some(latest_event) = room_latest_events.for_thread(thread_id) else {
+            return Ok(None);
+        };
 
         Ok(Some(latest_event.subscribe().await))
     }
@@ -238,6 +254,15 @@ impl LatestEvents {
 #[derive(Debug)]
 struct RegisteredRooms {
     /// All the registered [`RoomLatestEvents`].
+    ///
+    /// Locking rule: never await a per-room lock while holding this map's
+    /// guard. The compute task holds a room's write lock while it works, a
+    /// room registration can be queued on `rooms.write()`, and tokio's
+    /// write-preferring `RwLock` then parks every other `rooms.read()` behind
+    /// that queued writer: a map guard held across a per-room await closes
+    /// the cycle, and the sync response handler (which registers rooms) wedges
+    /// with it. Clone the cheap [`RoomLatestEvents`] handle out of the guard,
+    /// drop the guard, then await the room.
     rooms: RwLock<HashMap<OwnedRoomId, RoomLatestEvents>>,
 
     /// The (weak) client.
@@ -313,31 +338,40 @@ impl RegisteredRooms {
             // We need to take a write lock immediately, in case the thead
             // latest event doesn't exist.
             Some(thread_id) => {
-                let mut rooms = self.rooms.write().await;
+                // Snapshot the handle and release the map lock BEFORE awaiting the
+                // per-room write lock (see the locking rule on `RegisteredRooms::rooms`;
+                // this site wedged the sync loop when a room whose latest event is a
+                // threaded reply was opened twice in a row).
+                let room_latest_events = {
+                    let mut rooms = self.rooms.write().await;
 
-                // The `RoomLatestEvents` doesn't exist. Let's create and insert
-                // it.
-                if rooms.contains_key(room_id).not() {
-                    create_and_insert_room_latest_events(
-                        room_id,
-                        rooms.deref_mut(),
-                        &self.weak_client,
-                        &self.event_cache,
-                        &self.latest_event_queue_sender,
-                    );
-                }
+                    // The `RoomLatestEvents` doesn't exist. Let's create and insert it.
+                    if rooms.contains_key(room_id).not() {
+                        create_and_insert_room_latest_events(
+                            room_id,
+                            rooms.deref_mut(),
+                            &self.weak_client,
+                            &self.event_cache,
+                            &self.latest_event_queue_sender,
+                        );
+                    }
 
-                if let Some(room_latest_event) = rooms.get(room_id) {
-                    let mut room_latest_event = room_latest_event.write().await;
+                    rooms.get(room_id).cloned()
+                };
 
-                    // In `RoomLatestEvents`, the `LatestEvent` for this thread
-                    // doesn't exist. Let's create and insert it.
-                    if room_latest_event.has_thread(thread_id).not() {
-                        room_latest_event.create_and_insert_latest_event_for_thread(thread_id);
+                if let Some(room_latest_events) = room_latest_events {
+                    let mut room_latest_events = room_latest_events.write().await;
+
+                    // In `RoomLatestEvents`, the `LatestEvent` for this thread doesn't exist. Let's
+                    // create and insert it.
+                    if room_latest_events.has_thread(thread_id).not() {
+                        room_latest_events.create_and_insert_latest_event_for_thread(thread_id);
                     }
                 }
 
-                RwLockWriteGuard::try_downgrade_map(rooms, |rooms| rooms.get(room_id)).ok()
+                // Re-acquire a read guard to return. The entry may have been forgotten
+                // concurrently; `None` is correct in that case.
+                RwLockReadGuard::try_map(self.rooms.read().await, |rooms| rooms.get(room_id)).ok()
             }
 
             // Get the room latest event with the aim of fetching the latest
@@ -416,16 +450,14 @@ impl RegisteredRooms {
     /// If [`LatestEvents`] is not listening for `room_id` or `thread_id`,
     /// nothing happens.
     pub async fn forget_thread(&self, room_id: &RoomId, thread_id: &EventId) {
-        let rooms = self.rooms.read().await;
+        // Snapshot the handle and release the map lock BEFORE awaiting the
+        // per-room write lock; the previous `drop(rooms)` came after the await
+        // (see the locking rule on `RegisteredRooms::rooms`).
+        let room_latest_events = self.rooms.read().await.get(room_id).cloned();
 
-        // If the `RoomLatestEvents`, remove the `LatestEvent` in `per_thread`.
-        if let Some(room_latest_event) = rooms.get(room_id) {
-            let mut room_latest_event = room_latest_event.write().await;
-
-            // Release the lock on `self.rooms`.
-            drop(rooms);
-
-            room_latest_event.forget_thread(thread_id);
+        // If the `RoomLatestEvents` exists, remove the `LatestEvent` in `per_thread`.
+        if let Some(room_latest_events) = room_latest_events {
+            room_latest_events.write().await.forget_thread(thread_id);
         }
     }
 }
@@ -601,11 +633,7 @@ async fn compute_latest_events(
         room_id: &OwnedRoomId,
     ) -> ControlFlow<RoomLatestEventsWriteGuard, ()> {
         // Clone the handle and release the map lock BEFORE awaiting the
-        // per-room write lock. Awaiting it under the map guard is one arc of a
-        // lock cycle: a room registration can be queued on `rooms.write()`,
-        // tokio's write-preferring `RwLock` then parks every other
-        // `rooms.read()` behind that queued writer, while this task still
-        // holds its read guard and awaits a room lock owned by one of them.
+        // per-room write lock (see the locking rule on `RegisteredRooms::rooms`).
         let room_latest_events = {
             let rooms = registered_rooms.rooms.read().await;
 
