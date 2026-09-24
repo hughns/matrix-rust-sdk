@@ -19,12 +19,15 @@ use matrix_sdk_base::{
     crypto::types::qr_login::{LimitedString, LimitedUrl, RendezvousId},
     sleep,
 };
-use ruma::api::{
-    EndpointError as _, SupportedVersions,
-    client::rendezvous::{
-        create_rendezvous_session, get_rendezvous_session, update_rendezvous_session,
+use ruma::{
+    TransactionId,
+    api::{
+        EndpointError as _, SupportedVersions,
+        client::rendezvous::{
+            create_rendezvous_session, get_rendezvous_session, update_rendezvous_session,
+        },
+        error::{FromHttpResponseError, IntoHttpError},
     },
-    error::{FromHttpResponseError, IntoHttpError},
 };
 use tracing::{debug, instrument, trace};
 use url::Url;
@@ -167,6 +170,7 @@ impl Channel {
     pub(super) async fn send(&mut self, message: String) -> Result<(), SecureChannelError> {
         let request = update_rendezvous_session::unstable::Request::new(
             self.rendezvous_id.to_string(),
+            TransactionId::new(),
             self.sequence_token.to_string(),
             message,
         );
@@ -286,7 +290,7 @@ mod test {
     use similar_asserts::assert_eq;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{method, path, path_regex},
     };
 
     use super::*;
@@ -415,12 +419,13 @@ mod test {
         {
             let _scope = server
                 .register_as_scoped(
-                    Mock::given(method("PUT")).and(path(rendezvous_path.clone())).respond_with(
-                        ResponseTemplate::new(200).set_body_json(json!({
+                    Mock::given(method("PUT"))
+                        .and(path_regex(format!("^{rendezvous_path}/[^/]+$")))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                             "sequence_token": "3",
                             "expires_in_ms": 10_000,
-                        })),
-                    ),
+                        })))
+                        .expect(1),
                 )
                 .await;
 

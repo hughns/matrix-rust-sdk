@@ -400,6 +400,7 @@ impl EstablishedSecureChannel {
 #[cfg(all(test, not(target_family = "wasm")))]
 pub(super) mod test {
     use std::{
+        collections::HashMap,
         sync::{
             Arc, Mutex,
             atomic::{AtomicU8, Ordering},
@@ -418,7 +419,7 @@ pub(super) mod test {
     use url::Url;
     use wiremock::{
         Mock, MockGuard, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{method, path, path_regex},
     };
 
     use super::{EstablishedSecureChannel, SecureChannel};
@@ -588,6 +589,9 @@ pub(super) mod test {
             let content: Arc<Mutex<Option<String>>> = Mutex::default().into();
             let created: Arc<Mutex<Option<Instant>>> = Mutex::default().into();
             let sequence_token = Arc::new(AtomicU8::new(0));
+            // The sequence tokens we returned for each transaction ID, used to replay the
+            // response if a transaction ID is reused.
+            let transactions: Arc<Mutex<HashMap<String, String>>> = Mutex::default().into();
 
             let homeserver_url = Url::parse(&server.uri())
                 .expect("We should be able to parse the example homeserver");
@@ -627,14 +631,14 @@ pub(super) mod test {
             let put_guard = server
                 .register_as_scoped(
                     Mock::given(method("PUT"))
-                        .and(path(format!(
-                            "/_matrix/client/unstable/io.element.msc4388/rendezvous/{RENDEZVOUS_ID}"
+                        .and(path_regex(format!(
+                            "^/_matrix/client/unstable/io.element.msc4388/rendezvous/{RENDEZVOUS_ID}/[^/]+$"
                         )))
                         .respond_with({
                             let content = content.clone();
                             let created = created.clone();
                             let sequence_token = sequence_token.clone();
-
+                            let transactions = transactions.clone();
 
                             move |request: &wiremock::Request| {
                                 // Fail the request if the session has expired.
@@ -645,17 +649,36 @@ pub(super) mod test {
                                     }));
                                 }
 
+                                let txn_id = request
+                                    .url
+                                    .path_segments()
+                                    .and_then(|mut segments| segments.next_back())
+                                    .unwrap()
+                                    .to_owned();
+
+                                let mut transactions = transactions.lock().unwrap();
+
+                                // Replay the recorded response if we have already seen this
+                                // transaction ID.
+                                if let Some(recorded_token) = transactions.get(&txn_id) {
+                                    trace!("Replaying the response for transaction ID {txn_id}");
+
+                                    return ResponseTemplate::new(200).set_body_json(json!({
+                                        "sequence_token": recorded_token,
+                                    }));
+                                }
+
                                 let request_content: PutContent = request.body_json().unwrap();
                                 *content.lock().unwrap() = Some(request_content.data);
 
-                                let prev_token =
-                                    sequence_token.fetch_add(1, Ordering::SeqCst);
+                                let new_token =
+                                    (sequence_token.fetch_add(1, Ordering::SeqCst) + 1).to_string();
+                                transactions.insert(txn_id, new_token.clone());
 
                                 trace!("Putting new content into the rendezvous channel ID: {RENDEZVOUS_ID}");
 
                                 ResponseTemplate::new(200).set_body_json(json!({
-                                    "sequence_token": (prev_token + 1 ).to_string(),
-
+                                    "sequence_token": new_token,
                                 }))
                             }
                         }),
