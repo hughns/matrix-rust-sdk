@@ -85,18 +85,26 @@ async fn finish_login_grant<Q>(
         }
     };
 
-    // We verify the selected protocol.
+    // We verify the selected protocol, the device authorization grant is the
+    // only one we offer and it needs to come with the grant data.
     //
     // -- MSC4108 OAuth 2.0 login step 4
-    if protocol != LoginProtocolType::DeviceAuthorizationGrant {
-        channel
-            .send_json(QrAuthMessage::LoginFailure {
-                reason: LoginFailureReason::UnsupportedProtocol,
-                homeserver: None,
-            })
-            .await?;
-        return Err(QRCodeGrantLoginError::UnsupportedProtocol(protocol));
-    }
+    let device_authorization_grant = match device_authorization_grant {
+        Some(device_authorization_grant)
+            if protocol == LoginProtocolType::DeviceAuthorizationGrant =>
+        {
+            device_authorization_grant
+        }
+        _ => {
+            channel
+                .send_json(QrAuthMessage::LoginFailure {
+                    reason: LoginFailureReason::UnsupportedProtocol,
+                    homeserver: None,
+                })
+                .await?;
+            return Err(QRCodeGrantLoginError::UnsupportedProtocol(protocol));
+        }
+    };
 
     // We check that the device ID is still available.
     //
@@ -620,8 +628,10 @@ mod test {
                 // Now send the LoginProtocol message.
                 let message = QrAuthMessage::LoginProtocol {
                     protocol: LoginProtocolType::DeviceAuthorizationGrant,
-                    device_authorization_grant: device_authorization_grant
-                        .expect("Bob needs the device authorization grant"),
+                    device_authorization_grant: Some(
+                        device_authorization_grant
+                            .expect("Bob needs the device authorization grant"),
+                    ),
                     device_id: "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4".to_owned(),
                 };
                 bob.send_json(message).await.unwrap();
@@ -637,14 +647,17 @@ mod test {
                 return; // Exit.
             }
             BobBehaviour::UnsupportedProtocol => {
-                // Request a protocol that Alice did not offer.
-                let message = QrAuthMessage::LoginProtocol {
-                    protocol: LoginProtocolType::from("m.unknown_protocol"),
-                    device_authorization_grant: device_authorization_grant
-                        .expect("Bob needs the device authorization grant"),
-                    device_id: "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4".to_owned(),
-                };
-                bob.send_json(message).await.unwrap();
+                // Request a protocol that Alice did not offer. As the MSC
+                // describes for future protocols, its data is in a field named
+                // after it and there is no device authorization grant.
+                bob.send_json(serde_json::json!({
+                    "type": "m.login.protocol",
+                    "protocol": "m.unknown_protocol",
+                    "m.unknown_protocol": {},
+                    "device_id": "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4",
+                }))
+                .await
+                .unwrap();
 
                 // Alice should reject the protocol.
                 let message = bob
@@ -660,8 +673,10 @@ mod test {
                 // Send the LoginProtocol message.
                 let message = QrAuthMessage::LoginProtocol {
                     protocol: LoginProtocolType::DeviceAuthorizationGrant,
-                    device_authorization_grant: device_authorization_grant
-                        .expect("Bob needs the device authorization grant"),
+                    device_authorization_grant: Some(
+                        device_authorization_grant
+                            .expect("Bob needs the device authorization grant"),
+                    ),
                     device_id: "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4".to_owned(),
                 };
                 bob.send_json(message).await.unwrap();
@@ -681,8 +696,10 @@ mod test {
                 // Send the LoginProtocol message.
                 let message = QrAuthMessage::LoginProtocol {
                     protocol: LoginProtocolType::DeviceAuthorizationGrant,
-                    device_authorization_grant: device_authorization_grant
-                        .expect("Bob needs the device authorization grant"),
+                    device_authorization_grant: Some(
+                        device_authorization_grant
+                            .expect("Bob needs the device authorization grant"),
+                    ),
                     device_id: "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4".to_owned(),
                 };
                 bob.send_json(message).await.unwrap();
@@ -862,8 +879,10 @@ mod test {
                 // Now send the LoginProtocol message.
                 let message = QrAuthMessage::LoginProtocol {
                     protocol: LoginProtocolType::DeviceAuthorizationGrant,
-                    device_authorization_grant: device_authorization_grant
-                        .expect("Bob needs the device authorization grant"),
+                    device_authorization_grant: Some(
+                        device_authorization_grant
+                            .expect("Bob needs the device authorization grant"),
+                    ),
                     device_id: "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4".to_owned(),
                 };
                 bob.send_json(message).await.unwrap();
@@ -882,8 +901,10 @@ mod test {
                 // Send the LoginProtocol message.
                 let message = QrAuthMessage::LoginProtocol {
                     protocol: LoginProtocolType::DeviceAuthorizationGrant,
-                    device_authorization_grant: device_authorization_grant
-                        .expect("Bob needs the device authorization grant"),
+                    device_authorization_grant: Some(
+                        device_authorization_grant
+                            .expect("Bob needs the device authorization grant"),
+                    ),
                     device_id: "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4".to_owned(),
                 };
                 bob.send_json(message).await.unwrap();
@@ -903,8 +924,10 @@ mod test {
                 // Send the LoginProtocol message.
                 let message = QrAuthMessage::LoginProtocol {
                     protocol: LoginProtocolType::DeviceAuthorizationGrant,
-                    device_authorization_grant: device_authorization_grant
-                        .expect("Bob needs the device authorization grant"),
+                    device_authorization_grant: Some(
+                        device_authorization_grant
+                            .expect("Bob needs the device authorization grant"),
+                    ),
                     device_id: "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4".to_owned(),
                 };
                 bob.send_json(message).await.unwrap();
