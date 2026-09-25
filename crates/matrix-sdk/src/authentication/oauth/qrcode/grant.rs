@@ -458,13 +458,21 @@ impl IntoFuture for GrantLoginWithGeneratedQrCode {
             // -- MSC4108 Secure channel setup step 7
             let mut channel = channel.confirm(check_code)?;
 
-            // Since the QR code was generated on this existing device, the new
-            // device can derive the homeserver to use for logging in from the
-            // QR code and we don't need to send the m.login.protocols
-            // message.
+            // Inform the other device about the available login protocols and
+            // the homeserver to use. The MSC requires this message to always be
+            // sent first, but we only do so for the MSC4388 variant: with the
+            // MSC4108 variant the new device derives the homeserver from the
+            // QR code and doesn't expect this message, so we skip it to stay
+            // compatible with existing implementations.
             //
             // -- MSC4108 OAuth 2.0 login step 1
-            // TODO: for MSC4388 always send `m.login.protocols`
+            if !matches!(channel.channel_variant(), ChannelVariant::Msc4108) {
+                let message = QrAuthMessage::LoginProtocols(LoginProtocolsMessage::Msc4388 {
+                    protocols: vec![LoginProtocolType::DeviceAuthorizationGrant],
+                    base_url: self.client.homeserver(),
+                });
+                channel.send_json(message).await?;
+            }
 
             // Proceed with granting the login.
             //
@@ -552,6 +560,26 @@ mod test {
 
         // Let Alice know about the checkcode so she can verify the channel.
         check_code_tx.send(bob.check_code()).expect("Bob should be able to send the checkcode");
+
+        // With MSC4388, Alice informs us about the available login protocols
+        // even though we already know the homeserver from the QR code.
+        if let QrCodeIntentData::Msc4388 { base_url: qr_base_url, .. } = qr_code_data.intent_data()
+        {
+            let message = bob
+                .receive_json()
+                .await
+                .expect("Bob should receive the LoginProtocols message from Alice");
+
+            assert_let!(
+                QrAuthMessage::LoginProtocols(LoginProtocolsMessage::Msc4388 {
+                    protocols,
+                    base_url,
+                }) = message
+            );
+
+            assert_eq!(protocols, vec![LoginProtocolType::DeviceAuthorizationGrant]);
+            assert_eq!(&base_url, qr_base_url.as_url());
+        }
 
         match behaviour {
             BobBehaviour::UnexpectedMessageInsteadOfLoginProtocol => {
@@ -1931,12 +1959,13 @@ mod test {
     /// the error Alice aborts the login with.
     async fn grant_login_with_generated_qr_code_rejected_protocol(
         behaviour: BobBehaviour,
+        msc_4388: bool,
     ) -> QRCodeGrantLoginError {
         let server = MatrixMockServer::new().await;
         // Shared with Bob's task, so the rendezvous session outlives it and
         // Alice can still read Bob's last message.
         let rendezvous_server = Arc::new(
-            MockedRendezvousServer::new(server.server(), "abcdEFG12345", Duration::MAX, false)
+            MockedRendezvousServer::new(server.server(), "abcdEFG12345", Duration::MAX, msc_4388)
                 .await,
         );
         debug!("Set up rendezvous server mock at {}", rendezvous_server.rendezvous_url);
@@ -1983,10 +2012,16 @@ mod test {
 
         // Prepare the login granting future.
         let oauth = alice.oauth();
-        let grant = oauth
+        #[allow(unused_mut)]
+        let mut grant = oauth
             .grant_login_with_qr_code()
             .device_creation_timeout(Duration::from_secs(2))
             .generate();
+
+        #[cfg(feature = "unstable-msc4388")]
+        if msc_4388 {
+            grant.with_msc4388_support();
+        }
 
         let (qr_code_tx, qr_code_rx) = oneshot::channel();
         let (checkcode_tx, checkcode_rx) = oneshot::channel();
@@ -2065,11 +2100,12 @@ mod test {
         error
     }
 
-    #[async_test]
-    async fn test_grant_login_with_generated_qr_code_unsupported_protocol() {
-        let error =
-            grant_login_with_generated_qr_code_rejected_protocol(BobBehaviour::UnsupportedProtocol)
-                .await;
+    async fn test_grant_login_with_generated_qr_code_unsupported_protocol(msc_4388: bool) {
+        let error = grant_login_with_generated_qr_code_rejected_protocol(
+            BobBehaviour::UnsupportedProtocol,
+            msc_4388,
+        )
+        .await;
         assert_let!(
             QRCodeGrantLoginError::UnsupportedProtocol(protocol) = error,
             "Alice should abort the login with expected error variant"
@@ -2078,9 +2114,21 @@ mod test {
     }
 
     #[async_test]
+    async fn test_grant_login_with_generated_qr_code_unsupported_protocol_msc_4108() {
+        test_grant_login_with_generated_qr_code_unsupported_protocol(false).await;
+    }
+
+    #[async_test]
+    #[cfg(feature = "unstable-msc4388")]
+    async fn test_grant_login_with_generated_qr_code_unsupported_protocol_msc_4388() {
+        test_grant_login_with_generated_qr_code_unsupported_protocol(true).await;
+    }
+
+    #[async_test]
     async fn test_grant_login_with_generated_qr_code_unsupported_protocol_with_grant() {
         let error = grant_login_with_generated_qr_code_rejected_protocol(
             BobBehaviour::UnsupportedProtocolWithDeviceAuthorizationGrant,
+            false,
         )
         .await;
         assert_let!(
@@ -2094,6 +2142,7 @@ mod test {
     async fn test_grant_login_with_generated_qr_code_missing_device_authorization_grant() {
         let error = grant_login_with_generated_qr_code_rejected_protocol(
             BobBehaviour::MissingDeviceAuthorizationGrant,
+            false,
         )
         .await;
         assert_matches!(
