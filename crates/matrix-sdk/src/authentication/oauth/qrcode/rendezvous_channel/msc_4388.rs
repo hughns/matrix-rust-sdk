@@ -98,9 +98,13 @@ impl Channel {
     /// By outbound we mean that we're going to tell the Matrix server to create
     /// a new rendezvous session. We're going to send an initial empty message
     /// through the channel.
+    ///
+    /// The `access_token` should be provided if we have one, since servers
+    /// may require an authenticated user to create a rendezvous session.
     pub(super) async fn create_outbound(
         client: HttpClient,
         base_url: &LimitedUrl,
+        access_token: Option<&str>,
     ) -> Result<Self, SecureChannelError> {
         use std::borrow::Cow;
 
@@ -112,7 +116,7 @@ impl Channel {
                 request,
                 None,
                 base_url.to_string(),
-                None, // TODO: should also support passing in access token
+                access_token,
                 Cow::Owned(SupportedVersions {
                     versions: Default::default(),
                     features: Default::default(),
@@ -290,7 +294,7 @@ mod test {
     use similar_asserts::assert_eq;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path, path_regex},
+        matchers::{header, method, path, path_regex},
     };
 
     use super::*;
@@ -330,7 +334,7 @@ mod test {
 
         let client = HttpClient::new(reqwest::Client::new(), RequestConfig::new().disable_retry());
 
-        let mut alice = Channel::create_outbound(client, &base_url)
+        let mut alice = Channel::create_outbound(client, &base_url, None)
             .await
             .expect("We should be able to create an outbound rendezvous channel");
 
@@ -458,6 +462,38 @@ mod test {
     }
 
     #[async_test]
+    async fn test_creation_with_access_token() {
+        let server = MockServer::start().await;
+        let base_url = LimitedUrl::new(
+            Url::parse(&server.uri()).expect("We should be able to parse the example homeserver"),
+        )
+        .unwrap();
+
+        // The server only lets authenticated users create a rendezvous session.
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path(BASE_PATH))
+                    .and(header("authorization", "Bearer ALICE_TOKEN"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "abcdEFG12345",
+                        "sequence_token": "1",
+                        "expires_in_ms": 10_000,
+                    })))
+                    .expect(1),
+            )
+            .await;
+
+        let client = HttpClient::new(reqwest::Client::new(), RequestConfig::new().disable_retry());
+
+        let alice = Channel::create_outbound(client, &base_url, Some("ALICE_TOKEN"))
+            .await
+            .expect("We should be able to create a rendezvous session with an access token");
+
+        assert_eq!(alice.rendezvous_id().as_str(), "abcdEFG12345");
+    }
+
+    #[async_test]
     async fn test_retry_mechanism() {
         let server = MockServer::start().await;
         let rendezvous_id = RendezvousId::new("abcdEFG12345".to_owned()).unwrap();
@@ -471,7 +507,7 @@ mod test {
 
         let client = HttpClient::new(reqwest::Client::new(), RequestConfig::new().disable_retry());
 
-        let mut alice = Channel::create_outbound(client, &base_url)
+        let mut alice = Channel::create_outbound(client, &base_url, None)
             .await
             .expect("We should be able to create an outbound rendezvous channel");
 
@@ -524,7 +560,7 @@ mod test {
 
         let client = HttpClient::new(reqwest::Client::new(), RequestConfig::new().disable_retry());
 
-        let mut alice = Channel::create_outbound(client, &url)
+        let mut alice = Channel::create_outbound(client, &url, None)
             .await
             .expect("We should be able to create an outbound rendezvous channel");
 

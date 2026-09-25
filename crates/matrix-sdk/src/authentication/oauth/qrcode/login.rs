@@ -560,8 +560,13 @@ impl<'a> LoginWithGeneratedQrCode<'a> {
         // login with.
         //
         // -- MSC4108 Secure channel setup steps 1 & 2
-        let secure_channel =
-            SecureChannel::login(http_client, &client.homeserver(), use_msc_4388).await?;
+        let secure_channel = SecureChannel::login(
+            http_client,
+            &client.homeserver(),
+            client.access_token().as_deref(),
+            use_msc_4388,
+        )
+        .await?;
 
         // Extract the QR code data and emit a progress update so that the
         // caller can present the QR code for scanning by the other device.
@@ -760,9 +765,10 @@ mod test {
         server.mock_query_keys().ok().expect(1).named("query_keys").mount().await;
 
         let client = HttpClient::new(reqwest::Client::new(), Default::default());
-        let alice = SecureChannel::reciprocate(client, &rendezvous_server.homeserver_url, msc_4388)
-            .await
-            .expect("Alice should be able to create a secure channel.");
+        let alice =
+            SecureChannel::reciprocate(client, &rendezvous_server.homeserver_url, None, msc_4388)
+                .await
+                .expect("Alice should be able to create a secure channel.");
 
         assert_eq!(alice.qr_code_data().intent(), QrCodeIntent::Reciprocate);
 
@@ -889,9 +895,10 @@ mod test {
 
         // Alice creates the rendezvous session on the initial server.
         let client = HttpClient::new(reqwest::Client::new(), Default::default());
-        let alice = SecureChannel::reciprocate(client, &rendezvous_server.homeserver_url, true)
-            .await
-            .expect("Alice should be able to create a secure channel.");
+        let alice =
+            SecureChannel::reciprocate(client, &rendezvous_server.homeserver_url, None, true)
+                .await
+                .expect("Alice should be able to create a secure channel.");
 
         assert_let!(
             QrCodeIntentData::Msc4388 { base_url, .. } = &alice.qr_code_data().intent_data()
@@ -1106,7 +1113,7 @@ mod test {
             .expect("Should be able to create a client for Bob");
 
         let secure_channel =
-            SecureChannel::login(bob.inner.http_client.clone(), &homeserver_url, msc_4388)
+            SecureChannel::login(bob.inner.http_client.clone(), &homeserver_url, None, msc_4388)
                 .await
                 .expect("Bob should be able to create a secure channel");
 
@@ -1184,6 +1191,10 @@ mod test {
             bob.encryption().get_user_identity(bob.user_id().unwrap()).await.unwrap().unwrap();
 
         assert!(own_identity.is_verified());
+
+        // Bob wasn't logged in when he created the rendezvous session, so he
+        // had no access token to send.
+        assert!(rendezvous_server.create_access_token.lock().unwrap().is_none());
     }
 
     #[async_test]
@@ -1255,6 +1266,7 @@ mod test {
         let secure_channel = SecureChannel::login(
             bob.inner.http_client.clone(),
             &rendezvous_homeserver_url,
+            None,
             msc_4388,
         )
         .await
@@ -1412,9 +1424,10 @@ mod test {
         server.mock_who_am_i().ok().named("whoami").mount().await;
 
         let client = HttpClient::new(reqwest::Client::new(), Default::default());
-        let alice = SecureChannel::reciprocate(client, &rendezvous_server.homeserver_url, msc_4388)
-            .await
-            .expect("Alice should be able to create a secure channel.");
+        let alice =
+            SecureChannel::reciprocate(client, &rendezvous_server.homeserver_url, None, msc_4388)
+                .await
+                .expect("Alice should be able to create a secure channel.");
 
         assert_eq!(alice.qr_code_data().intent(), QrCodeIntent::Reciprocate);
 
@@ -1562,7 +1575,7 @@ mod test {
             .expect("Should be able to create a client for Bob");
 
         let secure_channel =
-            SecureChannel::login(bob.inner.http_client.clone(), &homeserver_url, msc_4388)
+            SecureChannel::login(bob.inner.http_client.clone(), &homeserver_url, None, msc_4388)
                 .await
                 .expect("Bob should be able to create a secure channel");
 
@@ -2003,9 +2016,10 @@ mod test {
         server.mock_who_am_i().ok().named("whoami").mount().await;
 
         let client = HttpClient::new(reqwest::Client::new(), Default::default());
-        let alice = SecureChannel::reciprocate(client, &rendezvous_server.homeserver_url, false)
-            .await
-            .expect("Alice should be able to create a secure channel.");
+        let alice =
+            SecureChannel::reciprocate(client, &rendezvous_server.homeserver_url, None, false)
+                .await
+                .expect("Alice should be able to create a secure channel.");
 
         assert_let!(
             QrCodeIntentData::Msc4108 {

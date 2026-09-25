@@ -62,16 +62,23 @@ impl RendezvousChannel {
     /// By outbound we mean that we're going to tell the Matrix server to create
     /// a new rendezvous session. We're going to send an initial empty message
     /// through the channel.
+    ///
+    /// The `access_token` is only used by the MSC4388 variant, the MSC4108
+    /// rendezvous API doesn't take one.
     pub(super) async fn create_outbound(
         client: HttpClient,
         rendezvous_server: &Url,
+        #[allow(unused_variables)] access_token: Option<&str>,
         #[allow(unused_variables)] msc_4388: bool,
     ) -> Result<Self, SecureChannelError> {
         #[cfg(feature = "unstable-msc4388")]
         if msc_4388 {
             let rendezvous_server = LimitedUrl::new(rendezvous_server.clone())
                 .ok_or(MessageDecodeError::TooLongBaseUrl)?;
-            Ok(Self::Msc4388(msc_4388::Channel::create_outbound(client, &rendezvous_server).await?))
+            Ok(Self::Msc4388(
+                msc_4388::Channel::create_outbound(client, &rendezvous_server, access_token)
+                    .await?,
+            ))
         } else {
             Ok(Self::Msc4108(msc_4108::Channel::create_outbound(client, rendezvous_server).await?))
         }

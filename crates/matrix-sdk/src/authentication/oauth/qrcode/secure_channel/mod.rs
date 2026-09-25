@@ -48,13 +48,18 @@ pub(super) struct SecureChannel {
 
 impl SecureChannel {
     /// Create a new secure channel to request a login with.
+    ///
+    /// The `access_token` should be provided if we have one, since servers
+    /// may require it to create a rendezvous session.
     pub(super) async fn login(
         http_client: HttpClient,
         homeserver_url: &Url,
+        access_token: Option<&str>,
         msc_4388: bool,
     ) -> Result<Self, Error> {
         let channel =
-            RendezvousChannel::create_outbound(http_client, homeserver_url, msc_4388).await?;
+            RendezvousChannel::create_outbound(http_client, homeserver_url, access_token, msc_4388)
+                .await?;
 
         let (crypto_channel, qr_code_data) = match channel.rendezvous_info() {
             RendezvousInfo::Msc4108 { rendezvous_url } => {
@@ -89,12 +94,17 @@ impl SecureChannel {
     }
 
     /// Create a new secure channel to reciprocate an existing login with.
+    ///
+    /// The `access_token` should be provided if we have one, since servers
+    /// may require it to create a rendezvous session.
     pub(super) async fn reciprocate(
         http_client: HttpClient,
         homeserver_url: &Url,
+        access_token: Option<&str>,
         msc_4388: bool,
     ) -> Result<Self, Error> {
-        let mut channel = SecureChannel::login(http_client, homeserver_url, msc_4388).await?;
+        let mut channel =
+            SecureChannel::login(http_client, homeserver_url, access_token, msc_4388).await?;
 
         match channel.channel.rendezvous_info() {
             RendezvousInfo::Msc4108 { rendezvous_url } => {
@@ -437,6 +447,9 @@ pub(super) mod test {
         put_guard: MockGuard,
         get_guard: MockGuard,
         discover_guard: Option<MockGuard>,
+        /// The access token the rendezvous session was created with, only
+        /// recorded for MSC4388.
+        pub create_access_token: Arc<Mutex<Option<String>>>,
     }
 
     impl MockedRendezvousServer {
@@ -573,6 +586,7 @@ pub(super) mod test {
                 homeserver_url,
                 rendezvous_url,
                 discover_guard: None,
+                create_access_token: Default::default(),
             }
         }
 
@@ -588,6 +602,7 @@ pub(super) mod test {
 
             let content: Arc<Mutex<Option<String>>> = Mutex::default().into();
             let created: Arc<Mutex<Option<Instant>>> = Mutex::default().into();
+            let create_access_token: Arc<Mutex<Option<String>>> = Mutex::default().into();
             let sequence_token = Arc::new(AtomicU8::new(0));
             // The sequence tokens we returned for each transaction ID, used to replay the
             // response if a transaction ID is reused.
@@ -609,11 +624,22 @@ pub(super) mod test {
 
                             trace!("Creating a new rendezvous channel ID: {RENDEZVOUS_ID}");
 
-                            ResponseTemplate::new(200).set_body_json(json!({
-                                "id": RENDEZVOUS_ID,
-                                "sequence_token": "0",
-                                "expires_in_ms": 100_000,
-                            }))
+                            let create_access_token = create_access_token.clone();
+
+                            move |request: &wiremock::Request| {
+                                *create_access_token.lock().unwrap() = request
+                                    .headers
+                                    .get("authorization")
+                                    .and_then(|value| value.to_str().ok())
+                                    .and_then(|value| value.strip_prefix("Bearer "))
+                                    .map(ToOwned::to_owned);
+
+                                ResponseTemplate::new(200).set_body_json(json!({
+                                    "id": RENDEZVOUS_ID,
+                                    "sequence_token": "0",
+                                    "expires_in_ms": 100_000,
+                                }))
+                            }
                         }),
                 )
                 .await;
@@ -731,6 +757,7 @@ pub(super) mod test {
                 homeserver_url,
                 rendezvous_url,
                 discover_guard: Some(discover_guard),
+                create_access_token,
             }
         }
     }
@@ -741,9 +768,10 @@ pub(super) mod test {
             MockedRendezvousServer::new(&server, "abcdEFG12345", Duration::MAX, msc_4388).await;
 
         let client = HttpClient::new(reqwest::Client::new(), Default::default());
-        let alice = SecureChannel::reciprocate(client, &rendezvous_server.homeserver_url, msc_4388)
-            .await
-            .expect("Alice should be able to create a secure channel.");
+        let alice =
+            SecureChannel::reciprocate(client, &rendezvous_server.homeserver_url, None, msc_4388)
+                .await
+                .expect("Alice should be able to create a secure channel.");
 
         let qr_code_data = alice.qr_code_data().clone();
 
