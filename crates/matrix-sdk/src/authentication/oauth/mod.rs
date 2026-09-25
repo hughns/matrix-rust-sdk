@@ -372,11 +372,17 @@ impl OAuth {
     }
 
     /// Check if the homeserver supports the [MSC4388] variant of the rendezvous
-    /// server.
+    /// server, and lets us create a rendezvous session with it.
     ///
-    /// Returns `Ok(true)` if the rendezvous discovery endpoint returns a 200 OK
-    /// HTTP response, `Ok(false)` if the endpoint returns a 404 NOT_FOUND or
-    /// 403 FORBIDDEN HTTP response, otherwise an error is returned.
+    /// Returns the `create_available` field of the rendezvous discovery
+    /// endpoint's 200 OK HTTP response, i.e. `Ok(true)` if we are allowed to
+    /// create a rendezvous session, which is needed to generate a QR code.
+    /// Returns `Ok(false)` if we aren't, or if the endpoint returns a 404
+    /// NOT_FOUND or 403 FORBIDDEN HTTP response, otherwise an error is
+    /// returned.
+    ///
+    /// The access token is sent if this client is logged in, since the server
+    /// policy for creating rendezvous sessions may depend on it.
     ///
     /// [MSC4388]: https://github.com/matrix-org/matrix-spec-proposals/pull/4388
     #[cfg(feature = "e2e-encryption")]
