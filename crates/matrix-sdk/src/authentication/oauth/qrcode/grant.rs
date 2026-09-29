@@ -24,7 +24,10 @@ use matrix_sdk_base::{
     },
 };
 use oauth2::VerificationUriComplete;
-use ruma::time::Instant;
+use ruma::{
+    api::client::discovery::get_authorization_server_metadata::v1::GrantType, time::Instant,
+};
+use tracing::warn;
 use url::Url;
 #[cfg(doc)]
 use vodozemac::ecies::CheckCode;
@@ -54,9 +57,40 @@ async fn export_secrets_bundle(client: &Client) -> Result<SecretsBundle, QRCodeG
     Ok(secrets_bundle)
 }
 
+/// Get the login protocols we can offer to the new device in the
+/// `m.login.protocols` message.
+///
+/// The device authorization grant is only offered if the authorization server
+/// supports it.
+async fn available_login_protocols(client: &Client) -> Vec<LoginProtocolType> {
+    match client.oauth().cached_server_metadata().await {
+        Ok(metadata) if metadata.grant_types_supported.contains(&GrantType::DeviceCode) => {
+            vec![LoginProtocolType::DeviceAuthorizationGrant]
+        }
+        Ok(_) => {
+            warn!(
+                "The authorization server doesn't support the device authorization grant, \
+                 offering no login protocols"
+            );
+            vec![]
+        }
+        Err(error) => {
+            // The new device checks the server metadata itself before starting
+            // the login, so let it decide.
+            warn!(
+                ?error,
+                "Could not get the authorization server metadata, offering the device \
+                 authorization grant anyway"
+            );
+            vec![LoginProtocolType::DeviceAuthorizationGrant]
+        }
+    }
+}
+
 async fn finish_login_grant<Q>(
     client: &Client,
     channel: &mut EstablishedSecureChannel,
+    offered_protocols: &[LoginProtocolType],
     device_creation_timeout: Duration,
     secrets_bundle: &SecretsBundle,
     state: &SharedObservable<GrantLoginProgress<Q>>,
@@ -85,13 +119,15 @@ async fn finish_login_grant<Q>(
         }
     };
 
-    // We verify the selected protocol, the device authorization grant is the
-    // only one we offer and it needs to come with the grant data.
+    // We verify the selected protocol. It needs to be one we offered, and the
+    // device authorization grant is the only one we support, which needs to
+    // come with the grant data.
     //
     // -- MSC4108 OAuth 2.0 login step 4
     let device_authorization_grant = match device_authorization_grant {
         Some(device_authorization_grant)
-            if protocol == LoginProtocolType::DeviceAuthorizationGrant =>
+            if protocol == LoginProtocolType::DeviceAuthorizationGrant
+                && offered_protocols.contains(&protocol) =>
         {
             device_authorization_grant
         }
@@ -331,28 +367,36 @@ impl<'a> IntoFuture for GrantLoginWithScannedQrCode<'a> {
             // -- MSC4108 Secure channel setup step 7
 
             // Inform the other device about the available login protocols and
-            // the homeserver to use.
+            // the homeserver to use. With MSC4388 we only offer the protocols
+            // the authorization server supports; the MSC4108 variant always
+            // offers the device authorization grant, as it always has.
             //
             // -- MSC4108 OAuth 2.0 login step 1
-            let message = if channel.is_using_msc_4388() {
-                QrAuthMessage::LoginProtocols(LoginProtocolsMessage::Msc4388 {
-                    protocols: vec![LoginProtocolType::DeviceAuthorizationGrant],
+            let (message, offered_protocols) = if channel.is_using_msc_4388() {
+                let protocols = available_login_protocols(self.client).await;
+                let message = QrAuthMessage::LoginProtocols(LoginProtocolsMessage::Msc4388 {
+                    protocols: protocols.clone(),
                     base_url: self.client.homeserver(),
-                })
+                });
+                (message, protocols)
             } else {
-                QrAuthMessage::LoginProtocols(LoginProtocolsMessage::Msc4108 {
-                    protocols: vec![LoginProtocolType::DeviceAuthorizationGrant],
+                let protocols = vec![LoginProtocolType::DeviceAuthorizationGrant];
+                let message = QrAuthMessage::LoginProtocols(LoginProtocolsMessage::Msc4108 {
+                    protocols: protocols.clone(),
                     homeserver: self.client.homeserver(),
-                })
+                });
+                (message, protocols)
             };
             channel.send_json(message).await?;
 
-            // Proceed with granting the login.
+            // Proceed with granting the login. If we didn't offer any protocols,
+            // the new device will tell us that it can't continue.
             //
             // -- MSC4108 OAuth 2.0 login remaining steps
             finish_login_grant(
                 self.client,
                 &mut channel,
+                &offered_protocols,
                 self.device_creation_timeout,
                 &secrets_bundle,
                 &self.state,
@@ -488,13 +532,19 @@ impl<'a> IntoFuture for GrantLoginWithGeneratedQrCode<'a> {
             // compatible with existing implementations.
             //
             // -- MSC4108 OAuth 2.0 login step 1
-            if channel.is_using_msc_4388() {
+            let offered_protocols = if channel.is_using_msc_4388() {
+                // Only offer the protocols the authorization server supports.
+                let protocols = available_login_protocols(client).await;
                 let message = QrAuthMessage::LoginProtocols(LoginProtocolsMessage::Msc4388 {
-                    protocols: vec![LoginProtocolType::DeviceAuthorizationGrant],
+                    protocols: protocols.clone(),
                     base_url: client.homeserver(),
                 });
                 channel.send_json(message).await?;
-            }
+                protocols
+            } else {
+                // The new device implicitly uses the device authorization grant.
+                vec![LoginProtocolType::DeviceAuthorizationGrant]
+            };
 
             // Proceed with granting the login.
             //
@@ -502,6 +552,7 @@ impl<'a> IntoFuture for GrantLoginWithGeneratedQrCode<'a> {
             finish_login_grant(
                 client,
                 &mut channel,
+                &offered_protocols,
                 device_creation_timeout,
                 &secrets_bundle,
                 &state,
@@ -547,6 +598,13 @@ mod test {
         InvalidJsonMessage,
         CancelledWhileWaitingForAuth,
         UnsupportedProtocol,
+        /// Expect Alice to offer no protocols, and tell her we can't continue.
+        #[cfg(feature = "unstable-msc4388")]
+        NoProtocolsOffered,
+        /// Expect Alice to offer no protocols, but request the device
+        /// authorization grant anyway.
+        #[cfg(feature = "unstable-msc4388")]
+        RequestsProtocolNotOffered,
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -594,8 +652,29 @@ mod test {
                 }) = message
             );
 
-            assert_eq!(protocols, vec![LoginProtocolType::DeviceAuthorizationGrant]);
             assert_eq!(&base_url, qr_base_url);
+
+            match behaviour {
+                #[cfg(feature = "unstable-msc4388")]
+                BobBehaviour::NoProtocolsOffered => {
+                    assert!(protocols.is_empty(), "Alice shouldn't offer any protocols");
+
+                    // We can't use any of the protocols, so tell Alice and stop.
+                    let message = QrAuthMessage::LoginFailure {
+                        reason: LoginFailureReason::UnsupportedProtocol,
+                        homeserver: None,
+                    };
+                    bob.send_json(message).await.unwrap();
+                    return;
+                }
+                #[cfg(feature = "unstable-msc4388")]
+                BobBehaviour::RequestsProtocolNotOffered => {
+                    assert!(protocols.is_empty(), "Alice shouldn't offer any protocols");
+                }
+                _ => {
+                    assert_eq!(protocols, vec![LoginProtocolType::DeviceAuthorizationGrant]);
+                }
+            }
         }
 
         match behaviour {
@@ -651,6 +730,30 @@ mod test {
                     .expect("Bob should receive the LoginFailure message from Alice");
                 assert_let!(QrAuthMessage::LoginFailure { reason, .. } = message);
                 assert_matches!(reason, LoginFailureReason::DeviceAlreadyExists);
+
+                return; // Exit.
+            }
+            #[cfg(feature = "unstable-msc4388")]
+            BobBehaviour::RequestsProtocolNotOffered => {
+                // Request the device authorization grant, although Alice did
+                // not offer it.
+                let message = QrAuthMessage::LoginProtocol {
+                    protocol: LoginProtocolType::DeviceAuthorizationGrant,
+                    device_authorization_grant: Some(
+                        device_authorization_grant
+                            .expect("Bob needs the device authorization grant"),
+                    ),
+                    device_id: "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4".to_owned(),
+                };
+                bob.send_json(message).await.unwrap();
+
+                // Alice should reject the protocol.
+                let message = bob
+                    .receive_json()
+                    .await
+                    .expect("Bob should receive the LoginFailure message from Alice");
+                assert_let!(QrAuthMessage::LoginFailure { reason, .. } = message);
+                assert_matches!(reason, LoginFailureReason::UnsupportedProtocol);
 
                 return; // Exit.
             }
@@ -846,8 +949,22 @@ mod test {
             (protocols, homeserver)
         };
 
-        assert_eq!(protocols, vec![LoginProtocolType::DeviceAuthorizationGrant]);
         assert_eq!(alice_homeserver, homeserver);
+
+        #[cfg(feature = "unstable-msc4388")]
+        if matches!(behaviour, BobBehaviour::NoProtocolsOffered) {
+            assert!(protocols.is_empty(), "Alice shouldn't offer any protocols");
+
+            // We can't use any of the protocols, so tell Alice and stop.
+            let message = QrAuthMessage::LoginFailure {
+                reason: LoginFailureReason::UnsupportedProtocol,
+                homeserver: None,
+            };
+            bob.send_json(message).await.unwrap();
+            return;
+        }
+
+        assert_eq!(protocols, vec![LoginProtocolType::DeviceAuthorizationGrant]);
 
         match behaviour {
             BobBehaviour::UnexpectedMessageInsteadOfLoginProtocol => {
@@ -1025,6 +1142,9 @@ mod test {
                 .await;
         debug!("Set up rendezvous server mock at {}", rendezvous_server.rendezvous_url);
 
+        // The authorization server supports the device authorization grant.
+        server.oauth().mock_server_metadata().ok().named("server_metadata").mount().await;
+
         let device_authorization_grant = AuthorizationGrant {
             verification_uri_complete: Some(VerificationUriComplete::new(
                 "https://id.matrix.org/device/abcde".to_owned(),
@@ -1200,6 +1320,9 @@ mod test {
             MockedRendezvousServer::new(server.server(), "abcdEFG12345", Duration::MAX, msc_4388)
                 .await;
         debug!("Set up rendezvous server mock at {}", rendezvous_server.rendezvous_url);
+
+        // The authorization server supports the device authorization grant.
+        server.oauth().mock_server_metadata().ok().named("server_metadata").mount().await;
 
         let device_authorization_grant = AuthorizationGrant {
             verification_uri_complete: Some(VerificationUriComplete::new(
@@ -1857,6 +1980,185 @@ mod test {
         assert_eq!(protocol.as_str(), "m.unknown_protocol");
         updates_task.await.expect("Alice should run through all progress states");
         bob_task.await.expect("Bob's task should finish");
+    }
+
+    /// The authorization server doesn't support the device authorization grant,
+    /// so Alice shouldn't offer any login protocols.
+    #[cfg(feature = "unstable-msc4388")]
+    async fn test_grant_login_with_generated_qr_code_without_device_code_grant(
+        behaviour: BobBehaviour,
+    ) -> Result<(), QRCodeGrantLoginError> {
+        let msc_4388 = true;
+        let server = MatrixMockServer::new().await;
+        // Shared with Bob's task, so the rendezvous session outlives it and
+        // Alice can still read Bob's last message.
+        let rendezvous_server = Arc::new(
+            MockedRendezvousServer::new(server.server(), "abcdEFG12345", Duration::MAX, msc_4388)
+                .await,
+        );
+        debug!("Set up rendezvous server mock at {}", rendezvous_server.rendezvous_url);
+
+        server
+            .oauth()
+            .mock_server_metadata()
+            .ok_without_device_authorization()
+            .named("server_metadata")
+            .mount()
+            .await;
+
+        let device_authorization_grant = AuthorizationGrant {
+            verification_uri_complete: Some(VerificationUriComplete::new(
+                "https://id.matrix.org/device/abcde".to_owned(),
+            )),
+            verification_uri: EndUserVerificationUrl::new(
+                "https://id.matrix.org/device/abcde?code=ABCDE".to_owned(),
+            )
+            .unwrap(),
+        };
+
+        server.mock_upload_keys().ok().expect(1).named("upload_keys").mount().await;
+        server
+            .mock_upload_cross_signing_keys()
+            .ok()
+            .expect(1)
+            .named("upload_xsigning_keys")
+            .mount()
+            .await;
+        server
+            .mock_upload_cross_signing_signatures()
+            .ok()
+            .expect(1)
+            .named("upload_xsigning_signatures")
+            .mount()
+            .await;
+
+        // Create the existing client (Alice).
+        let user_id = owned_user_id!("@alice:example.org");
+        let device_id = owned_device_id!("ALICE_DEVICE");
+        let alice = server
+            .client_builder_for_crypto_end_to_end(&user_id, &device_id)
+            .logged_in_with_oauth()
+            .build()
+            .await;
+        alice
+            .encryption()
+            .bootstrap_cross_signing(None)
+            .await
+            .expect("Alice should be able to set up cross signing");
+
+        // Prepare the login granting future.
+        let oauth = alice.oauth();
+        let mut grant = oauth
+            .grant_login_with_qr_code()
+            .device_creation_timeout(Duration::from_secs(2))
+            .generate();
+
+        grant.with_msc4388_support();
+
+        let (qr_code_tx, qr_code_rx) = oneshot::channel();
+        let (checkcode_tx, checkcode_rx) = oneshot::channel();
+
+        // Spawn the updates task.
+        let mut updates = grant.subscribe_to_progress();
+        let mut state = grant.state.get();
+        assert_matches!(state.clone(), GrantLoginProgress::Starting);
+        let updates_task = spawn(async move {
+            let mut qr_code_tx = Some(qr_code_tx);
+            let mut checkcode_rx = Some(checkcode_rx);
+
+            while let Some(update) = updates.next().await {
+                match &update {
+                    GrantLoginProgress::Starting => {
+                        assert_matches!(state, GrantLoginProgress::Starting);
+                    }
+                    GrantLoginProgress::EstablishingSecureChannel(
+                        GeneratedQrProgress::QrReady(qr_code_data),
+                    ) => {
+                        assert_matches!(state, GrantLoginProgress::Starting);
+                        qr_code_tx
+                            .take()
+                            .expect("The QR code should only be forwarded once")
+                            .send(qr_code_data.clone())
+                            .expect("Alice should be able to forward the QR code");
+                    }
+                    GrantLoginProgress::EstablishingSecureChannel(
+                        GeneratedQrProgress::QrScanned(checkcode_sender),
+                    ) => {
+                        assert_matches!(
+                            state,
+                            GrantLoginProgress::EstablishingSecureChannel(
+                                GeneratedQrProgress::QrReady(_)
+                            )
+                        );
+                        let checkcode = checkcode_rx
+                            .take()
+                            .expect("The checkcode should only be forwarded once")
+                            .await
+                            .expect("Alice should receive the checkcode");
+                        checkcode_sender
+                            .send(checkcode)
+                            .await
+                            .expect("Alice should be able to forward the checkcode");
+                    }
+                    _ => {
+                        panic!("Alice should abort the process");
+                    }
+                }
+                state = update;
+            }
+        });
+
+        // Let Bob request the login and run through the process.
+        let rendezvous_server_clone = rendezvous_server.clone();
+        let bob_task = spawn(async move {
+            request_login_with_scanned_qr_code(
+                behaviour,
+                qr_code_rx,
+                checkcode_tx,
+                None,
+                &rendezvous_server_clone,
+                Some(device_authorization_grant),
+                None,
+            )
+            .await;
+        });
+
+        // Wait for all tasks to finish / fail.
+        let result = grant.await;
+        updates_task.await.expect("Alice should run through all progress states");
+        bob_task.await.expect("Bob's task should finish");
+
+        result
+    }
+
+    #[async_test]
+    #[cfg(feature = "unstable-msc4388")]
+    async fn test_grant_login_with_generated_qr_code_no_protocols_offered_msc_4388() {
+        let result = test_grant_login_with_generated_qr_code_without_device_code_grant(
+            BobBehaviour::NoProtocolsOffered,
+        )
+        .await;
+
+        // Bob tells Alice that he can't continue.
+        assert_matches!(
+            result,
+            Err(QRCodeGrantLoginError::LoginFailure {
+                reason: LoginFailureReason::UnsupportedProtocol
+            })
+        );
+    }
+
+    #[async_test]
+    #[cfg(feature = "unstable-msc4388")]
+    async fn test_grant_login_with_generated_qr_code_protocol_not_offered_msc_4388() {
+        let result = test_grant_login_with_generated_qr_code_without_device_code_grant(
+            BobBehaviour::RequestsProtocolNotOffered,
+        )
+        .await;
+
+        // Alice rejects the protocol, since she didn't offer it.
+        assert_let!(Err(QRCodeGrantLoginError::UnsupportedProtocol(protocol)) = result);
+        assert_eq!(protocol, LoginProtocolType::DeviceAuthorizationGrant);
     }
 
     #[async_test]
@@ -2784,6 +3086,128 @@ mod test {
         assert_matches!(
             grant.await,
             Err(QRCodeGrantLoginError::LoginFailure { reason: LoginFailureReason::UserCancelled }),
+            "Alice should abort the login with expected error"
+        );
+        updates_task.await.expect("Alice should run through all progress states");
+        bob_task.await.expect("Bob's task should finish");
+    }
+
+    /// The authorization server doesn't support the device authorization grant,
+    /// so Alice shouldn't offer any login protocols and Bob should give up.
+    #[async_test]
+    #[cfg(feature = "unstable-msc4388")]
+    async fn test_grant_login_with_scanned_qr_code_no_protocols_offered_msc_4388() {
+        let server = MatrixMockServer::new().await;
+        let rendezvous_server = Arc::new(
+            MockedRendezvousServer::new(server.server(), "abcdEFG12345", Duration::MAX, true).await,
+        );
+        debug!("Set up rendezvous server mock at {}", rendezvous_server.rendezvous_url);
+
+        server
+            .oauth()
+            .mock_server_metadata()
+            .ok_without_device_authorization()
+            .named("server_metadata")
+            .mount()
+            .await;
+
+        server.mock_upload_keys().ok().expect(1).named("upload_keys").mount().await;
+        server
+            .mock_upload_cross_signing_keys()
+            .ok()
+            .expect(1)
+            .named("upload_xsigning_keys")
+            .mount()
+            .await;
+        server
+            .mock_upload_cross_signing_signatures()
+            .ok()
+            .expect(1)
+            .named("upload_xsigning_signatures")
+            .mount()
+            .await;
+
+        // Create a secure channel on the new client (Bob) and extract the QR
+        // code.
+        let client = HttpClient::new(reqwest::Client::new(), Default::default());
+        let channel = SecureChannel::login(client, &rendezvous_server.homeserver_url, None, true)
+            .await
+            .expect("Bob should be able to create a secure channel.");
+        let qr_code_data = channel.qr_code_data().clone();
+
+        // Create the existing client (Alice).
+        let user_id = owned_user_id!("@alice:example.org");
+        let device_id = owned_device_id!("ALICE_DEVICE");
+        let alice = server
+            .client_builder_for_crypto_end_to_end(&user_id, &device_id)
+            .logged_in_with_oauth()
+            .build()
+            .await;
+        alice
+            .encryption()
+            .bootstrap_cross_signing(None)
+            .await
+            .expect("Alice should be able to set up cross signing");
+
+        // Prepare the login granting future using the QR code.
+        let oauth = alice.oauth();
+        let grant = oauth
+            .grant_login_with_qr_code()
+            .device_creation_timeout(Duration::from_secs(2))
+            .scan(&qr_code_data);
+        let (checkcode_tx, checkcode_rx) = oneshot::channel();
+
+        // Spawn the updates task.
+        let mut updates = grant.subscribe_to_progress();
+        let mut state = grant.state.get();
+        assert_matches!(state.clone(), GrantLoginProgress::Starting);
+        let updates_task = spawn(async move {
+            let mut checkcode_tx = Some(checkcode_tx);
+
+            while let Some(update) = updates.next().await {
+                match &update {
+                    GrantLoginProgress::Starting => {
+                        assert_matches!(state, GrantLoginProgress::Starting);
+                    }
+                    GrantLoginProgress::EstablishingSecureChannel(QrProgress { check_code }) => {
+                        assert_matches!(state, GrantLoginProgress::Starting);
+                        checkcode_tx
+                            .take()
+                            .expect("The checkcode should only be forwarded once")
+                            .send(*check_code)
+                            .expect("Alice should be able to forward the checkcode");
+                        break;
+                    }
+                    _ => {
+                        panic!("Alice should abort the process");
+                    }
+                }
+                state = update;
+            }
+        });
+
+        let rendezvous_server_clone = rendezvous_server.clone();
+        // Let Bob request the login and run through the process.
+        let bob_task = spawn(async move {
+            request_login_with_generated_qr_code(
+                BobBehaviour::NoProtocolsOffered,
+                channel,
+                checkcode_rx,
+                None,
+                &rendezvous_server_clone,
+                alice.homeserver(),
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // Wait for all tasks to finish / fail.
+        assert_matches!(
+            grant.await,
+            Err(QRCodeGrantLoginError::LoginFailure {
+                reason: LoginFailureReason::UnsupportedProtocol
+            }),
             "Alice should abort the login with expected error"
         );
         updates_task.await.expect("Alice should run through all progress states");
