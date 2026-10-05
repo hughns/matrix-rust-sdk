@@ -17,8 +17,8 @@ use matrix_sdk_common::deserialized_responses::PrivOwnedStr;
 use oauth2::{
     EndUserVerificationUrl, StandardDeviceAuthorizationResponse, VerificationUriComplete,
 };
-use ruma::serde::StringEnum;
-use serde::{Deserialize, Serialize};
+use ruma::serde::{JsonObject, StringEnum};
+use serde::{Deserialize, Serialize, ser::SerializeMap};
 use url::Url;
 use vodozemac::Curve25519PublicKey;
 
@@ -39,12 +39,10 @@ pub enum QrAuthMessage {
     /// message the new device has picked. Sent by the new device.
     #[serde(rename = "m.login.protocol")]
     LoginProtocol {
-        /// The device authorization grant the OAuth 2.0 server has given to the
-        /// new device, contains the URL the existing device should use to
-        /// confirm the log in.
-        device_authorization_grant: AuthorizationGrant,
-        /// The protocol the new device has picked.
-        protocol: LoginProtocolType,
+        /// The protocol the new device has picked, along with the data specific
+        /// to that protocol.
+        #[serde(flatten)]
+        protocol: LoginProtocolData,
         /// The device ID the new device will be using.
         device_id: String,
     },
@@ -126,9 +124,157 @@ impl QrAuthMessage {
     ) -> QrAuthMessage {
         QrAuthMessage::LoginProtocol {
             device_id: device_id.to_base64(),
-            device_authorization_grant,
-            protocol: LoginProtocolType::DeviceAuthorizationGrant,
+            protocol: LoginProtocolData::DeviceAuthorizationGrant(device_authorization_grant),
         }
+    }
+}
+
+/// The login protocol the new device has picked in a
+/// [`QrAuthMessage::LoginProtocol`] message, along with the data specific to
+/// that protocol.
+///
+/// On the wire, MSC4108 puts the protocol name in the `protocol` field. For
+/// the `device_authorization_grant` protocol, the protocol specific data lives
+/// in a field of the same name, i.e. `"protocol": "device_authorization_grant"`
+/// comes with a `"device_authorization_grant": { ... }` field. Other protocols
+/// may lay out their data differently, so their fields are kept verbatim.
+///
+/// Like other known message types, a known protocol only keeps the fields it
+/// knows about, while an [`UnknownLoginProtocol`] keeps all the fields, as we
+/// don't know which ones are relevant.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "LoginProtocolDataHelper")]
+#[non_exhaustive]
+pub enum LoginProtocolData {
+    /// The `device_authorization_grant` login protocol.
+    ///
+    /// Contains the device authorization grant the OAuth 2.0 server has given
+    /// to the new device, with the URL the existing device should use to
+    /// confirm the log in.
+    DeviceAuthorizationGrant(AuthorizationGrant),
+    /// An unknown and unsupported login protocol.
+    Unknown(UnknownLoginProtocol),
+}
+
+impl LoginProtocolData {
+    /// Create a new [`LoginProtocolData`] from the given login protocol and its
+    /// data.
+    ///
+    /// The `data` contains the fields of the [`QrAuthMessage::LoginProtocol`]
+    /// message other than `type`, `protocol` and `device_id`. If the protocol
+    /// is a known one, the data is deserialized into the corresponding
+    /// variant and only the fields that protocol knows about are kept.
+    /// Otherwise a [`LoginProtocolData::Unknown`] is created, which keeps all
+    /// the fields verbatim.
+    ///
+    /// Returns an error if the protocol is a known one and the data is not
+    /// valid for it, or if the protocol is unknown and the data contains one
+    /// of the `type`, `protocol` or `device_id` fields, as they would clash
+    /// with the fields of the message when serialized.
+    pub fn new(protocol: LoginProtocolType, data: JsonObject) -> Result<Self, serde_json::Error> {
+        LoginProtocolDataHelper { protocol, other: data }.try_into()
+    }
+
+    /// Get the login protocol.
+    pub fn protocol(&self) -> LoginProtocolType {
+        match self {
+            Self::DeviceAuthorizationGrant(_) => LoginProtocolType::DeviceAuthorizationGrant,
+            Self::Unknown(c) => c.protocol.clone(),
+        }
+    }
+}
+
+/// An unknown and unsupported login protocol of a
+/// [`QrAuthMessage::LoginProtocol`] message.
+#[derive(Debug, Clone)]
+pub struct UnknownLoginProtocol {
+    /// The name of the unknown login protocol.
+    protocol: LoginProtocolType,
+
+    /// The other data of the unknown login protocol.
+    other: JsonObject,
+}
+
+impl UnknownLoginProtocol {
+    /// Get the name of the unknown login protocol.
+    pub fn protocol(&self) -> &LoginProtocolType {
+        &self.protocol
+    }
+
+    /// Get the data of the unknown login protocol, i.e. the fields of the
+    /// [`QrAuthMessage::LoginProtocol`] message other than `type`, `protocol`
+    /// and `device_id`.
+    pub fn data(&self) -> &JsonObject {
+        &self.other
+    }
+}
+
+#[derive(Deserialize)]
+struct LoginProtocolDataHelper {
+    protocol: LoginProtocolType,
+    #[serde(flatten)]
+    other: JsonObject,
+}
+
+impl Serialize for LoginProtocolData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("protocol", &self.protocol())?;
+
+        match self {
+            Self::DeviceAuthorizationGrant(device_authorization_grant) => {
+                map.serialize_entry("device_authorization_grant", device_authorization_grant)?;
+            }
+            Self::Unknown(c) => {
+                for (key, value) in &c.other {
+                    map.serialize_entry(key, value)?;
+                }
+            }
+        }
+
+        map.end()
+    }
+}
+
+impl TryFrom<LoginProtocolDataHelper> for LoginProtocolData {
+    type Error = serde_json::Error;
+
+    fn try_from(mut value: LoginProtocolDataHelper) -> Result<Self, Self::Error> {
+        Ok(match value.protocol {
+            LoginProtocolType::DeviceAuthorizationGrant => {
+                let device_authorization_grant =
+                    value.other.remove("device_authorization_grant").ok_or_else(|| {
+                        serde::de::Error::missing_field("device_authorization_grant")
+                    })?;
+
+                Self::DeviceAuthorizationGrant(
+                    serde_json::from_value(device_authorization_grant).map_err(|error| {
+                        serde::de::Error::custom(format_args!(
+                            "invalid device_authorization_grant: {error}"
+                        ))
+                    })?,
+                )
+            }
+            _ => {
+                // The fields of an unknown protocol are serialized next to the
+                // fields of the message, so they must not clash with them.
+                const RESERVED_FIELDS: &[&str] = &["type", "protocol", "device_id"];
+
+                if let Some(field) =
+                    RESERVED_FIELDS.iter().find(|field| value.other.contains_key(**field))
+                {
+                    return Err(serde::de::Error::custom(format_args!(
+                        "the `{field}` field is reserved and can't be part of the login \
+                         protocol data"
+                    )));
+                }
+
+                Self::Unknown(UnknownLoginProtocol { protocol: value.protocol, other: value.other })
+            }
+        })
     }
 }
 
@@ -259,11 +405,167 @@ mod test {
         });
 
         let message: QrAuthMessage = serde_json::from_value(json.clone()).unwrap();
-        assert_let!(QrAuthMessage::LoginProtocol { protocol, device_id, .. } = &message);
-        assert_eq!(protocol, &LoginProtocolType::DeviceAuthorizationGrant);
+        assert_let!(
+            QrAuthMessage::LoginProtocol {
+                protocol: LoginProtocolData::DeviceAuthorizationGrant(device_authorization_grant),
+                device_id,
+            } = &message
+        );
+        assert_eq!(
+            device_authorization_grant.verification_uri.as_str(),
+            "https://id.matrix.org/device/abcde?code=ABCDE"
+        );
         assert_eq!(device_id, "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4");
         let serialized = serde_json::to_value(&message).unwrap();
         assert_eq!(json, serialized);
+    }
+
+    #[test]
+    fn test_protocol_serialization_unknown_protocol() {
+        // A future protocol carries its data in a field named after it, and has
+        // no `device_authorization_grant` field.
+        let json = json!({
+            "type": "m.login.protocol",
+            "protocol": "org.example.future_protocol",
+            "org.example.future_protocol": {
+                "some": "data"
+            },
+            "device_id": "ABCDEFGH"
+        });
+
+        let message: QrAuthMessage = serde_json::from_value(json.clone()).unwrap();
+        assert_let!(
+            QrAuthMessage::LoginProtocol {
+                protocol: LoginProtocolData::Unknown(protocol),
+                device_id
+            } = &message
+        );
+        assert_eq!(protocol.protocol().as_str(), "org.example.future_protocol");
+        assert_eq!(
+            protocol.data(),
+            &JsonObject::from_iter([(
+                "org.example.future_protocol".to_owned(),
+                json!({ "some": "data" })
+            )])
+        );
+        assert_eq!(device_id, "ABCDEFGH");
+
+        // The data of the unknown protocol is kept, and no
+        // `device_authorization_grant` field is added.
+        let serialized = serde_json::to_value(&message).unwrap();
+        assert_eq!(json, serialized);
+    }
+
+    #[test]
+    fn test_protocol_deserialization_missing_device_authorization_grant() {
+        let json = json!({
+            "type": "m.login.protocol",
+            "protocol": "device_authorization_grant",
+            "device_id": "ABCDEFGH"
+        });
+
+        serde_json::from_value::<QrAuthMessage>(json).expect_err(
+            "The device authorization grant protocol requires the device_authorization_grant field",
+        );
+    }
+
+    #[test]
+    fn test_protocol_deserialization_invalid_device_authorization_grant() {
+        let json = json!({
+            "type": "m.login.protocol",
+            "protocol": "device_authorization_grant",
+            "device_authorization_grant": {},
+            "device_id": "ABCDEFGH"
+        });
+
+        let error = serde_json::from_value::<QrAuthMessage>(json)
+            .expect_err("The device authorization grant requires the verification_uri field");
+        let error = error.to_string();
+        assert!(error.contains("device_authorization_grant"), "{error}");
+        assert!(error.contains("verification_uri"), "{error}");
+    }
+
+    #[test]
+    fn test_protocol_serialization_drops_unknown_fields_of_known_protocol() {
+        let json = json!({
+            "type": "m.login.protocol",
+            "protocol": "device_authorization_grant",
+            "device_authorization_grant": {
+                "verification_uri": "https://id.matrix.org/device/abcde"
+            },
+            "org.example.hint": "data",
+            "device_id": "ABCDEFGH"
+        });
+
+        let message: QrAuthMessage = serde_json::from_value(json).unwrap();
+        let serialized = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            serialized,
+            json!({
+                "type": "m.login.protocol",
+                "protocol": "device_authorization_grant",
+                "device_authorization_grant": {
+                    "verification_uri": "https://id.matrix.org/device/abcde",
+                    "verification_uri_complete": null
+                },
+                "device_id": "ABCDEFGH"
+            })
+        );
+    }
+
+    #[test]
+    fn test_login_protocol_data_new() {
+        let grant = json!({
+            "verification_uri": "https://id.matrix.org/device/abcde",
+        });
+
+        // A known protocol with valid data gets its own variant.
+        let data = LoginProtocolData::new(
+            LoginProtocolType::DeviceAuthorizationGrant,
+            JsonObject::from_iter([("device_authorization_grant".to_owned(), grant.clone())]),
+        )
+        .unwrap();
+        assert_let!(LoginProtocolData::DeviceAuthorizationGrant(device_authorization_grant) = data);
+        assert_eq!(
+            device_authorization_grant.verification_uri.as_str(),
+            "https://id.matrix.org/device/abcde"
+        );
+
+        // A known protocol with missing data is an error.
+        LoginProtocolData::new(LoginProtocolType::DeviceAuthorizationGrant, JsonObject::new())
+            .expect_err("The device authorization grant protocol requires its data");
+
+        // An unknown protocol keeps its data, even if it looks like the data of
+        // a known protocol.
+        let other =
+            JsonObject::from_iter([("device_authorization_grant".to_owned(), grant.clone())]);
+        let data =
+            LoginProtocolData::new("org.example.future_protocol".into(), other.clone()).unwrap();
+        assert_let!(LoginProtocolData::Unknown(protocol) = data);
+        assert_eq!(protocol.protocol().as_str(), "org.example.future_protocol");
+        assert_eq!(protocol.data(), &other);
+
+        // The data of an unknown protocol can't contain the fields of the
+        // message, as they would be duplicated when serialized.
+        for field in ["type", "protocol", "device_id"] {
+            let other = JsonObject::from_iter([(field.to_owned(), json!("foo"))]);
+            let error = LoginProtocolData::new("org.example.future_protocol".into(), other)
+                .expect_err("The reserved fields should be rejected");
+            assert!(error.to_string().contains(field), "{error}");
+        }
+
+        // A known protocol only keeps the fields it knows about, so the
+        // reserved fields can't clash and are dropped like any other field.
+        let data = LoginProtocolData::new(
+            LoginProtocolType::DeviceAuthorizationGrant,
+            JsonObject::from_iter([
+                ("device_authorization_grant".to_owned(), grant),
+                ("type".to_owned(), json!("foo")),
+                ("org.example.hint".to_owned(), json!(1)),
+            ]),
+        )
+        .unwrap();
+        assert_let!(LoginProtocolData::DeviceAuthorizationGrant(_) = data);
     }
 
     #[test]

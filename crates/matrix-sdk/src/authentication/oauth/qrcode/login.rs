@@ -700,7 +700,7 @@ mod test {
             .expect("Alice should be able to receive the initial message from Bob");
 
         assert_let!(QrAuthMessage::LoginProtocol { protocol, .. } = message);
-        assert_eq!(protocol, LoginProtocolType::DeviceAuthorizationGrant);
+        assert_eq!(protocol.protocol(), LoginProtocolType::DeviceAuthorizationGrant);
 
         let message = match behaviour {
             AliceBehaviour::DeclinedProtocol => QrAuthMessage::LoginFailure {
@@ -925,7 +925,7 @@ mod test {
             .await
             .expect("Alice should be able to receive the `m.login.protocol` message from Bob");
         assert_let!(QrAuthMessage::LoginProtocol { protocol, .. } = message);
-        assert_eq!(protocol, LoginProtocolType::DeviceAuthorizationGrant);
+        assert_eq!(protocol.protocol(), LoginProtocolType::DeviceAuthorizationGrant);
 
         // Alice sends m.login.protocol_accepted message
         let message = match behaviour {
