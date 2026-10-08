@@ -1933,9 +1933,12 @@ mod test {
         behaviour: BobBehaviour,
     ) -> QRCodeGrantLoginError {
         let server = MatrixMockServer::new().await;
-        let rendezvous_server =
+        // Shared with Bob's task, so the rendezvous session outlives it and
+        // Alice can still read Bob's last message.
+        let rendezvous_server = Arc::new(
             MockedRendezvousServer::new(server.server(), "abcdEFG12345", Duration::MAX, false)
-                .await;
+                .await,
+        );
         debug!("Set up rendezvous server mock at {}", rendezvous_server.rendezvous_url);
 
         let device_authorization_grant = AuthorizationGrant {
@@ -2040,13 +2043,14 @@ mod test {
 
         // Let Bob request the login with a m.login.protocol message Alice
         // rejects.
+        let rendezvous_server_clone = rendezvous_server.clone();
         let bob_task = spawn(async move {
             request_login_with_scanned_qr_code(
                 behaviour,
                 qr_code_rx,
                 checkcode_tx,
                 None,
-                &rendezvous_server,
+                &rendezvous_server_clone,
                 Some(device_authorization_grant),
                 None,
             )
