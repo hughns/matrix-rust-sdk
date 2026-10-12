@@ -152,8 +152,8 @@ impl QrAuthMessage {
 /// Like other known message types, a known protocol only keeps the fields it
 /// knows about, while an [`UnknownLoginProtocol`] keeps all the fields, as we
 /// don't know which ones are relevant.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(try_from = "LoginProtocolDataHelper")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
 #[non_exhaustive]
 pub enum LoginProtocolData {
     /// The `device_authorization_grant` login protocol, as sent over the
@@ -163,6 +163,9 @@ pub enum LoginProtocolData {
     /// Contains the device authorization grant the OAuth 2.0 server has given
     /// to the new device, with the URL the existing device should use to
     /// confirm the log in.
+    // This variant must come before the MSC4388 one, as the untagged variants
+    // are tried in order.
+    #[serde(with = "msc4108_device_authorization_grant")]
     Msc4108DeviceAuthorizationGrant(AuthorizationGrant),
     /// The `device_authorization_grant` login protocol, as sent over the
     /// MSC4388 variant of the secure channel, with the data next to the
@@ -171,6 +174,7 @@ pub enum LoginProtocolData {
     /// Contains the device authorization grant the OAuth 2.0 server has given
     /// to the new device, with the URL the existing device should use to
     /// confirm the log in.
+    #[serde(with = "msc4388_device_authorization_grant")]
     Msc4388DeviceAuthorizationGrant(AuthorizationGrant),
     /// An unknown and unsupported login protocol.
     Unknown(UnknownLoginProtocol),
@@ -197,8 +201,24 @@ impl LoginProtocolData {
     /// valid for it, or if the protocol is unknown and the data contains one
     /// of the `type`, `protocol` or `device_id` fields, as they would clash
     /// with the fields of the message when serialized.
-    pub fn new(protocol: LoginProtocolType, data: JsonObject) -> Result<Self, serde_json::Error> {
-        LoginProtocolDataHelper { protocol, other: data }.try_into()
+    pub fn new(
+        protocol: LoginProtocolType,
+        mut data: JsonObject,
+    ) -> Result<Self, serde_json::Error> {
+        if matches!(protocol, LoginProtocolType::_Custom(_)) {
+            // The fields of an unknown protocol are serialized next to the
+            // fields of the message, so they must not clash with them.
+            const RESERVED_FIELDS: &[&str] = &["type", "protocol", "device_id"];
+
+            if let Some(field) = RESERVED_FIELDS.iter().find(|field| data.contains_key(**field)) {
+                return Err(serde::de::Error::custom(format_args!(
+                    "the `{field}` field is reserved and can't be part of the login protocol data"
+                )));
+            }
+        }
+
+        data.insert("protocol".to_owned(), protocol.as_str().into());
+        serde_json::from_value(data.into())
     }
 
     /// Create a new [`LoginProtocolData`] for the
@@ -232,12 +252,14 @@ impl LoginProtocolData {
 
 /// An unknown and unsupported login protocol of a
 /// [`QrAuthMessage::LoginProtocol`] message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnknownLoginProtocol {
     /// The name of the unknown login protocol.
+    #[serde(deserialize_with = "deserialize_unknown_protocol")]
     protocol: LoginProtocolType,
 
     /// The other data of the unknown login protocol.
+    #[serde(flatten)]
     other: JsonObject,
 }
 
@@ -255,95 +277,92 @@ impl UnknownLoginProtocol {
     }
 }
 
-#[derive(Deserialize)]
-struct LoginProtocolDataHelper {
-    protocol: LoginProtocolType,
-    #[serde(flatten)]
-    other: JsonObject,
-}
+/// Only accept unknown protocols, so a known protocol with invalid data is an
+/// error instead of falling back to [`LoginProtocolData::Unknown`].
+fn deserialize_unknown_protocol<'de, D>(deserializer: D) -> Result<LoginProtocolType, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let protocol = LoginProtocolType::deserialize(deserializer)?;
 
-#[derive(Serialize)]
-struct LoginProtocolDataSerHelper<'a, T: Serialize> {
-    protocol: LoginProtocolType,
-    #[serde(flatten)]
-    data: &'a T,
-}
-
-#[derive(Serialize)]
-struct Msc4108DeviceAuthorizationGrantSerHelper<'a> {
-    device_authorization_grant: &'a AuthorizationGrant,
-}
-
-impl Serialize for LoginProtocolData {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let protocol = self.protocol();
-
-        match self {
-            Self::Msc4108DeviceAuthorizationGrant(device_authorization_grant) => {
-                LoginProtocolDataSerHelper {
-                    protocol,
-                    data: &Msc4108DeviceAuthorizationGrantSerHelper { device_authorization_grant },
-                }
-                .serialize(serializer)
-            }
-            Self::Msc4388DeviceAuthorizationGrant(device_authorization_grant) => {
-                LoginProtocolDataSerHelper { protocol, data: device_authorization_grant }
-                    .serialize(serializer)
-            }
-            Self::Unknown(c) => {
-                LoginProtocolDataSerHelper { protocol, data: &c.other }.serialize(serializer)
-            }
-        }
+    if matches!(protocol, LoginProtocolType::_Custom(_)) {
+        Ok(protocol)
+    } else {
+        Err(serde::de::Error::custom(format_args!("invalid data for the `{protocol}` protocol")))
     }
 }
 
-impl TryFrom<LoginProtocolDataHelper> for LoginProtocolData {
-    type Error = serde_json::Error;
+/// The `protocol` field of the `device_authorization_grant` login protocol.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DeviceAuthorizationGrantProtocol {
+    DeviceAuthorizationGrant,
+}
 
-    fn try_from(mut value: LoginProtocolDataHelper) -> Result<Self, Self::Error> {
-        Ok(match value.protocol {
-            LoginProtocolType::DeviceAuthorizationGrant => {
-                let invalid_data = |error: serde_json::Error| {
-                    serde::de::Error::custom(format_args!(
-                        "invalid device_authorization_grant: {error}"
-                    ))
-                };
+mod msc4108_device_authorization_grant {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-                // The MSC4108 variant nests the data in a field named after the
-                // protocol, while the MSC4388 variant puts it next to the
-                // `protocol` field.
-                if let Some(device_authorization_grant) =
-                    value.other.remove("device_authorization_grant")
-                {
-                    Self::Msc4108DeviceAuthorizationGrant(
-                        serde_json::from_value(device_authorization_grant).map_err(invalid_data)?,
-                    )
-                } else {
-                    Self::Msc4388DeviceAuthorizationGrant(
-                        serde_json::from_value(value.other.into()).map_err(invalid_data)?,
-                    )
-                }
-            }
-            _ => {
-                // The fields of an unknown protocol are serialized next to the
-                // fields of the message, so they must not clash with them.
-                const RESERVED_FIELDS: &[&str] = &["type", "protocol", "device_id"];
+    use super::{AuthorizationGrant, DeviceAuthorizationGrantProtocol};
 
-                if let Some(field) =
-                    RESERVED_FIELDS.iter().find(|field| value.other.contains_key(**field))
-                {
-                    return Err(serde::de::Error::custom(format_args!(
-                        "the `{field}` field is reserved and can't be part of the login \
-                         protocol data"
-                    )));
-                }
+    #[derive(Serialize, Deserialize)]
+    struct Helper<T> {
+        protocol: DeviceAuthorizationGrantProtocol,
+        device_authorization_grant: T,
+    }
 
-                Self::Unknown(UnknownLoginProtocol { protocol: value.protocol, other: value.other })
-            }
-        })
+    pub(super) fn serialize<S>(
+        device_authorization_grant: &AuthorizationGrant,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        Helper {
+            protocol: DeviceAuthorizationGrantProtocol::DeviceAuthorizationGrant,
+            device_authorization_grant,
+        }
+        .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<AuthorizationGrant, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Helper::deserialize(deserializer)?.device_authorization_grant)
+    }
+}
+
+mod msc4388_device_authorization_grant {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{AuthorizationGrant, DeviceAuthorizationGrantProtocol};
+
+    #[derive(Serialize, Deserialize)]
+    struct Helper<T> {
+        protocol: DeviceAuthorizationGrantProtocol,
+        #[serde(flatten)]
+        device_authorization_grant: T,
+    }
+
+    pub(super) fn serialize<S>(
+        device_authorization_grant: &AuthorizationGrant,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        Helper {
+            protocol: DeviceAuthorizationGrantProtocol::DeviceAuthorizationGrant,
+            device_authorization_grant,
+        }
+        .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<AuthorizationGrant, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Helper::deserialize(deserializer)?.device_authorization_grant)
     }
 }
 
@@ -564,9 +583,9 @@ mod test {
         let error = serde_json::from_value::<QrAuthMessage>(json).expect_err(
             "The device authorization grant protocol requires the device authorization grant",
         );
+        // The untagged enum doesn't tell us which field is wrong.
         let error = error.to_string();
-        assert!(error.contains("device_authorization_grant"), "{error}");
-        assert!(error.contains("verification_uri"), "{error}");
+        assert!(error.contains("did not match any variant"), "{error}");
     }
 
     #[test]
@@ -580,9 +599,28 @@ mod test {
 
         let error = serde_json::from_value::<QrAuthMessage>(json)
             .expect_err("The device authorization grant requires the verification_uri field");
+        // The untagged enum doesn't tell us which field is wrong.
         let error = error.to_string();
-        assert!(error.contains("device_authorization_grant"), "{error}");
-        assert!(error.contains("verification_uri"), "{error}");
+        assert!(error.contains("did not match any variant"), "{error}");
+    }
+
+    #[test]
+    fn test_protocol_deserialization_invalid_nested_valid_flat_grant() {
+        let json = json!({
+            "type": "m.login.protocol",
+            "protocol": "device_authorization_grant",
+            "device_authorization_grant": {},
+            "verification_uri": "https://id.matrix.org/device/abcde",
+            "device_id": "ABCDEFGH"
+        });
+
+        let message: QrAuthMessage = serde_json::from_value(json).unwrap();
+        assert_let!(
+            QrAuthMessage::LoginProtocol {
+                protocol: LoginProtocolData::Msc4388DeviceAuthorizationGrant(_),
+                ..
+            } = message
+        );
     }
 
     #[test]
