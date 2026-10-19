@@ -856,9 +856,8 @@ mod tests {
         let client = server.client_builder().build().await;
 
         client.base_client().get_or_create_room(room_id, RoomState::Joined);
-        client.event_cache().subscribe().unwrap();
 
-        let latest_events = client.latest_events().await;
+        let latest_events = client.latest_events().await.unwrap();
         let registered_rooms = latest_events.state.registered_rooms.clone();
 
         // The room and one thread are registered, so `R` exists and the computation
@@ -1561,10 +1560,7 @@ mod tests {
                 .unwrap();
         }
 
-        let event_cache = client.event_cache();
-        event_cache.subscribe().unwrap();
-
-        let latest_events = client.latest_events().await;
+        let latest_events = client.latest_events().await.unwrap();
 
         // Register the room, and let its computation run to completion.
         assert!(latest_events.listen_to_room(&room_id).await.unwrap());
