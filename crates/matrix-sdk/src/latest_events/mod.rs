@@ -776,6 +776,75 @@ mod tests {
     }
 
     #[async_test]
+    async fn test_busy_room_lock_does_not_wedge_the_rooms_map() {
+        let room_id_0 = room_id!("!r0");
+        let room_id_1 = room_id!("!r1");
+        let thread_id_0_0 = event_id!("$ev0.0");
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        client.base_client().get_or_create_room(room_id_0, RoomState::Joined);
+        client.base_client().get_or_create_room(room_id_1, RoomState::Joined);
+
+        let latest_events = client.latest_events().await.unwrap();
+
+        // Register room 0, then hold its per-room write lock, as the compute
+        // task does for the whole duration of a computation (which can span a
+        // decryption attempt or an event cache store access).
+        assert!(latest_events.listen_to_room(room_id_0).await.unwrap());
+
+        let room_0_guard = {
+            let rooms = latest_events.state.registered_rooms.rooms.read().await;
+            // `write()` returns an owned guard, so the map lock can be released
+            // right after.
+            let guard = rooms.get(room_id_0).unwrap().write().await;
+            drop(rooms);
+            guard
+        };
+
+        // Subscribing to a thread of the busy room must park on the room lock
+        // WITHOUT holding the rooms map lock while parked.
+        let parked = {
+            let client = client.clone();
+
+            matrix_sdk_common::executor::spawn(async move {
+                client
+                    .latest_events()
+                    .await
+                    .unwrap()
+                    .listen_and_subscribe_to_thread(room_id_0, thread_id_0_0)
+                    .await
+            })
+        };
+
+        // Let the spawned task run up to the park point.
+        for _ in 0..10 {
+            yield_now().await;
+        }
+
+        // The rooms map must remain usable while that task is parked. If the
+        // map lock is held around per-room awaits, this times out: the parked
+        // task wedges every other map user, including the sync response
+        // handler (observed on device as a permanent loading overlay and a
+        // stalled sync loop).
+        timeout(Duration::from_secs(1), latest_events.listen_to_room(room_id_1))
+            .await
+            .expect("the rooms map is wedged behind the busy room lock")
+            .unwrap();
+
+        // Release the room; the parked subscription must now complete.
+        drop(room_0_guard);
+
+        let subscriber = timeout(Duration::from_secs(1), parked)
+            .await
+            .expect("the thread subscription never unparked")
+            .unwrap()
+            .unwrap();
+        assert!(subscriber.is_some());
+    }
+
+    #[async_test]
     async fn test_forget_room() {
         let room_id_0 = room_id!("!r0");
         let room_id_1 = room_id!("!r1");
