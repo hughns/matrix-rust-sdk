@@ -333,6 +333,9 @@ pub fn default_event_filter(event: &AnySyncTimelineEvent, rules: &RoomVersionRul
                                 | MessageType::VerificationRequest(_) => true,
                                 #[cfg(feature = "unstable-msc4274")]
                                 MessageType::Gallery(_) => true,
+                                // Custom msgtypes are surfaced as `MessageType::Other` so clients can
+                                // render the ones they understand (e.g. `io.element.a2ui`).
+                                MessageType::_Custom(_) => true,
                                 _ => false,
                             }
                         }
