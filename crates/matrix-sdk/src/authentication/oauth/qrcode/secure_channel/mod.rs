@@ -438,6 +438,7 @@ pub(super) mod test {
         post_guard: MockGuard,
         put_guard: MockGuard,
         get_guard: MockGuard,
+        discovery_guard: Option<MockGuard>,
     }
 
     impl MockedRendezvousServer {
@@ -570,6 +571,7 @@ pub(super) mod test {
                 post_guard,
                 put_guard,
                 get_guard,
+                discovery_guard: None,
                 homeserver_url,
                 rendezvous_url,
             }
@@ -598,6 +600,17 @@ pub(super) mod test {
             let rendezvous_url = homeserver_url
                 .join(RENDEZVOUS_ID)
                 .expect("We should be able to create a rendezvous URL");
+
+            let discovery_guard = server
+                .register_as_scoped(
+                    Mock::given(method("GET"))
+                        .and(path("/_matrix/client/unstable/io.element.msc4388/rendezvous"))
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                .set_body_json(json!({ "create_available": true })),
+                        ),
+                )
+                .await;
 
             let post_guard = server
                 .register_as_scoped(
@@ -717,6 +730,7 @@ pub(super) mod test {
                 post_guard,
                 put_guard,
                 get_guard,
+                discovery_guard: Some(discovery_guard),
                 homeserver_url,
                 rendezvous_url,
             }
