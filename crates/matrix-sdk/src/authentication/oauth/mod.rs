@@ -398,6 +398,98 @@ impl OAuth {
         }
     }
 
+    /// Check which modes of QR code login this client supports to log in.
+    ///
+    /// This is meant for a new client that isn't logged in yet. For an
+    /// existing client that wants to grant a login to a new client, use
+    /// [`OAuth::grant_login_with_qr_code_support()`] instead.
+    ///
+    /// - Scanning a QR code is always supported, because the homeserver to log
+    ///   in with and the rendezvous server are provided by the other client.
+    /// - Generating a QR code is supported if the homeserver supports creating
+    ///   rendezvous sessions with either [MSC4388] (only with the
+    ///   `unstable-msc4388` feature) or [MSC4108]. The other client provides
+    ///   the homeserver to log in with, so this homeserver doesn't need to
+    ///   support the OAuth 2.0 API.
+    ///
+    /// Returns an error if the support for the rendezvous server can't be
+    /// fetched.
+    ///
+    /// [MSC4108]: https://github.com/matrix-org/matrix-spec-proposals/pull/4108
+    /// [MSC4388]: https://github.com/matrix-org/matrix-spec-proposals/pull/4388
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn login_with_qr_code_support(&self) -> Result<qrcode::QrCodeLoginSupport> {
+        Ok(qrcode::QrCodeLoginSupport {
+            scan: true,
+            generate: self.rendezvous_server_supported().await?,
+        })
+    }
+
+    /// Check which modes of QR code login this client supports to grant a
+    /// login to a new client.
+    ///
+    /// This is meant for an existing client that is logged in. For a new
+    /// client that wants to log in, use
+    /// [`OAuth::login_with_qr_code_support()`] instead.
+    ///
+    /// No mode is supported unless this client uses the OAuth 2.0 API, and the
+    /// authorization server supports the device authorization grant.
+    /// Otherwise:
+    ///
+    /// - Scanning a QR code is supported, because the rendezvous server is
+    ///   provided by the other client.
+    /// - Generating a QR code is supported if the homeserver supports creating
+    ///   rendezvous sessions with either [MSC4388] (only with the
+    ///   `unstable-msc4388` feature) or [MSC4108].
+    ///
+    /// Returns an error if the authorization server metadata or the support
+    /// for the rendezvous server can't be fetched.
+    ///
+    /// [MSC4108]: https://github.com/matrix-org/matrix-spec-proposals/pull/4108
+    /// [MSC4388]: https://github.com/matrix-org/matrix-spec-proposals/pull/4388
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn grant_login_with_qr_code_support(&self) -> Result<qrcode::QrCodeLoginSupport> {
+        // We need to be using the OAuth 2.0 API.
+        if self.data().is_none() {
+            return Ok(Default::default());
+        }
+
+        // We need the authorization server to support the device authorization
+        // grant.
+        let metadata = match self.cached_server_metadata().await {
+            Ok(metadata) => metadata,
+            Err(error) if error.is_not_supported() => return Ok(Default::default()),
+            Err(error) => return Err(OAuthError::from(error).into()),
+        };
+        if !supports_device_authorization_grant(&metadata) {
+            return Ok(Default::default());
+        }
+
+        Ok(qrcode::QrCodeLoginSupport {
+            scan: true,
+            generate: self.rendezvous_server_supported().await?,
+        })
+    }
+
+    /// Check if the homeserver supports creating rendezvous sessions, which is
+    /// necessary to generate a QR code.
+    ///
+    /// This matches the variant used when generating a QR code: [MSC4388] if
+    /// it's supported (only with the `unstable-msc4388` feature), otherwise
+    /// [MSC4108].
+    ///
+    /// [MSC4108]: https://github.com/matrix-org/matrix-spec-proposals/pull/4108
+    /// [MSC4388]: https://github.com/matrix-org/matrix-spec-proposals/pull/4388
+    #[cfg(feature = "e2e-encryption")]
+    async fn rendezvous_server_supported(&self) -> Result<bool> {
+        #[cfg(feature = "unstable-msc4388")]
+        if self.msc_4388_rendezvous_server_supported().await? {
+            return Ok(true);
+        }
+
+        Ok(self.client.unstable_features().await?.contains(&ruma::api::FeatureFlag::Msc4108))
+    }
+
     /// Log in this device using a QR code.
     ///
     /// # Arguments
