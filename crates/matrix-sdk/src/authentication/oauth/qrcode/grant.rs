@@ -655,6 +655,9 @@ mod test {
         DeviceAlreadyExists,
         DeviceNotCreated,
         InvalidJsonMessage,
+        /// Alice cancels after Bob signals that he received the
+        /// `m.login.protocols` message.
+        CancelledAfterLoginProtocols(oneshot::Sender<()>),
         /// Alice cancels after Bob signals that he received
         /// `m.login.protocol_accepted`.
         CancelledWhileWaitingForAuth(oneshot::Sender<()>),
@@ -1045,6 +1048,14 @@ mod test {
                 // Send an unexpected message and exit.
                 let message = QrAuthMessage::LoginSuccess;
                 bob.send_json(message).await.unwrap();
+                return;
+            }
+            BobBehaviour::CancelledAfterLoginProtocols(login_protocols_tx) => {
+                // Let Alice know she can cancel now and exit. Alice is dropped
+                // when cancelled so she won't tell us about it.
+                login_protocols_tx
+                    .send(())
+                    .expect("Bob should be able to signal that he received the login protocols");
                 return;
             }
             BobBehaviour::LoginFailureInsteadOfLoginProtocol => {
@@ -1849,6 +1860,7 @@ mod test {
             .device_creation_timeout(Duration::from_secs(2))
             .scan(&qr_code_data);
         let (checkcode_tx, checkcode_rx) = oneshot::channel();
+        let (login_protocols_tx, login_protocols_rx) = oneshot::channel();
 
         // Spawn the updates task.
         let mut updates = grant.subscribe_to_progress();
@@ -1858,6 +1870,7 @@ mod test {
         assert_matches!(state.clone(), GrantLoginProgress::Starting);
         let updates_task = spawn(async move {
             let mut checkcode_tx = Some(checkcode_tx);
+            let mut login_protocols_rx = Some(login_protocols_rx);
 
             while let Some(update) = updates.next().await {
                 match &update {
@@ -1871,6 +1884,14 @@ mod test {
                             .expect("The checkcode should only be forwarded once")
                             .send(*check_code)
                             .expect("Alice should be able to forward the checkcode");
+
+                        // Only cancel once Bob has received the login protocols
+                        // so that Alice is waiting for his reply.
+                        login_protocols_rx
+                            .take()
+                            .expect("Bob's signal should only be awaited once")
+                            .await
+                            .expect("Bob should signal that he received the login protocols");
                         cancel.cancel();
                         break;
                     }
@@ -1886,7 +1907,7 @@ mod test {
         // Let Bob request the login and run through the process.
         let bob_task = spawn(async move {
             request_login_with_generated_qr_code(
-                BobBehaviour::UnexpectedMessageInsteadOfLoginProtocol,
+                BobBehaviour::CancelledAfterLoginProtocols(login_protocols_tx),
                 channel,
                 checkcode_rx,
                 None,
@@ -1901,16 +1922,7 @@ mod test {
         // Wait for all tasks to finish / fail.
         assert_matches!(grant.await, None, "Alice should abort the login by cancelling it");
         updates_task.await.expect("Alice should run through all progress states");
-
-        // Alice is cancelled as soon as she has forwarded the checkcode, which
-        // can happen before she sends the `LoginProtocols` message that
-        // Bob waits for. Bob would then wait forever because the
-        // rendezvous session never expires, so stop his task instead of
-        // waiting for it to finish, but still fail if it panicked.
-        bob_task.abort();
-        if let Err(error) = bob_task.await {
-            assert!(error.is_cancelled(), "Bob's task should not fail: {error}");
-        }
+        bob_task.await.expect("Bob's task should finish");
     }
 
     #[async_test]
